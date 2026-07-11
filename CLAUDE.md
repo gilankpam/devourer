@@ -224,10 +224,13 @@ Knob-specific facts that aren't obvious from the field docs:
 - `DEVOURER_TX_WITH_RX=thread` (concurrent TX+RX on one claimed handle:
   `InitWrite` once, then `StartRxLoop` on a thread) must be set **before**
   `InitWrite` on Jaguar3 — the bring-up keeps the RX filters open; retrofitting
-  RX later is unreliable. On the 8822E, TX+RX mode leaves the path-B OFDM TXAGC
-  reference (0x41e8) at table default — any nonzero value there desenses the
-  EU's RX to near-deaf (hardware-bisected, value-independent). This is the
-  single-radio beamforming self-sounding station: pair with
+  RX later is unreliable. On the 8822E, TX+RX mode used to leave the path-B OFDM TXAGC reference
+  (0x41e8) at table default to guard a claimed RX desense — that skip
+  corrupts ALL TX in TX+RX mode (bench-proven 2026-07-11: zero decodable
+  frames), so the default now writes both paths; the legacy skip is opt-in
+  via DEVOURER_PROTECT_PATHB_AGC for RX-desense range experiments (the
+  desense did not reproduce at 1 m). This is the single-radio beamforming
+  self-sounding station: pair with
   `DEVOURER_BF_ARM_SOUNDER` / `DEVOURER_TX_NDPA` / `DEVOURER_BF_DETECT_REPORT`
   (`docs/beamforming-self-sounding.md`). Non-`thread` values select a
   `fork()` RX child that only works on Termux; on regular Linux the forked

@@ -89,7 +89,10 @@ public:
    * kept and only the reference base is programmed. skip_path_b_ofdm_ref leaves
    * 0x41e8 at its table default — the 8822E TX+RX RX-desense quirk (see
    * apply_power_by_rate_8822e); previously a flat override on a TX+RX session
-   * wrote it unconditionally and deafened the EU's RX. */
+   * wrote it unconditionally and deafened the EU's RX. Callers pass true only
+   * under the opt-in rx.protect_pathb_agc guard; the default path writes 0x41e8
+   * like the 8822C, because skipping it corrupts TX in TX+RX mode (2026-07-11
+   * bench). */
   void set_tx_power_ref(uint8_t idx, bool zero_diffs = true,
                         bool skip_path_b_ofdm_ref = false);
 

@@ -868,14 +868,16 @@ void RtlJaguar3Device::FastSetBandwidth(ChannelWidth_t bw) {
   _channel.ChannelWidth = bw;
 }
 
-/* Re-program TXAGC from the current knob state (see header). The 0x41e8
- * TX+RX quirk is 8822E-specific, so the skip flag is derived here — once —
- * from _rx_wanted AND the variant; the 8822C keeps its path-B ref writes. */
+/* Re-program TXAGC from the current knob state (see header). The legacy
+ * 0x41e8 skip (rx.protect_pathb_agc, default OFF) is 8822E-specific and
+ * opt-in: skipping the path-B OFDM ref corrupts all TX in TX+RX mode
+ * (bench-proven 2026-07-11), so the default now writes both paths. */
 void RtlJaguar3Device::apply_tx_power_current(bool full) {
   const int off = _tx_pwr_offset_steps;
   const int flat = _tx_pwr_override;
-  const bool skip_b =
-      _rx_wanted && _variant == jaguar3::ChipVariant::C8822E;
+  const bool skip_b = _rx_wanted &&
+                      _variant == jaguar3::ChipVariant::C8822E &&
+                      _cfg.rx.protect_pathb_agc;
   _txpwr_sat_low = false;
   _txpwr_sat_high = false;
   auto clamp127 = [&](int v) -> uint8_t {

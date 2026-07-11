@@ -98,12 +98,15 @@ public:
    * set_tx_power_ref) under _reg_mu, serialized against the coex tick's
    * pwr_track (which RMWs the [7:0] thermal field of the SAME 0x18a0/0x41a0
    * dwords — field-disjoint, so thermal compensation and the offset compose).
-   * The 8822E TX+RX 0x41e8 quirk is enforced structurally: every ref write
-   * takes skip_path_b_ofdm_ref from _rx_wanted. A full SetMonitorChannel
-   * re-folds the knobs against the new channel group's efuse refs (gated on a
-   * knob being active); FastRetune never touches TXAGC. GetThermalStatus
-   * reads RF 0x42[6:1] via the calibration impl (efuse baseline on the E,
-   * first-read cold reference on the C). */
+   * The legacy 8822E TX+RX 0x41e8 skip is opt-in via rx.protect_pathb_agc
+   * (default OFF): every ref write derives skip_path_b_ofdm_ref from
+   * _rx_wanted AND that flag. Skipping corrupts all TX in TX+RX mode
+   * (bench-proven 2026-07-11); the desense the skip guarded against did not
+   * reproduce at bench range and is untested at distance.
+   * A full SetMonitorChannel re-folds the knobs against the new channel
+   * group's efuse refs (gated on a knob being active); FastRetune never
+   * touches TXAGC. GetThermalStatus reads RF 0x42[6:1] via the calibration
+   * impl (efuse baseline on the E, first-read cold reference on the C). */
   devourer::TxPowerCaps GetTxPowerCaps() override;
   int SetTxPowerOffsetQdb(int qdb) override;
   void SetTxPowerIndexOverride(int idx) override;
@@ -246,7 +249,8 @@ private:
   /* TX+RX intent (DEVOURER_TX_WITH_RX at InitWrite / an RX-side Init):
    * consumed as skip_path_b_ofdm_ref by EVERY TXAGC ref write, so no offset
    * churn can ever touch 0x41e8 while RX is alive (the 8822E RX-desense
-   * quirk is enforced structurally, not by call-site discipline). */
+   * quirk is enforced structurally, not by call-site discipline). Only
+   * enforced when rx.protect_pathb_agc opts in (see DeviceConfig). */
   bool _rx_wanted = false;
   /* Cached 8822E per-channel-group efuse base refs (the values InitWrite
    * derived, incl. the 0x4b fallback) so an offset-only step recomputes

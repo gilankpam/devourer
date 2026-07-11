@@ -47,6 +47,7 @@ devourer::DeviceConfig devourer_config_from_env() {
   /* ---- rx ---- */
   cfg.rx.keep_corrupted = env_flag("DEVOURER_RX_KEEP_CORRUPTED");
   cfg.rx.enable_with_tx = env_str("DEVOURER_TX_WITH_RX") != nullptr;
+  cfg.rx.protect_pathb_agc = env_flag("DEVOURER_PROTECT_PATHB_AGC");
   if (const char *e = env_str("DEVOURER_RX_CSI_MASK"))
     cfg.rx.csi_mask = e;
   if (const char *e = env_str("DEVOURER_RX_NBI"))
