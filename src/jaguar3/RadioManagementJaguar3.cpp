@@ -252,8 +252,9 @@ void RadioManagementJaguar3::DumpCanary() {
       0x18ac, 0x41ac, 0x1944, 0x4044,
       /* TXAGC refs (runtime TX-power API): OFDM 0x18e8/0x41e8, CCK
        * 0x18a0/0x41a0, + the first per-rate diff dword. The regcheck's
-       * TX+RX cell asserts 0x41e8 stays at its table default (the 8822E
-       * RX-desense quirk) while path A moves with the offset. */
+       * TX+RX cell expects 0x41e8 to move with the offset by default; it
+       * stays at table default only when rx.protect_pathb_agc opts into the
+       * legacy skip (skipping corrupts TX in TX+RX mode — 2026-07-11 bench). */
       0x18e8, 0x41e8, 0x18a0, 0x41a0, 0x3a00};
   static const uint16_t mac_canary[] = {0x0, 0x24, 0x454, 0x483,
                                         0x55c, 0x638, 0x668};

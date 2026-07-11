@@ -47,6 +47,7 @@ devourer::DeviceConfig devourer_config_from_env() {
   /* ---- rx ---- */
   cfg.rx.keep_corrupted = env_flag("DEVOURER_RX_KEEP_CORRUPTED");
   cfg.rx.enable_with_tx = env_str("DEVOURER_TX_WITH_RX") != nullptr;
+  cfg.rx.protect_pathb_agc = env_flag("DEVOURER_PROTECT_PATHB_AGC");
   if (const char *e = env_str("DEVOURER_RX_CSI_MASK"))
     cfg.rx.csi_mask = e;
   if (const char *e = env_str("DEVOURER_RX_NBI"))
@@ -171,7 +172,7 @@ devourer::DeviceConfig devourer_config_from_env() {
   /* ---- usb ---- */
   if (const char *e = env_str("TMPDIR"); e && *e)
     cfg.usb.lock_dir = e;
-  if (env_str("DEVOURER_RX_ZEROCOPY")) /* default true; =0 forces the heap path */
+  if (env_str("DEVOURER_RX_ZEROCOPY")) /* default false; =1 opts in to DMA */
     cfg.usb.rx_zerocopy = env_flag("DEVOURER_RX_ZEROCOPY");
 
   return cfg;

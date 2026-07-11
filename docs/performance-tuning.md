@@ -134,14 +134,19 @@ does much — the structural win above is already the dominant effect:
   8821A (6), and the HalMAC generations (3) — a modest depth, where the
   syscall saved can still be offset by the packing cost. Do not expect a
   host-CPU reduction from it on the 8812A.
-- **Zerocopy RX DMA ring** (`usb.rx_zerocopy`, default on): allocates the async
+- **Zerocopy RX DMA ring** (`usb.rx_zerocopy`, default off): allocates the async
   RX ring from kernel DMA memory (`libusb_dev_mem_alloc`) so a received frame
   DMAs straight into the userspace buffer and usbfs skips the copy-on-reap.
-  Correct and safe (per-buffer heap fallback when the HCD doesn't support it),
+  In principle safe (per-buffer heap fallback when the HCD doesn't support it),
   but the copy it removes is tiny at realistic RX rates — a 20 Mbps video link
   is ~2.5 MB/s, negligible against the per-URB reap. It's kept as a
   structurally-correct, low-risk path (and a base to develop further), not a
   measured CPU win at these rates.
+
+  > **Known issue (2026-07-11):** on an xhci desktop host the zerocopy ring
+  > intermittently delivered zero frames (same host/dongle/channel: one run
+  > fine, the next deaf; heap path 100% reliable). Zerocopy is therefore
+  > default-OFF (`DEVOURER_RX_ZEROCOPY=1` opts in) until root-caused.
 
 The honest summary: devourer's CPU advantage is the kernel stack it *doesn't*
 run, and that is already captured by the raw-injection design. There is no

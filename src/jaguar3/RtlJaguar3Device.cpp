@@ -8,8 +8,9 @@
 #include <vector>
 
 #include "AckResponder.h"
-#include "RadiotapPeek.h" /* send_packets batch pre-parse */
-#include "TxAggPlan.h"    /* USB TX aggregation URB packing */
+#include "RadiotapPeek.h"   /* send_packets batch pre-parse */
+#include "RadiotapTxFlags.h" /* HT MCS field decoder (LDPC/STBC) */
+#include "TxAggPlan.h"      /* USB TX aggregation URB packing */
 #include "TxReport.h"     /* CCX TX-status report decode + tx.report event */
 
 #include "BeamformingSounder.h" /* generation-neutral BF self-sounding recipe */
@@ -318,6 +319,8 @@ RtlJaguar3Device::~RtlJaguar3Device() {
 void RtlJaguar3Device::coex_runtime_loop() {
   std::vector<uint8_t> buf(16 * 1024);
   uint64_t tick = 0, c2h = 0, rx = 0;
+  int fail_streak = 0;
+  constexpr int kMaxFailStreak = 5;
   /* The coex decision + FW heartbeats run on a fixed ~2 s WALL-CLOCK cadence
    * (steady_clock), independent of how fast bulk-IN completes — a busy bulk-IN
    * pipe must not turn the keepalive into an H2C storm that floods the HMEBOX. */
@@ -361,6 +364,10 @@ void RtlJaguar3Device::coex_runtime_loop() {
     if (std::chrono::steady_clock::now() < next_tick)
       continue;
     next_tick += period;
+    /* A transient register/USB error must not kill the thread that sustains
+     * 5 GHz TX (coex re-apply + pwr_track) — log, retry next tick, and only
+     * give up after kMaxFailStreak consecutive failures (a chip that is
+     * really gone fails every tick and still lets the thread exit). */
     try {
       std::lock_guard<std::mutex> lk(_reg_mu);
       _hal.coex_run_5g();
@@ -368,7 +375,28 @@ void RtlJaguar3Device::coex_runtime_loop() {
       _hal.fw_update_wl_phy_info();
       _hal.fw_set_pwr_mode_active();
       _hal.fw_coex_query_bt_info();
-    } catch (...) { break; }
+      fail_streak = 0;
+    } catch (const std::exception &e) {
+      ++fail_streak;
+      _logger->error("Jaguar3 coex: tick {} failed ({}) — {}/{} consecutive",
+                     tick + 1, e.what(), fail_streak, kMaxFailStreak);
+      if (fail_streak >= kMaxFailStreak) {
+        _logger->error("Jaguar3 coex: giving up after {} consecutive failures "
+                       "— sustained 5 GHz TX will degrade", kMaxFailStreak);
+        break;
+      }
+      continue;
+    } catch (...) {
+      ++fail_streak;
+      _logger->error("Jaguar3 coex: tick {} failed (unknown exception) — {}/{} "
+                     "consecutive", tick + 1, fail_streak, kMaxFailStreak);
+      if (fail_streak >= kMaxFailStreak) {
+        _logger->error("Jaguar3 coex: giving up after {} consecutive failures "
+                       "— sustained 5 GHz TX will degrade", kMaxFailStreak);
+        break;
+      }
+      continue;
+    }
     if (++tick <= 3 || tick % 15 == 0)
       _logger->info("Jaguar3 coex: tick {} (bulk-IN reads={}, C2H={})", tick, rx,
                     c2h);
@@ -868,14 +896,16 @@ void RtlJaguar3Device::FastSetBandwidth(ChannelWidth_t bw) {
   _channel.ChannelWidth = bw;
 }
 
-/* Re-program TXAGC from the current knob state (see header). The 0x41e8
- * TX+RX quirk is 8822E-specific, so the skip flag is derived here — once —
- * from _rx_wanted AND the variant; the 8822C keeps its path-B ref writes. */
+/* Re-program TXAGC from the current knob state (see header). The legacy
+ * 0x41e8 skip (rx.protect_pathb_agc, default OFF) is 8822E-specific and
+ * opt-in: skipping the path-B OFDM ref corrupts all TX in TX+RX mode
+ * (bench-proven 2026-07-11), so the default now writes both paths. */
 void RtlJaguar3Device::apply_tx_power_current(bool full) {
   const int off = _tx_pwr_offset_steps;
   const int flat = _tx_pwr_override;
-  const bool skip_b =
-      _rx_wanted && _variant == jaguar3::ChipVariant::C8822E;
+  const bool skip_b = _rx_wanted &&
+                      _variant == jaguar3::ChipVariant::C8822E &&
+                      _cfg.rx.protect_pathb_agc;
   _txpwr_sat_low = false;
   _txpwr_sat_high = false;
   auto clamp127 = [&](int v) -> uint8_t {
@@ -1288,18 +1318,16 @@ size_t RtlJaguar3Device::build_tx_block(const uint8_t *packet, size_t length,
           devourer::freq_to_chan(get_unaligned_le16(it.this_arg));
       break;
     case IEEE80211_RADIOTAP_MCS: {
-      uint8_t mcs_known = it.this_arg[0];
-      uint8_t mcs_flags = it.this_arg[1];
-      if ((mcs_flags & IEEE80211_RADIOTAP_MCS_BW_MASK) ==
-          IEEE80211_RADIOTAP_MCS_BW_40)
+      const devourer::RadiotapMcsField m =
+          devourer::decode_radiotap_mcs_field(it.this_arg);
+      if (m.bw40)
         bwidth = CHANNEL_WIDTH_40;
-      sgi = (mcs_flags & 0x04) ? 1 : 0;
-      if (mcs_known & IEEE80211_RADIOTAP_MCS_HAVE_MCS) {
-        uint8_t idx = it.this_arg[2];
-        if (idx <= 31) {
-          fixed_rate = MGN_MCS0 + idx;
-          rate_from_radiotap = true;
-        }
+      sgi = m.sgi;
+      ldpc = m.ldpc;
+      stbc = m.stbc;
+      if (m.have_mcs) {
+        fixed_rate = MGN_MCS0 + m.mcs;
+        rate_from_radiotap = true;
       }
     } break;
     case IEEE80211_RADIOTAP_VHT: {
