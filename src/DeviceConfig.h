@@ -293,11 +293,12 @@ struct DeviceConfig {
     std::string lock_dir;
     /* env: DEVOURER_RX_ZEROCOPY — allocate the async RX ring from kernel DMA
      * memory (libusb_dev_mem_alloc / USBDEVFS_ALLOC) so incoming frames DMA
-     * straight into the userspace buffer, eliminating the per-URB usbfs copy on
-     * reap. Linux + capable HCD only; the alloc falls back to heap buffers (the
-     * historical copy-on-reap path) when unsupported, so leaving it on is safe.
-     * 1 = on (default), 0 = force the heap path. */
-    bool rx_zerocopy = true;
+     * straight into the userspace buffer, eliminating the per-URB usbfs copy
+     * on reap. Linux + capable HCD only. DEFAULT OFF: intermittent
+     * zero-frame delivery observed on an xhci desktop host (2026-07-11 —
+     * same host/dongle/channel worked on one run, deaf on the next; the heap
+     * path was 100% reliable). Opt in with =1 until root-caused. */
+    bool rx_zerocopy = false;
   } usb;
 
   /* ---- PCIe (DEVOURER_PCIE builds; see src/PcieTransport.h) ------------ */
