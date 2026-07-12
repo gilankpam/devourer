@@ -14,7 +14,9 @@
 #include "SelectedChannel.h"
 #include "ChipVariant.h"
 #include "HalJaguar3.h"
+#include "LaCapture.h"
 #include "RadioManagementJaguar3.h"
+#include "PhydmRuntimeJaguar3.h"
 
 /* RtlJaguar3Device is the orchestrator for the Realtek "Jaguar3" 802.11ac family
  * — RTL8822CU, RTL8812EU, RTL8822EU. It is the Jaguar3 sibling of
@@ -98,15 +100,11 @@ public:
    * set_tx_power_ref) under _reg_mu, serialized against the coex tick's
    * pwr_track (which RMWs the [7:0] thermal field of the SAME 0x18a0/0x41a0
    * dwords — field-disjoint, so thermal compensation and the offset compose).
-   * The legacy 8822E TX+RX 0x41e8 skip is opt-in via rx.protect_pathb_agc
-   * (default OFF): every ref write derives skip_path_b_ofdm_ref from
-   * _rx_wanted AND that flag. Skipping corrupts all TX in TX+RX mode
-   * (bench-proven 2026-07-11); the desense the skip guarded against did not
-   * reproduce at bench range and is untested at distance.
-   * A full SetMonitorChannel re-folds the knobs against the new channel
-   * group's efuse refs (gated on a knob being active); FastRetune never
-   * touches TXAGC. GetThermalStatus reads RF 0x42[6:1] via the calibration
-   * impl (efuse baseline on the E, first-read cold reference on the C). */
+   * A full SetMonitorChannel
+   * re-folds the knobs against the new channel group's efuse refs (gated on a
+   * knob being active); FastRetune never touches TXAGC. GetThermalStatus
+   * reads RF 0x42[6:1] via the calibration impl (efuse baseline on the E,
+   * first-read cold reference on the C). */
   devourer::TxPowerCaps GetTxPowerCaps() override;
   int SetTxPowerOffsetQdb(int qdb) override;
   void SetTxPowerIndexOverride(int idx) override;
@@ -189,6 +187,14 @@ public:
     return _hal.fw_boot_status();
   }
 
+  /* Research helper: one-shot LA-mode (phydm logic-analyzer) IQ capture into
+   * the TX packet buffer — JGR3 dialect (0x1ce4/0x1cf4 engine, 0x1c3c
+   * dbg-port mux), 128 KB window on both 8822C and 8822E. Serialized on
+   * _reg_mu against the coex runtime tick. Blocking; see LaCapture.h for
+   * the brick-risk caveats and the TX-quiesced contract. */
+  devourer::LaResult la_capture(const devourer::LaParams &p);
+  bool la_capture_wedged() const { return _la && _la->is_wedged(); }
+
   bool should_stop = false;
 
 private:
@@ -207,7 +213,12 @@ private:
   jaguar3::ChipVariant _variant;
   int _xtal_cap = -1; /* current crystal-cap code (SetXtalCap) */
   jaguar3::HalJaguar3 _hal;
+  /* Lazy LA-mode capture helper (la_capture). */
+  std::unique_ptr<devourer::LaCapture> _la;
   jaguar3::RadioManagementJaguar3 _radioManagement;
+  /* phydm dynamic mechanisms (FA/DIG/CCK-PD/EDCCA), ticked from the coex
+   * thread every ~2 s like the vendor watchdog. */
+  jaguar3::PhydmRuntimeJaguar3 _phydm;
   SelectedChannel _channel{};
   Action_ParsedRadioPacket _packetProcessor = nullptr;
   /* Runtime TX-power knobs (atomic so GetTxPowerState's cached snapshot is
@@ -247,10 +258,7 @@ private:
   bool _cca_disabled = false;
   void apply_cca_mode_locked(bool disabled);
   /* TX+RX intent (DEVOURER_TX_WITH_RX at InitWrite / an RX-side Init):
-   * consumed as skip_path_b_ofdm_ref by EVERY TXAGC ref write, so no offset
-   * churn can ever touch 0x41e8 while RX is alive (the 8822E RX-desense
-   * quirk is enforced structurally, not by call-site discipline). Only
-   * enforced when rx.protect_pathb_agc opts in (see DeviceConfig). */
+   * keeps the RX filters open across the TX bring-up. */
   bool _rx_wanted = false;
   /* Cached 8822E per-channel-group efuse base refs (the values InitWrite
    * derived, incl. the 0x4b fallback) so an offset-only step recomputes
@@ -265,6 +273,10 @@ private:
    * change / flat<->efuse transitions); full=false is the light offset step.
    * Caller holds _reg_mu when the coex thread may be running. */
   void apply_tx_power_current(bool full);
+  /* Golden-init replay (DEVOURER_REPLAY_WSEQ, debug.replay_wseq): apply a
+   * captured kernel register-write stream verbatim at the end of InitWrite —
+   * the hardware-diff lever (same as Jaguar2's; found the 8822B RF18 bug). */
+  void apply_replay_wseq();
   /* Runtime TX-mode default (SetTxMode/ClearTxMode). */
   std::optional<devourer::TxMode> _tx_mode_default;
 

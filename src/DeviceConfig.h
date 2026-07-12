@@ -67,15 +67,6 @@ struct DeviceConfig {
      * run on the same handle. Must be decided before InitWrite (retrofitting
      * RX onto a TX-only bring-up is unreliable on this generation). */
     bool enable_with_tx = false;
-    /* env: DEVOURER_PROTECT_PATHB_AGC — 8822E legacy RX-desense guard: while
-     * RX is wanted, skip every path-B OFDM TXAGC reference write (0x41e8),
-     * leaving it at table default. WARNING: the skip corrupts ALL TX in
-     * TX+RX mode below the PLCP level (bench-proven 2026-07-11: 0 decodable
-     * frames with the skip vs thousands without, same binary). The desense
-     * it guarded against ("any nonzero 0x41e8 -> near-deaf RX") did not
-     * reproduce at 1 m bench range and is untested at distance. Enable only
-     * for RX-desense range experiments. */
-    bool protect_pathb_agc = false;
     /* env: DEVOURER_RX_CSI_MASK — "<f_lo>[-<f_hi>][/wgt]" MHz: de-weight a
      * frequency range in the RX equalizer's per-tone CSI mask (ToneMask.h).
      * Applied when the RX loop starts; a channel switch reverts it. */

@@ -49,7 +49,9 @@ construction from the `SYS_CFG2` chip-id (see **Architecture**):
   Sustained 5 GHz TX needs the **coex runtime thread**
   (`RtlJaguar3Device::coex_runtime_loop`, started in `InitWrite`) — without its
   ~2 s WiFi-only coex re-apply + FW heartbeats, the combo chip's coex firmware
-  silences the antenna.
+  silences the antenna. The rtl8822e's hardware-bisected constraints (DPDT/
+  pin-mux front end, single-path 1SS TX, spur channels, LCK, the 2.4 GHz TX
+  kernel-parity limitation) live in `docs/8822e-quirks.md`.
 
 Naming traps: **RTL8821AU is Jaguar1** (not Jaguar2, despite the Jaguar2
 RTL8821C's similar name); RTL8822**B**U (Jaguar2) ≠ RTL8822**C**U (Jaguar3).
@@ -224,13 +226,8 @@ Knob-specific facts that aren't obvious from the field docs:
 - `DEVOURER_TX_WITH_RX=thread` (concurrent TX+RX on one claimed handle:
   `InitWrite` once, then `StartRxLoop` on a thread) must be set **before**
   `InitWrite` on Jaguar3 — the bring-up keeps the RX filters open; retrofitting
-  RX later is unreliable. On the 8822E, TX+RX mode used to leave the path-B OFDM TXAGC reference
-  (0x41e8) at table default to guard a claimed RX desense — that skip
-  corrupts ALL TX in TX+RX mode (bench-proven 2026-07-11: zero decodable
-  frames), so the default now writes both paths; the legacy skip is opt-in
-  via DEVOURER_PROTECT_PATHB_AGC for RX-desense range experiments (the
-  desense did not reproduce at 1 m). This is the single-radio beamforming
-  self-sounding station: pair with
+  RX later is unreliable. This is the
+  single-radio beamforming self-sounding station: pair with
   `DEVOURER_BF_ARM_SOUNDER` / `DEVOURER_TX_NDPA` / `DEVOURER_BF_DETECT_REPORT`
   (`docs/beamforming-self-sounding.md`). Non-`thread` values select a
   `fork()` RX child that only works on Termux; on regular Linux the forked
@@ -251,6 +248,12 @@ Knob-specific facts that aren't obvious from the field docs:
   `crc_err`/`icv_err` set — the entry point for the fused-FEC salvage layer
   (`docs/fused-fec.md`). Opt-in: a body with a corrupt tail is the worst-case
   input for an IP-stack consumer that didn't ask for it.
+- `DEVOURER_LA_CAPTURE=<trig>/<rate>M/dma0/port:0x880` (rxdemo) — one-shot
+  LA-mode IQ capture into the TX packet buffer (`src/LaCapture.h`): raw
+  complex baseband to a `DVLA` file, offline per-tone H(k) via
+  `tools/la_csi.py`. 8814A/8822B/8821C/8822C/8822E (+ 8821CE PCIe); the
+  8812A/8821A have no LA block. Sample packing, per-chip windows, trigger
+  semantics, validation scripts and wedge risks: `docs/la-capture.md`.
 - `DEVOURER_THERMAL_POLL_MS=N` emits `thermal` events from the RF
   0x42 meter: `raw` is 0..63 thermal units (~1.5–2 °C each, **not** absolute
   °C — hence bucketed status, not a fake temperature), `delta` = raw −
@@ -304,6 +307,19 @@ MHz) + `DEVOURER_HOP_DWELL_FRAMES` / `_ROUNDS` / `_FAST` / `_RADIOTAP` /
 timing. Validation: `tests/run_hop_validation.sh`, `tests/hop_parity_check.sh`
 (register parity full-vs-fast). Implementation + per-generation ports:
 `docs/frequency-hopping.md`.
+
+**Keyed FHSS + lockstep RX** (`src/HopSchedule.h`): `DEVOURER_HOP_SLOT_MS`
+selects monotonic wall-clock slots; `DEVOURER_HOP_SEED` (≤32 hex, a 128-bit key)
+replaces the public round-robin with a SipHash-2-4 Fisher-Yates permutation per
+round — stateless (`channel = perm(slot/N)[slot%N]`), so a receiver joins
+without RNG state. Both orders share the lockstep path: in slot mode `txdemo`
+(beacon) and `streamtx` (own frame every `DEVOURER_HOP_SYNC_EVERY`, FEC PSDU
+untouched) emit a sync marker (fingerprint/epoch/slot/phase); `rxdemo` hops in
+lockstep when `DEVOURER_HOP_CHANNELS`+`_SLOT_MS` are set (seed optional →
+keyed/sequential), emitting `hop.rx` acquire/track/retune events. Jammer
+resilience: `tests/run_jammer_resilience.sh` (parked B210 A/B/C/D delivery
+matrix) + `tests/sdr_follower_jammer.py` (full-duplex B210 follower, reactive vs
+predictive). Article + results: `docs/fhss.md`, `docs/jammer-resilience.md`.
 
 `IRtlDevice::FastSetBandwidth(bw)` is the bandwidth analogue — a lean
 same-channel toggle between 20 MHz and 5/10 MHz narrowband (the RF stays in

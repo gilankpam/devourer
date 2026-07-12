@@ -8,9 +8,8 @@
 #include <vector>
 
 #include "AckResponder.h"
-#include "RadiotapPeek.h"   /* send_packets batch pre-parse */
-#include "RadiotapTxFlags.h" /* HT MCS field decoder (LDPC/STBC) */
-#include "TxAggPlan.h"      /* USB TX aggregation URB packing */
+#include "RadiotapPeek.h" /* send_packets batch pre-parse */
+#include "TxAggPlan.h"    /* USB TX aggregation URB packing */
 #include "TxReport.h"     /* CCX TX-status report decode + tx.report event */
 
 #include "BeamformingSounder.h" /* generation-neutral BF self-sounding recipe */
@@ -42,7 +41,7 @@ RtlJaguar3Device::RtlJaguar3Device(RtlAdapter device, Logger_t logger,
                                    devourer::DeviceConfig cfg)
     : _device{device}, _cfg{std::move(cfg)}, _logger{logger},
       _variant{variant}, _hal{device, logger, variant, _cfg},
-      _radioManagement{device, logger, variant, _cfg} {
+      _radioManagement{device, logger, variant, _cfg}, _phydm{device, logger} {
   _logger->info("RtlJaguar3Device constructed ({})",
                 variant == jaguar3::ChipVariant::C8822E ? "8822E/EU" : "8822C/CU");
 }
@@ -50,13 +49,31 @@ RtlJaguar3Device::RtlJaguar3Device(RtlAdapter device, Logger_t logger,
 void RtlJaguar3Device::Init(Action_ParsedRadioPacket packetProcessor,
                             SelectedChannel channel) {
   _channel = channel;
-  _rx_wanted = true; /* RX-side bring-up: no TXAGC apply may touch 0x41e8 */
+  _rx_wanted = true;
   _hal.rtw_hal_init(channel);  /* full vendor-source bring-up */
   /* Tune the channel/bandwidth (5/10 MHz ChannelWidth re-clocks to narrowband),
-   * then run IQK calibration (it reads RF18 for the tuned channel). */
+   * then run IQK calibration (it reads RF18 for the tuned channel).
+   *
+   * The 8822C's IQK must run with the RF at 20 MHz: the vendor kernel only
+   * ever calibrates at its bring-up bandwidth and carries the coefficients
+   * across `iw set freq ... 80` (usbmon: the 20->80 transition contains no
+   * IQK-engine traffic), and devourer's IQK executed AT 80 MHz loads RxIQC
+   * coefficients that leave the receiver unable to sync ANY frame
+   * (hardware-bisected: SKIP_IQK alone revives 80 MHz RX). Calibrate at
+   * 20 MHz on the target channel, then retune to the requested width. */
+  const bool iqk_at_20 = _variant == jaguar3::ChipVariant::C8822C &&
+                         (channel.ChannelWidth == CHANNEL_WIDTH_40 ||
+                          channel.ChannelWidth == CHANNEL_WIDTH_80);
   _radioManagement.set_channel_bwmode(channel.Channel, channel.ChannelOffset,
-                                      channel.ChannelWidth);
-  _hal.run_iqk(channel);
+                                      iqk_at_20 ? CHANNEL_WIDTH_20
+                                                : channel.ChannelWidth);
+  SelectedChannel iqk_ch = channel;
+  if (iqk_at_20)
+    iqk_ch.ChannelWidth = CHANNEL_WIDTH_20; /* IQK command set follows the RF */
+  _hal.run_iqk(iqk_ch);
+  if (iqk_at_20)
+    _radioManagement.set_channel_bwmode(channel.Channel, channel.ChannelOffset,
+                                        channel.ChannelWidth);
   _hal.enable_rx_path(); /* RF into RX mode (IGI toggle) — must follow channel set */
   _hal.config_rfe(channel.Channel); /* 8822e RFE/PAPE antenna-switch pins */
   _hal.config_channel_8822e(channel.Channel); /* 8822e band TX scaling/backoff + shaping */
@@ -106,6 +123,16 @@ void RtlJaguar3Device::Init(Action_ParsedRadioPacket packetProcessor,
 
   if (_cfg.rx.ack_responder)
     SetAckResponder(*_cfg.rx.ack_responder); /* DEVOURER_ACK_RESPONDER */
+  apply_replay_wseq(); /* DEVOURER_REPLAY_WSEQ — end of both bring-ups,
+                        * like Jaguar2's. */
+  if (_cfg.debug.bb_dump) {
+    /* Same MAC+BB end-state dump as InitWrite's, at the end of the RX
+     * bring-up (kernel rtw_proc read_reg diffing). */
+    for (uint32_t a = 0x000; a <= 0x4ffc; a += 0x10)
+      _logger->info("BBDUMP 0x{:04x} 0x{:08x} 0x{:08x} 0x{:08x} 0x{:08x}", a,
+                    _device.rtw_read32(a), _device.rtw_read32(a + 4),
+                    _device.rtw_read32(a + 8), _device.rtw_read32(a + 12));
+  }
   StartRxLoop(std::move(packetProcessor));
 }
 
@@ -181,6 +208,30 @@ void RtlJaguar3Device::StartRxLoop(Action_ParsedRadioPacket packetProcessor) {
     } catch (...) {
       _logger->info("Jaguar3 cfo.track: 0x1040 base read failed — disabled");
     }
+  }
+  /* phydm dynamic mechanisms on RX-only sessions: the vendor watchdog's ~2 s
+   * cadence on a dedicated thread (register I/O CANNOT run on this thread —
+   * a sync control transfer from the bulk-IN event thread starves its own
+   * event loop; a separate thread under _reg_mu is the proven pattern, same
+   * as the TX-side coex thread, which owns the tick in TX+RX mode). */
+  std::atomic<bool> phydm_stop{false};
+  std::thread phydm_thread;
+  if (!_coex_thread.joinable()) {
+    phydm_thread = std::thread([this, &phydm_stop] {
+      auto next = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+      while (!phydm_stop && !g_devourer_should_stop) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        if (std::chrono::steady_clock::now() < next)
+          continue;
+        next += std::chrono::seconds(2);
+        try {
+          std::lock_guard<std::mutex> lk(_reg_mu);
+          _phydm.tick(_channel.Channel, !_cca_disabled);
+        } catch (...) {
+          break; /* chip gone — the RX loop will wind down too */
+        }
+      }
+    });
   }
   auto cfo_next = std::chrono::steady_clock::now() + std::chrono::seconds(2);
   auto cfo_tick = [&]() {
@@ -298,6 +349,9 @@ void RtlJaguar3Device::StartRxLoop(Action_ParsedRadioPacket packetProcessor) {
     return _rx_stop || g_devourer_should_stop;
   });
   _rx_loop_active = false;
+  phydm_stop = true;
+  if (phydm_thread.joinable())
+    phydm_thread.join();
 }
 
 /* Coex runtime (port of the rtw88 watchdog's coex path): drain the firmware's
@@ -319,8 +373,6 @@ RtlJaguar3Device::~RtlJaguar3Device() {
 void RtlJaguar3Device::coex_runtime_loop() {
   std::vector<uint8_t> buf(16 * 1024);
   uint64_t tick = 0, c2h = 0, rx = 0;
-  int fail_streak = 0;
-  constexpr int kMaxFailStreak = 5;
   /* The coex decision + FW heartbeats run on a fixed ~2 s WALL-CLOCK cadence
    * (steady_clock), independent of how fast bulk-IN completes — a busy bulk-IN
    * pipe must not turn the keepalive into an H2C storm that floods the HMEBOX. */
@@ -364,43 +416,53 @@ void RtlJaguar3Device::coex_runtime_loop() {
     if (std::chrono::steady_clock::now() < next_tick)
       continue;
     next_tick += period;
-    /* A transient register/USB error must not kill the thread that sustains
-     * 5 GHz TX (coex re-apply + pwr_track) — log, retry next tick, and only
-     * give up after kMaxFailStreak consecutive failures (a chip that is
-     * really gone fails every tick and still lets the thread exit). */
     try {
       std::lock_guard<std::mutex> lk(_reg_mu);
       _hal.coex_run_5g();
       _hal.pwr_track(); /* thermal TX-power compensation (sustains upper 5 GHz) */
+      /* phydm dynamic mechanisms (vendor watchdog parity): FA/CCA window
+       * statistics -> DIG -> CCK-PD -> EDCCA. EDCCA tracking is owned by
+       * SetCcaMode when the EDCCA-disable knob is active. */
+      _phydm.tick(_channel.Channel, !_cca_disabled);
       _hal.fw_update_wl_phy_info();
       _hal.fw_set_pwr_mode_active();
       _hal.fw_coex_query_bt_info();
-      fail_streak = 0;
-    } catch (const std::exception &e) {
-      ++fail_streak;
-      _logger->error("Jaguar3 coex: tick {} failed ({}) — {}/{} consecutive",
-                     tick + 1, e.what(), fail_streak, kMaxFailStreak);
-      if (fail_streak >= kMaxFailStreak) {
-        _logger->error("Jaguar3 coex: giving up after {} consecutive failures "
-                       "— sustained 5 GHz TX will degrade", kMaxFailStreak);
-        break;
-      }
-      continue;
-    } catch (...) {
-      ++fail_streak;
-      _logger->error("Jaguar3 coex: tick {} failed (unknown exception) — {}/{} "
-                     "consecutive", tick + 1, fail_streak, kMaxFailStreak);
-      if (fail_streak >= kMaxFailStreak) {
-        _logger->error("Jaguar3 coex: giving up after {} consecutive failures "
-                       "— sustained 5 GHz TX will degrade", kMaxFailStreak);
-        break;
-      }
-      continue;
-    }
+    } catch (...) { break; }
     if (++tick <= 3 || tick % 15 == 0)
       _logger->info("Jaguar3 coex: tick {} (bulk-IN reads={}, C2H={})", tick, rx,
                     c2h);
   }
+}
+
+/* Golden-init replay — same file format as Jaguar2's ("%x %u %llx" = addr
+ * width value per line, tests/decode_wseq.py output). */
+void RtlJaguar3Device::apply_replay_wseq() {
+  if (_cfg.debug.replay_wseq.empty())
+    return;
+  FILE *fp = fopen(_cfg.debug.replay_wseq.c_str(), "r");
+  if (!fp) {
+    _logger->error("replay_wseq: cannot open {}", _cfg.debug.replay_wseq);
+    return;
+  }
+  unsigned addr, width;
+  unsigned long long val;
+  size_t n = 0;
+  while (fscanf(fp, "%x %u %llx", &addr, &width, &val) == 3) {
+    if (width == 1)
+      _device.rtw_write8(static_cast<uint16_t>(addr),
+                         static_cast<uint8_t>(val));
+    else if (width == 2)
+      _device.rtw_write16(static_cast<uint16_t>(addr),
+                          static_cast<uint16_t>(val));
+    else
+      _device.rtw_write32(static_cast<uint16_t>(addr),
+                          static_cast<uint32_t>(val));
+    if (++n % 1000 == 0)
+      _logger->info("replay_wseq: {} writes applied", n);
+  }
+  fclose(fp);
+  _logger->info("replay_wseq: DONE — {} writes from {}", n,
+                _cfg.debug.replay_wseq);
 }
 
 /* Clean shutdown — see IRtlDevice::Stop. Best-effort: a chip that already
@@ -425,11 +487,22 @@ void RtlJaguar3Device::InitWrite(SelectedChannel channel) {
    * after the coex/FW steps leaves the RX path dead, and the register RMWs
    * race the running TX). */
   const bool want_rx = _cfg.rx.enable_with_tx;
-  _rx_wanted = want_rx; /* consumed by every TXAGC ref write (0x41e8 quirk) */
+  _rx_wanted = want_rx;
   _hal.rtw_hal_init(channel);  /* full vendor-source bring-up */
+  /* 8822C at 40/80 MHz: IQK at 20 MHz, then retune — see Init. */
+  const bool iqk_at_20 = _variant == jaguar3::ChipVariant::C8822C &&
+                         (channel.ChannelWidth == CHANNEL_WIDTH_40 ||
+                          channel.ChannelWidth == CHANNEL_WIDTH_80);
   _radioManagement.set_channel_bwmode(channel.Channel, channel.ChannelOffset,
-                                      channel.ChannelWidth);
-  _hal.run_iqk(channel);
+                                      iqk_at_20 ? CHANNEL_WIDTH_20
+                                                : channel.ChannelWidth);
+  SelectedChannel iqk_ch = channel;
+  if (iqk_at_20)
+    iqk_ch.ChannelWidth = CHANNEL_WIDTH_20; /* IQK command set follows the RF */
+  _hal.run_iqk(iqk_ch);
+  if (iqk_at_20)
+    _radioManagement.set_channel_bwmode(channel.Channel, channel.ChannelOffset,
+                                        channel.ChannelWidth);
   if (want_rx)
     _hal.enable_rx_path(); /* RF into RX mode — same slot as the Init path */
   _hal.dpk_force_bypass_8822e(); /* 8822e rfe 21/22: kernel bypasses DPK (after IQK) */
@@ -476,7 +549,10 @@ void RtlJaguar3Device::InitWrite(SelectedChannel channel) {
 
   /* TXAGC from the current runtime-knob state (flat override / offset folded
    * onto the efuse-calibrated refs) — see apply_tx_power_current. Pre-coex,
-   * so no _reg_mu needed here. */
+   * so no _reg_mu needed here. NOTE: the FW coex/power-mode H2Cs below rewrite
+   * the OFDM refs wholesale — the authoritative apply is the post-coex
+   * re-apply at the end of this function; this early one just keeps the
+   * intermediate bring-up steps on sane references. */
   apply_tx_power_current(/*full=*/true);
   _brought_up = true;
   /* WiFi-only coex bring-up: disable the BT/LTE antenna arbitration and lock the
@@ -573,6 +649,45 @@ void RtlJaguar3Device::InitWrite(SelectedChannel channel) {
    * so the AFE write doesn't contend with the periodic coex re-apply. */
   if (_cfg.tuning.xtal_cap)
     SetXtalCap(*_cfg.tuning.xtal_cap);
+  /* Re-apply TXAGC as the LAST bring-up register step: the FW power-mode /
+   * coex H2Cs above reprogram the OFDM TXAGC references (0x18e8/0x41e8)
+   * wholesale in firmware, clobbering the pre-coex apply — construction-time
+   * TX-power state (flat override / offset) only sticks when applied after
+   * them. The coex thread's ~2 s ticks do not rewrite the refs. */
+  apply_tx_power_current(/*full=*/true);
+  if (_variant == jaguar3::ChipVariant::C8822E) {
+    /* halmac "Config PIN Mux" (halmac_gpio_8822e.c HALMAC_WL_DPDT_SEL —
+     * REG_LED_CFG+3 |= BIT(0)): route the DPDT antenna transfer switch to WL
+     * control — 0x4c[24] = DPDT_WLBT_SEL set, [22] = GPIO13_14_WL_CTRL_EN
+     * clear. With the switch mis-routed the chip still transmits at full
+     * duty, but everything faster than ~26 Mbps PHY (HT MCS4+, legacy
+     * 48M/54M) airs a PPDU no receiver can sync to, and the surviving low
+     * rates run ~20 dB above the kernel's TX EVM. Must be written after the
+     * FW H2C steps above; interacts with the single-path 1SS TX mapping
+     * (HalJaguar3::config_channel_8822e) — with 1SS duplicated onto both
+     * chains this write wedges MCS0 TX, so the two ship together. */
+    const uint32_t v4c = _device.rtw_read<uint32_t>(0x4c);
+    _device.rtw_write<uint32_t>(0x4c, (v4c & ~0x00400000u) | 0x01000000u);
+    /* Same pin-mux family: PAD_CTRL1[29:28] route the WL PAPE/antenna pads.
+     * MacInit sets both (halmac pre-init), but the FW/coex bring-up steps
+     * clear bit29 — re-assert post-coex. */
+    const uint32_t v64 = _device.rtw_read<uint32_t>(0x0064);
+    if ((v64 & 0x30000000u) != 0x30000000u)
+      _device.rtw_write<uint32_t>(0x0064, v64 | 0x30000000u);
+    _logger->info("Jaguar3(8822e): DPDT/pad pin-mux applied (0x4c[24], "
+                  "0x64[29:28])");
+  }
+  apply_replay_wseq(); /* DEVOURER_REPLAY_WSEQ golden-init replay (debug) */
+  if (_cfg.debug.bb_dump) {
+    /* Full MAC+BB dump (0x000..0x4ffc — MAC plane, then BB incl. the RF
+     * direct-read windows at 0x3c00/0x4c00) in the same "BBDUMP" format as
+     * Jaguar2's, for end-state diffing against the vendor kernel's rtw_proc
+     * read_reg. */
+    for (uint32_t a = 0x000; a <= 0x4ffc; a += 0x10)
+      _logger->info("BBDUMP 0x{:04x} 0x{:08x} 0x{:08x} 0x{:08x} 0x{:08x}", a,
+                    _device.rtw_read32(a), _device.rtw_read32(a + 4),
+                    _device.rtw_read32(a + 8), _device.rtw_read32(a + 12));
+  }
   _coex_thread = std::thread([this] { coex_runtime_loop(); });
   if (_cfg.rx.ack_responder)
     SetAckResponder(*_cfg.rx.ack_responder); /* DEVOURER_ACK_RESPONDER */
@@ -836,6 +951,7 @@ void RtlJaguar3Device::SetCcaMode(bool disabled) {
 }
 
 void RtlJaguar3Device::SetMonitorChannel(SelectedChannel channel) {
+  _phydm.on_channel_change();
   /* Serialize against the coex thread's housekeeping tick (and any concurrent
    * FastRetune) — channel config is register RMW. Init/InitWrite call the
    * radio-management core directly (no lock needed: the coex thread isn't
@@ -896,16 +1012,13 @@ void RtlJaguar3Device::FastSetBandwidth(ChannelWidth_t bw) {
   _channel.ChannelWidth = bw;
 }
 
-/* Re-program TXAGC from the current knob state (see header). The legacy
- * 0x41e8 skip (rx.protect_pathb_agc, default OFF) is 8822E-specific and
- * opt-in: skipping the path-B OFDM ref corrupts all TX in TX+RX mode
- * (bench-proven 2026-07-11), so the default now writes both paths. */
+/* Re-program TXAGC from the current knob state (see header). Both TXAGC
+ * paths are written in every mode, TX+RX included — with the DPDT/pad
+ * pin-mux applied at bring-up, a live 0x41e8 write does not disturb the
+ * EU's RX (tests/eu_41e8_desense_recheck.sh). */
 void RtlJaguar3Device::apply_tx_power_current(bool full) {
   const int off = _tx_pwr_offset_steps;
   const int flat = _tx_pwr_override;
-  const bool skip_b = _rx_wanted &&
-                      _variant == jaguar3::ChipVariant::C8822E &&
-                      _cfg.rx.protect_pathb_agc;
   _txpwr_sat_low = false;
   _txpwr_sat_high = false;
   auto clamp127 = [&](int v) -> uint8_t {
@@ -924,7 +1037,7 @@ void RtlJaguar3Device::apply_tx_power_current(bool full) {
     /* Flat semantics: reference = flat + offset, per-rate diffs zeroed (once —
      * offset-only steps skip the 32-dword re-zero). */
     _radioManagement.set_tx_power_ref(clamp127(flat + off),
-                                      /*zero_diffs=*/!_diffs_zeroed, skip_b);
+                                      /*zero_diffs=*/!_diffs_zeroed);
     _diffs_zeroed = true;
     return;
   }
@@ -952,14 +1065,10 @@ void RtlJaguar3Device::apply_tx_power_current(bool full) {
     if (full || _diffs_zeroed) {
       /* Full apply: refs + the per-rate diff walk (also the path back from
        * flat semantics, which zeroed the diffs). */
-      _radioManagement.apply_power_by_rate_8822e(_channel.Channel, ra, rb,
-                                                 skip_b);
+      _radioManagement.apply_power_by_rate_8822e(_channel.Channel, ra, rb);
       _diffs_zeroed = false;
-      if (skip_b)
-        _logger->info("Jaguar3(8822e): TX+RX mode — path-B OFDM TXAGC ref left "
-                      "at table default (keeps RX alive)");
     } else {
-      _radioManagement.apply_tx_power_refs_8822e(ra, rb, skip_b);
+      _radioManagement.apply_tx_power_refs_8822e(ra, rb);
     }
     return;
   }
@@ -969,7 +1078,7 @@ void RtlJaguar3Device::apply_tx_power_current(bool full) {
    * per-rate default is a follow-up; the offset shifts this reference. */
   _radioManagement.set_tx_power_ref(
       clamp127(static_cast<int>(JAGUAR3_TXPWR_REF_BASE_8822C) + off),
-      /*zero_diffs=*/!_diffs_zeroed, skip_b);
+      /*zero_diffs=*/!_diffs_zeroed);
   _diffs_zeroed = true;
 }
 
@@ -1100,6 +1209,16 @@ devourer::EfuseStability RtlJaguar3Device::ProbeEfuseStability(int reads) {
       "efuse-stability: reads={} mismatched={} invalid_id={} id=0x{:04x}",
       st.reads, st.mismatched_reads, st.invalid_id_reads, st.eeprom_id);
   return st;
+}
+
+devourer::LaResult RtlJaguar3Device::la_capture(const devourer::LaParams &p) {
+  if (!_la)
+    _la = std::make_unique<devourer::LaCapture>(_device, _logger,
+                                                devourer::la_regs_jgr3());
+  /* Serialize against the coex runtime tick like every register-touching
+   * entry point. */
+  std::lock_guard<std::mutex> lk(_reg_mu);
+  return _la->run(p);
 }
 
 devourer::TxPowerState RtlJaguar3Device::GetTxPowerState() {
@@ -1318,16 +1437,18 @@ size_t RtlJaguar3Device::build_tx_block(const uint8_t *packet, size_t length,
           devourer::freq_to_chan(get_unaligned_le16(it.this_arg));
       break;
     case IEEE80211_RADIOTAP_MCS: {
-      const devourer::RadiotapMcsField m =
-          devourer::decode_radiotap_mcs_field(it.this_arg);
-      if (m.bw40)
+      uint8_t mcs_known = it.this_arg[0];
+      uint8_t mcs_flags = it.this_arg[1];
+      if ((mcs_flags & IEEE80211_RADIOTAP_MCS_BW_MASK) ==
+          IEEE80211_RADIOTAP_MCS_BW_40)
         bwidth = CHANNEL_WIDTH_40;
-      sgi = m.sgi;
-      ldpc = m.ldpc;
-      stbc = m.stbc;
-      if (m.have_mcs) {
-        fixed_rate = MGN_MCS0 + m.mcs;
-        rate_from_radiotap = true;
+      sgi = (mcs_flags & 0x04) ? 1 : 0;
+      if (mcs_known & IEEE80211_RADIOTAP_MCS_HAVE_MCS) {
+        uint8_t idx = it.this_arg[2];
+        if (idx <= 31) {
+          fixed_rate = MGN_MCS0 + idx;
+          rate_from_radiotap = true;
+        }
       }
     } break;
     case IEEE80211_RADIOTAP_VHT: {
