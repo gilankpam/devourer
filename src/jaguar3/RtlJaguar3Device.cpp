@@ -666,16 +666,31 @@ void RtlJaguar3Device::InitWrite(SelectedChannel channel) {
      * FW H2C steps above; interacts with the single-path 1SS TX mapping
      * (HalJaguar3::config_channel_8822e) — with 1SS duplicated onto both
      * chains this write wedges MCS0 TX, so the two ship together. */
-    const uint32_t v4c = _device.rtw_read<uint32_t>(0x4c);
-    _device.rtw_write<uint32_t>(0x4c, (v4c & ~0x00400000u) | 0x01000000u);
-    /* Same pin-mux family: PAD_CTRL1[29:28] route the WL PAPE/antenna pads.
-     * MacInit sets both (halmac pre-init), but the FW/coex bring-up steps
-     * clear bit29 — re-assert post-coex. */
-    const uint32_t v64 = _device.rtw_read<uint32_t>(0x0064);
-    if ((v64 & 0x30000000u) != 0x30000000u)
-      _device.rtw_write<uint32_t>(0x0064, v64 | 0x30000000u);
-    _logger->info("Jaguar3(8822e): DPDT/pad pin-mux applied (0x4c[24], "
-                  "0x64[29:28])");
+    /* chainb-hunt bisect knob: DEVOURER_DPDT_MODE = full (default; devourer
+     * b5a6df7 behavior: 0x4c[24] set + [22] CLEAR) | bit24 (kernel-faithful
+     * HALMAC_WL_DPDT_SEL: [24] set, [22] untouched) | skip. DEVOURER_SKIP_DPDT
+     * = legacy alias for skip. Suspect for GS RX path-B deafness. */
+    const char *dpdt_env = std::getenv("DEVOURER_DPDT_MODE");
+    std::string dpdt_mode = dpdt_env ? dpdt_env : "full";
+    if (std::getenv("DEVOURER_SKIP_DPDT") != nullptr)
+      dpdt_mode = "skip";
+    if (dpdt_mode != "skip") {
+      const uint32_t v4c = _device.rtw_read<uint32_t>(0x4c);
+      if (dpdt_mode == "bit24")
+        _device.rtw_write<uint32_t>(0x4c, v4c | 0x01000000u);
+      else
+        _device.rtw_write<uint32_t>(0x4c, (v4c & ~0x00400000u) | 0x01000000u);
+      /* Same pin-mux family: PAD_CTRL1[29:28] route the WL PAPE/antenna pads.
+       * MacInit sets both (halmac pre-init), but the FW/coex bring-up steps
+       * clear bit29 — re-assert post-coex. */
+      const uint32_t v64 = _device.rtw_read<uint32_t>(0x0064);
+      if ((v64 & 0x30000000u) != 0x30000000u)
+        _device.rtw_write<uint32_t>(0x0064, v64 | 0x30000000u);
+      _logger->warn("Jaguar3(8822e): DPDT/pad pin-mux applied mode={} "
+                    "(0x4c was 0x{:08x})", dpdt_mode, v4c);
+    } else {
+      _logger->warn("Jaguar3(8822e): BISECT — DPDT/pad pin-mux SKIPPED");
+    }
   }
   apply_replay_wseq(); /* DEVOURER_REPLAY_WSEQ golden-init replay (debug) */
   if (_cfg.debug.bb_dump) {

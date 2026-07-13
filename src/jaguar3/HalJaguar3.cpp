@@ -275,9 +275,15 @@ void HalJaguar3::config_channel_8822e(uint8_t channel) {
    * (unvalidated on-air here — see docs/8822e-quirks.md, 2.4 GHz TX).
    *   OFDM 0x820[7:0]=0x31/0x32 (2ss AB, 1ss A@2G / B@5G) + 0x1e2c=0x0400
    *   CCK  0x1a04[31:28]=0xc (AB) */
-  _device.phy_set_bb_reg(0x820, 0xff, is_2g ? 0x31 : 0x32);
-  _device.phy_set_bb_reg(0x1e2c, 0xffff, 0x0400);
-  _device.phy_set_bb_reg(0x1a04, 0xf0000000, 0xc);
+  /* chainb-hunt bisect knob: DEVOURER_SKIP_TX1SS=1 leaves the phy-table
+   * default TX antenna mapping (suspect for GS RX path-B deafness). */
+  if (std::getenv("DEVOURER_SKIP_TX1SS") == nullptr) {
+    _device.phy_set_bb_reg(0x820, 0xff, is_2g ? 0x31 : 0x32);
+    _device.phy_set_bb_reg(0x1e2c, 0xffff, 0x0400);
+    _device.phy_set_bb_reg(0x1a04, 0xf0000000, 0xc);
+  } else {
+    _logger->warn("Jaguar3(8822e): BISECT — 1SS TX path mapping SKIPPED");
+  }
 
   /* phydm_tx_triangular_shap_cfg_8822e: CFR + triangular TX shaping (both bands). */
   _device.phy_set_bb_reg(0xa74, 1u << 31, 0x1);
