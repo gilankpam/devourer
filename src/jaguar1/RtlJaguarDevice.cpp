@@ -486,6 +486,41 @@ bool RtlJaguarDevice::StartBeacon(const uint8_t *beacon, size_t len,
   return true;
 }
 
+bool RtlJaguarDevice::UpdateBeaconPayload(const uint8_t *beacon, size_t len) {
+  if (_bcn_mpdu.empty()) {
+    _logger->error("beacon(J1): UpdateBeaconPayload without an active beacon");
+    return false;
+  }
+  /* Same buffer contract as StartBeacon: strip a leading radiotap header. */
+  size_t rt = (len >= 4) ? (size_t)(beacon[2] | (beacon[3] << 8)) : 0;
+  if (rt > len) rt = 0;
+  /* A fresh BCNQ-boundary store replaces the TBTT engine's buffer (the same
+   * bracket the steers re-download through); the port stays configured and the
+   * TBTT grid is untouched, so no re-ignite is needed. */
+  if (!download_rsvd_beacon(beacon + rt, len - rt)) {
+    _logger->error("beacon(J1): UpdateBeaconPayload rsvd-page store failed");
+    return false;
+  }
+  _bcn_mpdu.assign(beacon + rt, beacon + len);
+  return true;
+}
+
+bool RtlJaguarDevice::StopBeacon() {
+  if (_bcn_mpdu.empty())
+    return false;
+  /* EN_BCN_FUNCTION off (keep DIS_TSF_UDT), StopTxBeacon (0x422[6] clear —
+   * the ResumeTxBeacon inverse), net_type back to No Link. */
+  _device.rtw_write8(0x0550 /* REG_BCN_CTRL */, 0x10);
+  _device.rtw_write8(0x0422, static_cast<uint8_t>(
+                                 _device.rtw_read8(0x0422) & ~0x40u));
+  uint8_t nt = _device.rtw_read8(0x0102);
+  _device.rtw_write8(0x0102, static_cast<uint8_t>(nt & ~0x03u));
+  _bcn_mpdu.clear();
+  _bcn_interval_tu = 0;
+  _logger->info("beacon(J1): stopped (EN_BCN off, StopTxBeacon, net_type->NoLink)");
+  return true;
+}
+
 int32_t RtlJaguarDevice::AdjustBeaconTiming(int32_t microseconds) {
   int nominal = _bcn_interval_tu;
   if (nominal <= 0) return 0;  // no active beacon
@@ -1520,21 +1555,41 @@ devourer::AdapterCaps RtlJaguarDevice::GetAdapterCaps() {
   devourer::set_standard_freq_ranges(c);
 
   /* Identity from the EFUSE version-id. The die name is refined by the RF-type:
-   * the 8812 die shipped as both the 2T2R 8812AU and the 1T1R 8811AU cut. */
+   * the 8812 die shipped as both the 2T2R 8812AU and the 1T1R 8811AU cut.
+   *
+   * LDPC RX truth per die (bench: encoding-matrix devourer↔devourer cells,
+   * HT-LDPC / HT-LDPC+STBC / VHT-LDPC at full delivery, RX-side ldpc flag
+   * cross-checked where the chip reports one):
+   *  - 8812A (incl. 8811A cut): decodes HT+VHT LDPC, reports the RX-desc bit.
+   *  - 8814A: decodes HT+VHT LDPC but has NO per-frame indicator (vendor
+   *    rxdesc parse leaves offsets 16/20 empty; the Jaguar1 phy-status report
+   *    carries no ldpc bit) — RxAtrib.ldpc reads 0 on LDPC frames.
+   *  - 8821A: VHT-LDPC RX broken in the field (Eachine Sphere Link →
+   *    PixelPilot reports); the HT decoder is a separate silicon path and
+   *    passed a prior HT-LDPC bench cell. */
   switch (_eepromManager->version_id.ICType) {
   case CHIP_8814A:
     c.chip_name = "RTL8814A";
     c.marketing_names = "RTL8814AU";
     c.chip_id = 0x08;
     c.variant = "8814A";
+    c.ldpc_rx_ht = true;
+    c.ldpc_rx_vht = true;
+    c.ldpc_rx_flag = false;
     break;
   case CHIP_8821:
     c.chip_name = "RTL8821A";
     c.marketing_names = "RTL8821AU";
     c.chip_id = 0x05;
     c.variant = "8821A";
+    c.ldpc_rx_ht = true;
+    c.ldpc_rx_vht = false;
+    c.ldpc_rx_flag = true;
     break;
   default: /* CHIP_8812 */
+    c.ldpc_rx_ht = true;
+    c.ldpc_rx_vht = true;
+    c.ldpc_rx_flag = true;
     if (_eepromManager->version_id.RFType == RF_TYPE_1T1R) {
       c.chip_name = "RTL8811A";
       c.marketing_names = "RTL8811AU/RTL8811AR";
