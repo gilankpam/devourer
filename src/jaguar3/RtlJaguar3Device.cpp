@@ -8,8 +8,9 @@
 #include <vector>
 
 #include "AckResponder.h"
-#include "RadiotapPeek.h" /* send_packets batch pre-parse */
-#include "TxAggPlan.h"    /* USB TX aggregation URB packing */
+#include "RadiotapPeek.h"   /* send_packets batch pre-parse */
+#include "RadiotapTxFlags.h" /* HT MCS field decoder (LDPC/STBC) */
+#include "TxAggPlan.h"      /* USB TX aggregation URB packing */
 #include "TxReport.h"     /* CCX TX-status report decode + tx.report event */
 
 #include "BeamformingSounder.h" /* generation-neutral BF self-sounding recipe */
