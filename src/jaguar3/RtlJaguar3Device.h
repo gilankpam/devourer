@@ -112,6 +112,8 @@ public:
   devourer::TxPowerCaps GetTxPowerCaps() override;
   int SetTxPowerOffsetQdb(int qdb) override;
   void SetTxPowerIndexOverride(int idx) override;
+  bool SetTxPowerRateDiffs(
+      const std::optional<devourer::TxRateDiffsQdb> &diffs) override;
   bool ReApplyTxPower() override;
   int SetXtalCap(int cap) override;
   int GetXtalCap() override { return _xtal_cap; }
@@ -272,6 +274,10 @@ private:
   /* True while the 0x3a00 per-rate diff table is zeroed (flat semantics /
    * 8822C default) — repeated flat steps then skip the 32-dword re-zero. */
   bool _diffs_zeroed = false;
+  /* Caller-supplied per-rate TXAGC diffs (SetTxPowerRateDiffs), in place of
+   * phy_reg_pg's table when set. 8822E-only; std::nullopt = default table.
+   * Read/written under _reg_mu once brought up. */
+  std::optional<devourer::TxRateDiffsQdb> _rate_diffs;
   /* Re-program TXAGC from the current knob state. full=true re-derives the
    * 8822E efuse refs + rewrites the per-rate diff table (bring-up / channel
    * change / flat<->efuse transitions); full=false is the light offset step.
