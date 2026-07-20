@@ -4,6 +4,7 @@
 #include "EepromManager.h"
 #include "Hal8812PhyReg.h"
 #include "NhmReader.h"
+#include "NoiseFloorMath.h" /* active idle-noise-floor sign/pwdb helpers */
 #include "RadioManagementModule.h"
 #include "AckResponder.h" /* hardware ACK responder recipe */
 #include "RadiotapPeek.h" /* send_packets batch pre-parse */
@@ -11,10 +12,12 @@
 #include "SignalStop.h"
 #include "ToneMask.h"
 #include "TxAggPlan.h" /* USB TX aggregation URB packing */
+#include "TxPower.h"   /* txpkt_pwr_step_for_db — 8814A per-packet LUT */
 #include "TxReport.h"  /* CCX TX-status report decode + tx.report event */
 
 #include <algorithm>
 #include <chrono>
+#include <climits> /* INT_MIN — "no radiotap DBM_TX_POWER" sentinel */
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -297,7 +300,73 @@ RxEnergy RtlJaguarDevice::GetRxEnergy() {
         _device.phy_set_bb_reg(a, m, v);
       },
       e);
+
+  /* Active absolute floor: the debug-port measurement wedges live RX, so
+   * it is NOT re-run here — GetRxEnergy just surfaces the RX-idle CAL taken at
+   * bring-up (measure_idle_noise_floor). Left invalid on the 8814A / when off. */
+  if (_cfg.rx.abs_noise_floor) {
+    e.abs_noise_floor_dbm = _abs_noise_floor;
+    e.valid_noise_floor = _abs_nf_valid;
+  }
   return e;
+}
+
+/* Vendor odm_inband_noise_monitor_ac (8812/8821 active-sampling path). MUST run
+ * RX-idle: the clock-stop (0x8B4[6]) + BB/PMAC/CCK resets collide with a live
+ * bulk-IN RX DMA. Reads the path-A RX I/Q off debug port 0x0FA0, forms
+ * pwdb = 10*log10(I^2+Q^2), averages VALID_CNT idle samples in [-27,0) dB, and
+ * offsets to dBm: noise = avg + 12(ADC backoff) + 0x1C(IGI ref) - 110 - 3. */
+void RtlJaguarDevice::measure_idle_noise_floor() {
+  auto bbset = [this](uint16_t a, uint32_t m, uint32_t v) {
+    _device.phy_set_bb_reg(a, m, v);
+  };
+  const uint8_t igi_save =
+      static_cast<uint8_t>(_device.rtw_read8(0x0C50) & 0x7f);
+  int sum = 0, valid = 0, invalid = 0;
+  while (valid < 5 && invalid < 10) {
+    bbset(0x0C50, 0x7f, 0x1C);        /* fix IGI = 0x1C */
+    bbset(0x08B4, 1u << 6, 1);        /* stop CK320 & CK88 */
+    bbset(0x08FC, 0xFFFFFFFF, 0x200); /* debug port -> RX I/Q buffer (path A) */
+    const uint32_t v =
+        _radioManagement->phy_query_bb_reg_public(0x0FA0, 0xFFFFFFFF);
+    const bool pd = (v >> 31) & 1u;
+    int rxi = static_cast<int>((v & 0xFFC00) >> 10); /* [19:10] */
+    int rxq = static_cast<int>(v & 0x3FF);           /* [9:0] */
+    bool have = false;
+    int pwdb = 0;
+    if (!pd || rxi != 0x200) { /* not in packet-detect / Tx state */
+      rxi = devourer::nf::sign_conversion(rxi, 10);
+      rxq = devourer::nf::sign_conversion(rxq, 10);
+      pwdb = devourer::nf::pwdb_conversion(rxi * rxi + rxq * rxq, 20, 18);
+      have = true;
+    }
+    bbset(0x08B4, 1u << 6, 0); /* restart clocks */
+    _device.rtw_write8(0x0002, _device.rtw_read8(0x0002) & ~1u); /* BB reset */
+    _device.rtw_write8(0x0002, _device.rtw_read8(0x0002) | 1u);
+    _device.rtw_write8(0x0B03, _device.rtw_read8(0x0B03) & ~1u); /* PMAC reset */
+    _device.rtw_write8(0x0B03, _device.rtw_read8(0x0B03) | 1u);
+    if (_device.rtw_read8(0x080B) & (1u << 4)) { /* CCK reset (if enabled) */
+      _device.rtw_write8(0x080B, _device.rtw_read8(0x080B) & ~(1u << 4));
+      _device.rtw_write8(0x080B, _device.rtw_read8(0x080B) | (1u << 4));
+    }
+    if (have && pwdb < 0 && pwdb >= -27) {
+      sum += pwdb;
+      ++valid;
+    } else {
+      ++invalid;
+    }
+  }
+  bbset(0x0C50, 0x7f, igi_save); /* restore IGI */
+  if (valid > 0) {
+    const int noise = sum / valid + 12 + 0x1C - 110 - 3;
+    _abs_noise_floor = static_cast<int8_t>(noise);
+    _abs_nf_valid = true;
+    _logger->info("Jaguar1: idle noise floor = {} dBm ({}/5 samples)", noise,
+                  valid);
+  } else {
+    _abs_nf_valid = false;
+    _logger->warn("Jaguar1: idle noise-floor CAL got no valid samples");
+  }
 }
 
 SelectedChannel RtlJaguarDevice::GetSelectedChannel() { return _channel; }
@@ -833,6 +902,10 @@ size_t RtlJaguarDevice::build_tx_block(const uint8_t *packet, size_t length,
   bool rate_from_radiotap = false;
   /* Per-packet hop target from a radiotap CHANNEL field (0 = none present). */
   int radiotap_channel = 0;
+  /* Per-packet TX-power delta from a radiotap DBM_TX_POWER field (dB vs the
+   * calibrated table; 8814A only — quantized to its descriptor LUT).
+   * INT_MIN = not present -> the SetTxPacketPowerStep session default. */
+  int radiotap_pkt_pwr_db = INT_MIN;
   if (length < sizeof(struct ieee80211_radiotap_header)) {
     return 0;
   }
@@ -881,6 +954,13 @@ size_t RtlJaguarDevice::build_tx_block(const uint8_t *packet, size_t length,
        * the RATE/MCS/VHT fields). */
       radiotap_channel =
           devourer::freq_to_chan(get_unaligned_le16(iterator.this_arg));
+      break;
+
+    case IEEE80211_RADIOTAP_DBM_TX_POWER:
+      /* Signed dB delta for THIS frame — 8814A quantizes it to the dword5
+       * TX_POWER_OFFSET LUT below (the Jaguar2 per-packet convention);
+       * ignored on 8812/8821 (no descriptor field). */
+      radiotap_pkt_pwr_db = *reinterpret_cast<const int8_t *>(iterator.this_arg);
       break;
 
     case IEEE80211_RADIOTAP_MCS: {
@@ -1106,6 +1186,18 @@ size_t RtlJaguarDevice::build_tx_block(const uint8_t *packet, size_t length,
 
   SET_TX_DESC_DATA_STBC_8812(usb_frame, stbc & 3);
 
+  /* Per-packet TX-power offset — 8814A only (dword5 [30:28] hardware LUT,
+   * see FrameParser.h). Radiotap DBM_TX_POWER wins per frame (quantized to
+   * the LUT), else the SetTxPacketPowerStep session default. 0 = baseline,
+   * byte-identical descriptor. Never written on 8812/8821 (no field there). */
+  if (is_8814a) {
+    uint8_t pkt_pwr_step = _tx_pkt_pwr_step.load(std::memory_order_relaxed);
+    if (radiotap_pkt_pwr_db != INT_MIN)
+      pkt_pwr_step = devourer::txpkt_pwr_step_for_db(radiotap_pkt_pwr_db);
+    if (pkt_pwr_step)
+      SET_TX_DESC_TX_POWER_OFFSET_8814A(usb_frame, pkt_pwr_step & 0x7);
+  }
+
   /* DEVOURER_TX_NDPA=1 — beamforming self-sounding probe: mark the injected
    * frame as an NDPA (TX-desc Dword3 [23:22]=1) so the MAC sounding engine
    * follows it with a hardware-generated NDP (pairs with
@@ -1186,6 +1278,13 @@ void RtlJaguarDevice::Init(Action_ParsedRadioPacket packetProcessor,
                   mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
   }
 
+  /* DEVOURER_RX_NOISE_FLOOR — measure the absolute idle floor RX-idle here,
+   * before StartRxLoop starts the bulk-IN DMA (the active-sampling path wedges a
+   * live RX). 8812A/8821A only; the 8814A uses a different vendor path. */
+  if (_cfg.rx.abs_noise_floor &&
+      _eepromManager->version_id.ICType != CHIP_8814A)
+    measure_idle_noise_floor();
+
   StartRxLoop(std::move(packetProcessor));
 }
 
@@ -1263,6 +1362,16 @@ void RtlJaguarDevice::StartRxLoop(Action_ParsedRadioPacket packetProcessor) {
   int rx_urbs = _cfg.rx.urbs.value_or(8);
   if (rx_urbs < 1)
     rx_urbs = 1;
+  /* 16 KB per URB, NOT more: some MediaTek Android xhci hosts never complete
+   * a bulk-IN read larger than 16 KB — LIBUSB_ERROR_TIMEOUT forever, zero RX
+   * (OpenIPC/PixelPilot#6). floppyhammer's #19 fixed this with 16 KB reads +
+   * the ≤16 KB rxagg_usb_size caps (RtlAdapter.cpp); the #213 transport split
+   * kept the rxagg half but regressed the read size to 32 KB. Free on healthy
+   * hosts: aggregates are capped ≤16 KB, so a 32 KB URB never filled past
+   * 16 KB anyway — each aggregate ends its URB via short packet. */
+  int rx_urb_bytes = _cfg.rx.urb_bytes.value_or(16 * 1024);
+  if (rx_urb_bytes < 4096)
+    rx_urb_bytes = 4096;
 
   /* Closed-loop CFO tracking on the receiver (#217): tick the controller on a
    * ~2 s cadence from the RX loop, mirroring Jaguar2/3. The crystal-cap field
@@ -1338,7 +1447,7 @@ void RtlJaguarDevice::StartRxLoop(Action_ParsedRadioPacket packetProcessor) {
       _packetProcessor(p);
     }
   };
-  _device.bulk_read_async_loop(32 * 1024, rx_urbs, on_data, [this]() -> bool {
+  _device.bulk_read_async_loop(rx_urb_bytes, rx_urbs, on_data, [this]() -> bool {
     return should_stop || g_devourer_should_stop;
   });
 
@@ -1464,6 +1573,39 @@ bool RtlJaguarDevice::ReApplyTxPower() {
   return true;
 }
 
+int RtlJaguarDevice::FastSetTxPowerOffsetQdb(int qdb) {
+  if (_cw_active) {
+    /* The CW/continuous-TX paths save+zero the TxScale words; a swing write
+     * mid-tone would corrupt the restore snapshot. */
+    _logger->warn("FastSetTxPowerOffsetQdb refused: CW tone active");
+    return 0;
+  }
+  /* Quantize to 0.5 dB (2 qdB) swing steps, ties away from zero; the radio
+   * module clamps to the [-24, +4] step travel and applies (1-4 BB writes).
+   * Pre-bring-up: record only — the bring-up channel-set folds it. */
+  const int steps = (qdb >= 0 ? qdb * 2 + 2 : qdb * 2 - 2) / 4;
+  const int applied_steps =
+      _radioManagement->FastSwingOffsetSteps(steps, _brought_up);
+  _logger->info("fast TX-power (BB-swing) offset: {} qdB requested -> {} qdB "
+                "applied ({} steps of 0.5 dB)",
+                qdb, applied_steps * 2, applied_steps);
+  return applied_steps * 2;
+}
+
+void RtlJaguarDevice::SetTxPacketPowerStep(uint8_t step) {
+  _tx_pkt_pwr_step = step & 0x7;
+  if (_eepromManager->version_id.ICType != CHIP_8814A) {
+    /* Recorded but inert: the 8812/8821 descriptor has no per-packet power
+     * field — the build path only writes it on the 8814A. */
+    _logger->warn("SetTxPacketPowerStep: 8814A-only (dword5 [30:28]); this "
+                  "chip's descriptor has no per-packet power field — inert");
+    return;
+  }
+  _logger->info("8814A: per-packet TX_POWER_OFFSET default step = {} "
+                "(0=none 1=-3 2=-7 3=-11 4=+3 5=+6 dB)",
+                step & 0x7);
+}
+
 devourer::TxCaps RtlJaguarDevice::GetTxCaps() {
   /* numTotalRfPath is the TX chain count the EFUSE RF-type resolves to (1 on
    * the 8811AU/8821AU 1T1R cuts, 2 on 8812AU, 4 on 8814AU). All Jaguar-1 AC
@@ -1521,6 +1663,18 @@ devourer::AdapterCaps RtlJaguarDevice::GetAdapterCaps() {
     c.narrowband_ok = true;
   }
   c.fastretune_ok = true; /* phy_SwChnl8812_fast (8812/8821) + full-path fallback */
+  /* Per-packet TX power: 8814A only — its dword5 [30:28] descriptor LUT (the
+   * 8822B TXPWR_OFSET position; vendor-defined, vendor-unused). measured
+   * stays false until tests/txpkt_pwr_ofset_onair.sh proves it moves on-air
+   * power. The 8812A/8821A descriptors have no per-frame power field —
+   * their fast lever is FastSetTxPowerOffsetQdb (BB-swing, global). */
+  if (_eepromManager->version_id.ICType == CHIP_8814A) {
+    c.per_packet_txpower = true;
+    c.per_pkt_txpwr_steps = 6;
+    c.per_pkt_txpwr_min_qdb = -44; /* -11 dB LUT floor */
+    c.per_pkt_txpwr_max_qdb = 24;  /* +6 dB LUT top */
+    c.per_pkt_txpwr_measured = false;
+  }
   c.hw_rx_timestamp = true;   /* FrameParser fills RxAtrib.tsfl on every frame */
   c.hw_beacon_txtsf = true;  /* StartBeacon: MAC inserts the egress TSF into
                               * beacons (bench: 8821AU + 8814AU body-TS steps

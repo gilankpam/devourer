@@ -5,6 +5,7 @@
 #include <thread>
 #include <utility>
 
+#include "KestrelLe.h"
 #include "MacRegAx.h"
 #include "SignalStop.h" /* g_devourer_should_stop — set by demo signal handlers */
 #if defined(DEVOURER_HAVE_KESTREL_8852B)
@@ -23,18 +24,11 @@ void delay_us(uint32_t us) {
   std::this_thread::sleep_for(std::chrono::microseconds(us));
 }
 
-uint32_t le32(const uint8_t *p) {
-  return static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8) |
-         (static_cast<uint32_t>(p[2]) << 16) |
-         (static_cast<uint32_t>(p[3]) << 24);
-}
-
-void put_le32(uint8_t *p, uint32_t v) {
-  p[0] = v & 0xFF;
-  p[1] = (v >> 8) & 0xFF;
-  p[2] = (v >> 16) & 0xFF;
-  p[3] = (v >> 24) & 0xFF;
-}
+/* le32 / put_le32 now live in KestrelLe.h (shared with KestrelFwSched.cpp);
+ * pull them into this anonymous namespace so existing unqualified uses below
+ * resolve unchanged. */
+using kestrel::le32;
+using kestrel::put_le32;
 
 } /* namespace */
 
@@ -576,6 +570,11 @@ bool KestrelFw::fw_send_beacon(const uint8_t *body, uint32_t len, uint8_t macid,
 
 bool KestrelFw::send_h2c_cmd(uint8_t cat, uint8_t h2c_class, uint8_t func,
                              const uint8_t *content, uint32_t len) {
+  /* Serialize: this mutates the shared _txbuf scratch + the _h2c_seq counter and
+   * sends one bulk-OUT. Concurrent callers (an H2C issued from the RX/C2H thread
+   * while the control thread issues another) would corrupt the scratch buffer
+   * and desync the firmware H2C-queue sequence. */
+  std::lock_guard<std::mutex> lk(_h2c_mu);
   /* Packet = [descriptor][fwcmd_hdr 8B][content]. Same framing as the FWDL
    * header path but with a caller-supplied cat/class/func and the content inline
    * (no FWDL_EN). The descriptor is the 8852C's 16-byte rxd_short_t

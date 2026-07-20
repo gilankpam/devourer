@@ -19,6 +19,7 @@
 #include "LinkHealth.h"
 #include "RxPacket.h"
 #include "SweepSpec.h"
+#include "TriggerParse.h"
 #include "caps_event.h"
 #if defined(DEVOURER_HAVE_JAGUAR1)
 #include "jaguar1/RtlJaguarDevice.h"
@@ -34,6 +35,7 @@
 #include "UsbOpen.h"
 #include "WiFiDriver.h"
 #include "env_config.h"
+#include "usb_select.h"
 #if defined(DEVOURER_HAVE_PCIE)
 #include "PcieTransport.h"
 #endif
@@ -413,7 +415,12 @@ struct RxAgg {
    * LDPC delivery on the same link). Counts what the chip *reports*: on the
    * 8814A ldpc reads 0 even on LDPC frames (AdapterCaps.ldpc_rx_flag). */
   uint32_t n_ldpc = 0, n_stbc = 0;
-  void add(int rssi, int snr, int evm, bool ldpc = false, bool stbc = false) {
+  /* FCS/ICV-failed frames in the window — nonzero only under
+   * DEVOURER_RX_KEEP_CORRUPTED (the parser drops them otherwise). The
+   * active-link delivery evidence a channel-migration policy consumes. */
+  uint32_t n_crc = 0, n_icv = 0;
+  void add(int rssi, int snr, int evm, bool ldpc = false, bool stbc = false,
+           bool crc = false, bool icv = false) {
     ++n;
     rssi_sum += rssi;
     if (rssi > rssi_max) rssi_max = rssi;
@@ -422,6 +429,8 @@ struct RxAgg {
     if (evm != 0) { evm_sum += evm; ++evm_n; }
     if (ldpc) ++n_ldpc;
     if (stbc) ++n_stbc;
+    if (crc) ++n_crc;
+    if (icv) ++n_icv;
   }
 };
 static RxAgg g_rxagg;
@@ -456,6 +465,15 @@ static const bool g_agg_sa_parsed = []() {
     return true;
   }
   return false;
+}();
+/* DEVOURER_RX_AGG_SA also re-gates the per-frame rx.frame stream in
+ * packetProcessor: env unset keeps the historic canonical-SA-only stream;
+ * "canon"/mac narrows it to that SA; "any" widens it to every frame. A
+ * separate presence flag because "any" parses to no filter (above) yet must
+ * widen the stream gate, while unset must not. */
+static const bool g_agg_sa_env = []() {
+  const char *e = std::getenv("DEVOURER_RX_AGG_SA");
+  return e != nullptr && *e != '\0';
 }();
 static bool agg_sa_match(const Packet &packet) {
   if (!g_agg_sa_filter)
@@ -530,6 +548,29 @@ static void packetProcessor(const Packet &packet) {
 
   ++g_rx_count;
 
+  /* HE Trigger frame (802.11 control, FC=0x24) — aired in a legacy PPDU, so
+   * even an 11ac witness captures the bytes. Decode + surface it as rx.trigger
+   * so a monitor validates what an AX AP's F2P / UL_FIXINFO scheduler airs
+   * (fields vs the commanded config) and resolves the fw RU/mode encoding. */
+  if (devourer::is_trigger_frame(packet.Data.data(), packet.Data.size())) {
+    devourer::TriggerInfo ti;
+    if (devourer::parse_trigger(packet.Data.data(), packet.Data.size(), ti)) {
+      auto ev = devourer::Ev(*g_ev, "rx.trigger");
+      ev.f("ttype", ti.trigger_type)
+          .f("ul_bw", ti.ul_bw)
+          .f("gi_ltf", ti.gi_ltf)
+          .f("nltf", ti.num_he_ltf)
+          .f("ap_pwr", ti.ap_tx_power)
+          .f("users", ti.n_users);
+      if (ti.n_users > 0)
+        ev.f("u0_aid", ti.users[0].aid12)
+            .f("u0_ru", ti.users[0].ru_alloc)
+            .f("u0_mcs", ti.users[0].mcs)
+            .f("u0_ss", ti.users[0].ss);
+    }
+    return; /* a trigger is not a data/mgmt frame — nothing else to match */
+  }
+
   if (g_hop_schedule && packet.Data.size() >= 16 &&
       std::memcmp(packet.Data.data() + 10, kTxSa, 6) == 0) {
     devourer::HopSyncMarker m;
@@ -571,7 +612,8 @@ static void packetProcessor(const Packet &packet) {
     std::lock_guard<std::mutex> lk(g_rxagg_mu);
     g_rxagg.add(packet.RxAtrib.rssi[0], packet.RxAtrib.snr[0],
                 packet.RxAtrib.evm[0], packet.RxAtrib.ldpc != 0,
-                packet.RxAtrib.stbc != 0);
+                packet.RxAtrib.stbc != 0, packet.RxAtrib.crc_err,
+                packet.RxAtrib.icv_err);
   }
 
   if (g_rx_count == 1) {
@@ -627,7 +669,27 @@ static void packetProcessor(const Packet &packet) {
    * one adapter while txdemo runs against another on the same
    * channel, each hit confirms an injected frame made it over the air. */
   if (packet.Data.size() >= 16) {
-    if (std::memcmp(packet.Data.data() + 10, kTxSa, 6) == 0) {
+    const bool sa_canon =
+        std::memcmp(packet.Data.data() + 10, kTxSa, 6) == 0;
+    /* DEVOURER_STREAM_OUT=1: print every stream-SA frame's body (uncapped)
+     * for the stream RX driver (tools/precoder/stream_rx.py) to decode. Tag
+     * is distinct so the regular dump_body capture stays uncluttered. The
+     * stream's SA gate follows DEVOURER_RX_AGG_SA when set — an oracle
+     * watching a foreign transmitter (e.g. a kernel-driver DUT's own MAC)
+     * selects it there — and stays canonical-SA-only when unset. */
+    static const bool stream_out =
+        std::getenv("DEVOURER_STREAM_OUT") != nullptr;
+    const bool stream_sa = g_agg_sa_env ? agg_sa_match(packet) : sa_canon;
+    /* DEVOURER_RX_KEEP_CORRUPTED=1: surface the body even when the chip
+     * flagged CRC/ICV error. Default is to filter them out for the byte-
+     * stream consumer (stream_rx.py), since a body with a wrong tail is
+     * the byte-mode parser's worst-case input. The flag is the entry
+     * point for the corruption_analysis.py tool — by-design opt-in so
+     * accidental enablement doesn't cause IP-stack misery. */
+    static const bool keep_corrupted =
+        std::getenv("DEVOURER_RX_KEEP_CORRUPTED") != nullptr;
+    const bool corrupted = packet.RxAtrib.crc_err || packet.RxAtrib.icv_err;
+    if (sa_canon) {
       static int hits = 0;
       ++hits;
       if (hits <= 10 || hits % 100 == 0) {
@@ -645,7 +707,10 @@ static void packetProcessor(const Packet &packet) {
             .f("rate", packet.RxAtrib.data_rate)
             .f("bw", packet.RxAtrib.bw)
             .f("stbc", packet.RxAtrib.stbc)
-            .f("ldpc", packet.RxAtrib.ldpc);
+            .f("ldpc", packet.RxAtrib.ldpc)
+            /* AX PPDU-format nibble (Kestrel; 255 = pre-AX no field): 7=HE_SU
+             * 8=HE_ERSU — the on-air proof of an ER SU TX. */
+            .f("ppdu_type", packet.RxAtrib.ppdu_type);
       }
 #if defined(DEVOURER_HAVE_JAGUAR1)
       /* F2: BB-dbgport sweep on the first kCsiMaxFrames canonical-SA frames.
@@ -690,20 +755,6 @@ static void packetProcessor(const Packet &packet) {
        * 6M OFDM and that its shaped PSDU bytes round-tripped intact — the
        * two-adapter, no-SDR verification. First few hits only. */
       static const bool dump_body = std::getenv("DEVOURER_DUMP_BODY") != nullptr;
-      /* DEVOURER_STREAM_OUT=1: like DEVOURER_DUMP_BODY but uncapped — print
-       * every canonical-SA frame's body for the stream RX driver
-       * (tools/precoder/stream_rx.py) to decode. Tag is distinct so the
-       * regular dump_body capture stays uncluttered. */
-      static const bool stream_out = std::getenv("DEVOURER_STREAM_OUT") != nullptr;
-      /* DEVOURER_RX_KEEP_CORRUPTED=1: surface the body even when the chip
-       * flagged CRC/ICV error. Default is to filter them out for the byte-
-       * stream consumer (stream_rx.py), since a body with a wrong tail is
-       * the byte-mode parser's worst-case input. The flag is the entry
-       * point for the corruption_analysis.py tool — by-design opt-in so
-       * accidental enablement doesn't cause IP-stack misery. */
-      static const bool keep_corrupted =
-          std::getenv("DEVOURER_RX_KEEP_CORRUPTED") != nullptr;
-      const bool corrupted = packet.RxAtrib.crc_err || packet.RxAtrib.icv_err;
       /* DEVOURER_RX_ALLPATHS=1: emit all four RX chains (A,B,C,D) of per-stream
        * RSSI / SNR / EVM on a distinct `rx.path` event. Opt-in and separate so
        * the canonical two-path `rx.frame`/`rx.body` events stay untouched.
@@ -726,60 +777,6 @@ static void packetProcessor(const Packet &packet) {
             .arr("snr", snr, 4)
             .arr("evm", evm, 4);
       }
-      if (stream_out && (!corrupted || keep_corrupted)) {
-        /* Per-stream phy soft metrics (RSSI / EVM / SNR for paths A,B; on
-         * 8814AU paths C,D would also be non-zero but we surface only A,B
-         * here to stay aligned with rx.body's fields). These are
-         * link-quality measurements at the PHY before decoding — same
-         * source as the Tier-2 diagnostics — so a consumer like
-         * corruption_analysis.py can correlate BER with link quality on a
-         * per-frame basis instead of relying on aggregated statistics. */
-        /* seq + tsfl: chip-side sequence number (12-bit u16) and TSF low
-         * (full 32-bit u32). Consumers can dedup by seq and measure
-         * one-way latency by diffing TSF against the host clock. Optional
-         * fields — pre-#84 regex consumers tolerate them via the same
-         * pass-through pattern. */
-        /* Decoded PHY descriptor fields (bw/stbc/ldpc/sgi) alongside the rate
-         * index: these let an SDR-as-TX completeness harness assert that the
-         * frame devourer received carries the bandwidth / STBC / FEC / guard
-         * interval the transmitter encoded. Valid on 8812/8821; on 8814AU the
-         * RX descriptor doesn't expose these at this offset (FrameParser.cpp),
-         * so they read as the chip's defaults there. */
-        const int rssi[2] = {packet.RxAtrib.rssi[0], packet.RxAtrib.rssi[1]};
-        const int evm[2] = {packet.RxAtrib.evm[0], packet.RxAtrib.evm[1]};
-        const int snr[2] = {packet.RxAtrib.snr[0], packet.RxAtrib.snr[1]};
-        const size_t body_len =
-            packet.Data.size() > 24 ? packet.Data.size() - 24 : 0;
-        auto ev = devourer::Ev(*g_ev, "rx.frame");
-        ev.f("rate", packet.RxAtrib.data_rate)
-            .f("len", packet.Data.size())
-            .f("crc", packet.RxAtrib.crc_err ? 1 : 0)
-            .f("icv", packet.RxAtrib.icv_err ? 1 : 0)
-            .arr("rssi", rssi, 2)
-            .arr("evm", evm, 2)
-            .arr("snr", snr, 2)
-            .f("seq", packet.RxAtrib.seq_num)
-            .f("tsfl", packet.RxAtrib.tsfl)
-            .f("bw", packet.RxAtrib.bw)
-            .f("stbc", packet.RxAtrib.stbc)
-            .f("ldpc", packet.RxAtrib.ldpc)
-            .f("sgi", packet.RxAtrib.sgi)
-            /* A-MPDU RX markers (src/RxPacket.h): paggr = inside an
-             * aggregate; ppdu = the halmac 2-bit received-PPDU counter
-             * (frames sharing a value shared one PPDU). */
-            .f("paggr", packet.RxAtrib.paggr ? 1 : 0)
-            .f("ppdu", packet.RxAtrib.ppdu_cnt)
-            /* FC flags byte (frame byte 1): bit3 = the 802.11 RETRY flag —
-             * distinguishes hardware retransmissions (e.g. an A-MPDU
-             * re-aired for want of a BlockAck) from first airings. */
-            .f("fc1", packet.Data.size() > 1 ? packet.Data[1] : 0);
-        /* tx_tsf: the sender's hardware TX-egress TSF (beacons / probe responses
-         * only). Pair with tsfl — the local hardware RX timestamp above — for
-         * one-way hardware time sync with no host-clock jitter on either end. */
-        if (auto tx = packet.TxEgressTsf())
-          ev.f("tx_tsf", (unsigned long long)*tx);
-        ev.hex("body", packet.Data.data() + 24, body_len);
-      }
       if (dump_body && hits <= 5) {
         /* Tier-2 health diagnostics alongside the byte mirror: rate (0x04 =
          * 6M OFDM), per-stream RSSI/EVM/SNR (link quality — content-blind),
@@ -799,6 +796,63 @@ static void packetProcessor(const Packet &packet) {
             .f("len", packet.Data.size())
             .hex("body", packet.Data.data() + 24, body_len);
       }
+    }
+    if (stream_out && stream_sa && (!corrupted || keep_corrupted)) {
+      /* Per-stream phy soft metrics (RSSI / EVM / SNR for paths A,B; on
+       * 8814AU paths C,D would also be non-zero but we surface only A,B
+       * here to stay aligned with rx.body's fields). These are
+       * link-quality measurements at the PHY before decoding — same
+       * source as the Tier-2 diagnostics — so a consumer like
+       * corruption_analysis.py can correlate BER with link quality on a
+       * per-frame basis instead of relying on aggregated statistics. */
+      /* seq + tsfl: chip-side sequence number (12-bit u16) and TSF low
+       * (full 32-bit u32). Consumers can dedup by seq and measure
+       * one-way latency by diffing TSF against the host clock. Optional
+       * fields — pre-#84 regex consumers tolerate them via the same
+       * pass-through pattern. */
+      /* Decoded PHY descriptor fields (bw/stbc/ldpc/sgi) alongside the rate
+       * index: these let an SDR-as-TX completeness harness assert that the
+       * frame devourer received carries the bandwidth / STBC / FEC / guard
+       * interval the transmitter encoded. Valid on 8812/8821; on 8814AU the
+       * RX descriptor doesn't expose these at this offset (FrameParser.cpp),
+       * so they read as the chip's defaults there. */
+      const int rssi[2] = {packet.RxAtrib.rssi[0], packet.RxAtrib.rssi[1]};
+      const int evm[2] = {packet.RxAtrib.evm[0], packet.RxAtrib.evm[1]};
+      const int snr[2] = {packet.RxAtrib.snr[0], packet.RxAtrib.snr[1]};
+      const size_t body_len =
+          packet.Data.size() > 24 ? packet.Data.size() - 24 : 0;
+      auto ev = devourer::Ev(*g_ev, "rx.frame");
+      ev.f("rate", packet.RxAtrib.data_rate)
+          .f("len", packet.Data.size())
+          .f("crc", packet.RxAtrib.crc_err ? 1 : 0)
+          .f("icv", packet.RxAtrib.icv_err ? 1 : 0)
+          .arr("rssi", rssi, 2)
+          .arr("evm", evm, 2)
+          .arr("snr", snr, 2)
+          .f("seq", packet.RxAtrib.seq_num)
+          .f("tsfl", packet.RxAtrib.tsfl)
+          .f("bw", packet.RxAtrib.bw)
+          .f("stbc", packet.RxAtrib.stbc)
+          .f("ldpc", packet.RxAtrib.ldpc)
+          .f("sgi", packet.RxAtrib.sgi)
+          /* A-MPDU RX markers (src/RxPacket.h): paggr = inside an
+           * aggregate; ppdu = the halmac 2-bit received-PPDU counter
+           * (frames sharing a value shared one PPDU). */
+          .f("paggr", packet.RxAtrib.paggr ? 1 : 0)
+          .f("ppdu", packet.RxAtrib.ppdu_cnt)
+          /* FC flags byte (frame byte 1): bit3 = the 802.11 RETRY flag —
+           * distinguishes hardware retransmissions (e.g. an A-MPDU
+           * re-aired for want of a BlockAck) from first airings. */
+          .f("fc1", packet.Data.size() > 1 ? packet.Data[1] : 0);
+      /* sa: the transmitter address the stream gate matched on — lets a
+       * multi-source consumer attribute frames when the gate is "any". */
+      ev.hex("sa", packet.Data.data() + 10, 6);
+      /* tx_tsf: the sender's hardware TX-egress TSF (beacons / probe responses
+       * only). Pair with tsfl — the local hardware RX timestamp above — for
+       * one-way hardware time sync with no host-clock jitter on either end. */
+      if (auto tx = packet.TxEgressTsf())
+        ev.f("tx_tsf", (unsigned long long)*tx);
+      ev.hex("body", packet.Data.data() + 24, body_len);
     }
   }
 }
@@ -926,79 +980,12 @@ int main() {
                         ? LIBUSB_LOG_LEVEL_DEBUG
                         : LIBUSB_LOG_LEVEL_WARNING);
 
-  /* DEVOURER_PID env var (hex, e.g. "0x8813") restricts the open loop to a
-   * single PID. Useful when multiple Realtek adapters are plugged.
-   * DEVOURER_VID overrides the VID (default 0x0bda Realtek) — needed to reach
-   * OEM-rebadged Jaguar dongles like the TP-Link Archer T2U Plus (2357:0120). */
-  const char *pid_env = std::getenv("DEVOURER_PID");
-  uint16_t target_pid = 0;
-  if (pid_env != nullptr) {
-    target_pid = static_cast<uint16_t>(std::strtoul(pid_env, nullptr, 0));
-    logger->info("DEVOURER_PID={:04x} (limiting to this PID)", target_pid);
-  }
-  uint16_t target_vid = USB_VENDOR_ID;
-  if (const char *vid_env = std::getenv("DEVOURER_VID")) {
-    target_vid = static_cast<uint16_t>(std::strtoul(vid_env, nullptr, 0));
-    logger->info("DEVOURER_VID={:04x} (overriding default VID)", target_vid);
-  }
-  libusb_device_handle *dev_handle = nullptr;
-
-  /* DEVOURER_USB_BUS (+ optional DEVOURER_USB_PORT) select a specific device by
-   * USB topology when several share one VID:PID and even the serial — e.g. two
-   * RTL8814AU dongles (CF-938AC vs CF-960AC) that enumerate identically, so only
-   * the bus/port tells them apart. DEVOURER_USB_PORT is the dotted libusb port
-   * path (as in sysfs `devpath` / `lsusb -t`, e.g. "2.3.2"). When bus is unset,
-   * the VID:PID open loop below runs as before. */
-  if (const char *bus_env = std::getenv("DEVOURER_USB_BUS")) {
-    const auto want_bus = static_cast<uint8_t>(std::strtoul(bus_env, nullptr, 0));
-    const char *port_env = std::getenv("DEVOURER_USB_PORT");
-    libusb_device **list = nullptr;
-    ssize_t n = libusb_get_device_list(ctx, &list);
-    for (ssize_t i = 0; i < n && dev_handle == NULL; ++i) {
-      libusb_device_descriptor dd{};
-      if (libusb_get_device_descriptor(list[i], &dd) != 0) continue;
-      if (dd.idVendor != target_vid) continue;
-      if (target_pid != 0 && dd.idProduct != target_pid) continue;
-      if (libusb_get_bus_number(list[i]) != want_bus) continue;
-      if (port_env != nullptr) {
-        uint8_t ports[8];
-        int pc = libusb_get_port_numbers(list[i], ports, sizeof(ports));
-        std::string path;
-        for (int p = 0; p < pc; ++p)
-          path += (path.empty() ? "" : ".") + std::to_string(ports[p]);
-        if (path != port_env) continue;
-      }
-      if (libusb_open(list[i], &dev_handle) == 0)
-        logger->info("Opened device {:04x}:{:04x} on bus {} port {}", dd.idVendor,
-                     dd.idProduct, want_bus, port_env ? port_env : "(any)");
-    }
-    if (list != nullptr) libusb_free_device_list(list, 1);
-    if (dev_handle == NULL)
-      logger->error("DEVOURER_USB_BUS={} PORT={} matched no device", want_bus,
-                    port_env ? port_env : "(any)");
-  }
-
-  for (uint16_t pid : kRealtekProductIds) {
-    if (dev_handle != NULL) break;
-    if (target_pid != 0 && pid != target_pid) continue;
-    dev_handle = libusb_open_device_with_vid_pid(ctx, target_vid, pid);
-    if (dev_handle != NULL) {
-      logger->info("Opened device {:04x}:{:04x}", target_vid, pid);
-      break;
-    }
-  }
-  /* DEVOURER_PID can name a PID not in kRealtekProductIds (e.g. 0x0120 for the
-   * T2U Plus). Try that direct combination once before giving up. */
-  if (dev_handle == NULL && target_pid != 0) {
-    dev_handle = libusb_open_device_with_vid_pid(ctx, target_vid, target_pid);
-    if (dev_handle != NULL) {
-      logger->info("Opened device {:04x}:{:04x} (via DEVOURER_PID)",
-                   target_vid, target_pid);
-    }
-  }
+  /* DEVOURER_PID / DEVOURER_VID / DEVOURER_USB_BUS / DEVOURER_USB_PORT device
+   * selection — shared with the other multi-adapter demos (usb_select.h). */
+  libusb_device_handle *dev_handle = open_selected_usb(
+      ctx, logger, kRealtekProductIds,
+      sizeof(kRealtekProductIds) / sizeof(kRealtekProductIds[0]));
   if (dev_handle == NULL) {
-    logger->error("Cannot find any supported device under VID {:04x}",
-                  target_vid);
     libusb_exit(ctx);
     return 1;
   }
@@ -1013,15 +1000,19 @@ int main() {
    * still suppresses the reset for a warm pickup (firmware already running).
    * See src/UsbOpen.h. */
   std::shared_ptr<devourer::UsbDeviceLock> usb_lock;
-  rc = devourer::claim_interface_then_reset(dev_handle, devourer::find_wifi_interface(dev_handle), logger, std::getenv("DEVOURER_SKIP_RESET") == nullptr,
-      usb_lock);
+  /* Reopen variant: recovers in place when the reset re-enumerates the device
+   * (a warm Kestrel drops its firmware back to ROM on reset — the handle goes
+   * stale and the dongle may pass through its ZeroCD id before returning). */
+  rc = devourer::claim_interface_reset_reopen(ctx, dev_handle, logger,
+      std::getenv("DEVOURER_SKIP_RESET") == nullptr, usb_lock);
   devourer::Ev(*g_ev, "init.timing")
       .f("stage", "demo.usb_reset")
       .f("ms", ms_since_start());
   if (rc != 0) {
     /* BUSY => another process owns the adapter; any other error => open failed.
      * Either way, exit cleanly rather than asserting. */
-    libusb_close(dev_handle);
+    if (dev_handle != nullptr)
+      libusb_close(dev_handle);
     libusb_exit(ctx);
     return 1;
   }
@@ -1153,9 +1144,15 @@ int main() {
             ev.f("igi", e.igi);
           else
             ev.f("igi", nullptr);
+          if (e.valid_noise_floor) /* active absolute floor (opt-in) */
+            ev.f("abs_noise_floor_dbm", e.abs_noise_floor_dbm);
+          else
+            ev.f("abs_noise_floor_dbm", nullptr);
           ev.f("frames", agg.n)
               .f("frames_ldpc", agg.n_ldpc)
               .f("frames_stbc", agg.n_stbc)
+              .f("crc_err", agg.n_crc)
+              .f("icv_err", agg.n_icv)
               .f("rssi_mean", rssi_mean)
               .f("rssi_max", agg.n ? agg.rssi_max : 0)
               .f("snr_mean", snr_mean)
@@ -1233,6 +1230,13 @@ int main() {
             ev.f("noise_floor_dbm", q.noise_floor_dbm);
           else
             ev.f("noise_floor_dbm", nullptr);
+          /* Active/frame-free absolute floor (DEVOURER_RX_NOISE_FLOOR): the
+           * companion to the passive floor above. Null unless opted-in AND the
+           * generation supports it (Jaguar2 live / Jaguar1 8812A CAL). */
+          if (q.abs_nf_valid)
+            ev.f("abs_noise_floor_dbm", q.abs_noise_floor_dbm);
+          else
+            ev.f("abs_noise_floor_dbm", nullptr);
           ev.f("igi", q.igi_valid ? q.igi : -1);
 
           /* Live per-chain RX-path activity (GetActiveRxPaths) — which
@@ -1478,6 +1482,8 @@ int main() {
             .f("frames", agg.n)
             .f("frames_ldpc", agg.n_ldpc)
             .f("frames_stbc", agg.n_stbc)
+            .f("crc_err", agg.n_crc)
+            .f("icv_err", agg.n_icv)
             .f("rssi_mean", rssi_mean)
             .f("rssi_max", agg.n ? agg.rssi_max : 0)
             .f("snr_mean", snr_mean)

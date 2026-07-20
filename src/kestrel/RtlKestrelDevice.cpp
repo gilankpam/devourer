@@ -1,5 +1,6 @@
 #include "RtlKestrelDevice.h"
 
+#include <climits> /* INT_MIN = "no radiotap DBM_TX_POWER" sentinel */
 #include <cstdint>
 #include <span>
 #include <stdexcept>
@@ -7,6 +8,8 @@
 #include <utility>
 
 #include "FrameParserKestrel.h"
+#include "KestrelLe.h"
+#include "RadiotapBuilder.h" /* build_stream_radiotap — host-injected trigger */
 #include "RadiotapPeek.h"
 #include "RateDefinitions.h" /* MGN_* rate enum */
 #include "MacRegAx.h"
@@ -17,6 +20,11 @@
 #include "ieee80211_radiotap.h" /* radiotap iterator + field ids */
 
 namespace {
+
+/* The canonical injection source address (examples/tx/main.cpp beacon SA); the
+ * WD macid-0 ADDR_CAM entry programmed in InitWrite resolves to it. Shared by
+ * the self-STA registration and the host-injected Basic Trigger's TA. */
+constexpr uint8_t kInjectSA[6] = {0x57, 0x42, 0x75, 0x05, 0xd6, 0x00};
 
 /* mac_ax get_chip_info() register pair (reference/rtl8852bu
  * phl/hal_g6/mac/mac_ax.c + mac_reg_ax.h). R_AX_SYS_CHIPINFO shares the
@@ -206,6 +214,10 @@ void RtlKestrelDevice::InitWrite(SelectedChannel channel) {
    * pure-monitor RX path keeps CCA on and can actually hear frames. */
   _hal.set_cca_on(_cfg.debug.kestrel_cca_on);
   EnableTxScheduler();
+  /* DEVOURER_DIS_CCA: EnableTxScheduler already cleared the CCA gates for TX;
+   * this just re-asserts it explicitly (idempotent) when the knob is set. */
+  if (_cfg.tuning.disable_cca)
+    SetCcaMode(true);
   _tx_mgmt_ep = _device.nth_bulk_out_ep(0); /* B0MG -> BULKOUTID0 */
   _tx_data_ep = _device.nth_bulk_out_ep(3); /* ACH0 -> BULKOUTID3 */
   if (_tx_mgmt_ep == 0) {
@@ -224,13 +236,18 @@ void RtlKestrelDevice::InitWrite(SelectedChannel channel) {
    * queued frames air and their PLE pages release — without it the mgmt
    * bulk-OUT stalls deterministically at ~103. SA = the canonical injection
    * source address (examples/tx/main.cpp beacon SA). */
-  static const uint8_t kInjectSA[6] = {0x57, 0x42, 0x75, 0x05, 0xd6, 0x00};
   _hal.add_self_sta(kInjectSA, /*macid=*/0);
   _hal.enable_tx_report(kestrel::reg::USR_TX_RPT_MODE_PERIOD, 0, 0);
   /* Diagnostic (DEVOURER_KESTREL_FWLOG): route the fw log to C2H packets to
    * probe whether async packet-C2H reaches the host at all (task #12/#236). */
   if (_cfg.debug.kestrel_fw_log)
     _hal.enable_fw_log_c2h();
+  /* Arm the HE sounding engine (mac_init_snd_mer/_mee): the beamformer CSI-parse
+   * offsets + beamformee response/CSI options so StartSounding can air an
+   * NDPA -> NDP -> BFRP sequence and receive the report HE TB PPDU. Idempotent
+   * register writes on otherwise-unused CMAC sounding regs; matches the vendor
+   * init order (mac_init_snd at bring-up). */
+  _hal.init_sounding();
   _logger->info("Kestrel: TX ready on ch{} — mgmt ep 0x{:02x} data ep 0x{:02x}",
                 channel.Channel, _tx_mgmt_ep, _tx_data_ep);
   /* One-shot thermal snapshot at bring-up (RF 0x42 meter vs efuse baseline) —
@@ -255,14 +272,19 @@ void RtlKestrelDevice::StartRxLoop(Action_ParsedRadioPacket packetProcessor) {
   /* Async bulk-IN ring; walk each aggregate with the 11ax rxd parser. The
    * buffer must hold a full RXAGG aggregate (the 8852C LEN_TH is ~20 KB), or
    * large aggregates overflow/truncate and RX delivery stalls. */
+  /* Per-die drv_info granularity (vendor RX_DESC_DRV_INFO_UNIT_8852{B,C}):
+   * 8 bytes on the 8852B, 16 on the 8852C — the one RX-descriptor layout
+   * divergence between the dies. */
+  const uint16_t drv_info_unit =
+      _variant == kestrel::ChipVariant::C8852C ? 16 : 8;
   _device.bulk_read_async_loop(
       32768, 8,
-      [&](const uint8_t *data, int n) {
+      [&, drv_info_unit](const uint8_t *data, int n) {
         uint32_t off = 0;
         while (off + 16 <= static_cast<uint32_t>(n)) {
           kestrel::KestrelRxFrame f;
           if (!kestrel::parse_rx_8852b(data + off, static_cast<size_t>(n) - off,
-                                       f))
+                                       f, drv_info_unit))
             break;
           if (f.rpkt_type == kestrel::RPKT_TYPE_PPDU && f.payload_len >= 6) {
             /* physts header (halbb physts_hdr_info): byte3 = rssi_avg_td, byte4+
@@ -270,15 +292,38 @@ void RtlKestrelDevice::StartRxLoop(Action_ParsedRadioPacket packetProcessor) {
              * for the following WIFI frame(s). */
             _last_rssi[0] = static_cast<uint8_t>(f.payload[4] >> 1);
             _last_rssi[1] = static_cast<uint8_t>(f.payload[5] >> 1);
+            /* Per-frame SNR for the passive floor: the 8-byte header is followed
+             * by the IEs; IE_01 (OFDM/HE info, physts_ie_1_info) is
+             * the first for a decodable OFDM/HE PPDU. Self-validate on its ie_hdr
+             * (byte0 [4:0] == 1) before trusting the offset: avg_snr is IE byte 8
+             * [5:0] in dB. Store as raw = dB*2 (the RxQualityAccumulator
+             * convention snr_db = raw/2). 0 when IE_01 absent (e.g. CCK).
+             * On-air-validated on BOTH dies (passive floor cross-matches the
+             * NHM floor within ~1 dB): the C8852C physts is bit-identical to the
+             * C8852B once its measurement engine is brought up (the 8852C branch
+             * in kestrel_halbb_rx_bringup + the R_AX_PPDU_STAT no-APP-prepend
+             * config in bb_reset_all) — same header, same IE_01 offset. */
+            _last_snr = 0;
+            if (f.payload_len >= 8 + 9 && (f.payload[8] & 0x1f) == 1)
+              _last_snr = static_cast<uint8_t>((f.payload[16] & 0x3f) * 2);
           } else if (f.rpkt_type == kestrel::RPKT_TYPE_WIFI && packetProcessor) {
             Packet p{};
             p.RxAtrib.pkt_len = static_cast<uint16_t>(f.payload_len);
             p.RxAtrib.crc_err = f.crc_err;
             p.RxAtrib.icv_err = f.icv_err;
             p.RxAtrib.data_rate = f.rx_rate; /* 9-bit AX code (HE >= 0x180) */
+            p.RxAtrib.bw = f.bw;
+            p.RxAtrib.ppdu_type = f.ppdu_type; /* 7=HE_SU 8=HE_ERSU */
+            p.RxAtrib.ppdu_cnt = f.ppdu_cnt;
             p.RxAtrib.tsfl = f.freerun_cnt;
             p.RxAtrib.rssi[0] = _last_rssi[0];
             p.RxAtrib.rssi[1] = _last_rssi[1];
+            p.RxAtrib.snr[0] = _last_snr;
+            /* Feed the windowed RX-quality aggregate (passive rssi-snr floor +
+             * LinkHealth). rssi_raw = dBm+110 (== _last_rssi), snr_raw = dB*2;
+             * a frame with no IE_01 SNR (snr=0) still counts toward RSSI. */
+            if (_last_rssi[0] > 0)
+              _rxq.add(_last_rssi[0], _last_snr, 0);
             p.Data = std::span<uint8_t>(const_cast<uint8_t *>(f.payload),
                                         f.payload_len);
             packetProcessor(p);
@@ -299,6 +344,60 @@ void RtlKestrelDevice::StartRxLoop(Action_ParsedRadioPacket packetProcessor) {
 void RtlKestrelDevice::SetMonitorChannel(SelectedChannel channel) {
   _channel = channel;
   _hal.set_channel(channel.Channel, channel.ChannelWidth, channel.ChannelOffset, channel.Band);
+}
+
+void RtlKestrelDevice::SetCcaMode(bool disabled) {
+  /* RMW the MAC carrier-sense gate: R_AX_CCA_CFG_0 B_AX_CCA_ALL_EN = primary CCA
+   * + sec20/40/80 + EDCCA (bits 0-4). Same field EnableTxScheduler clears for TX
+   * injection, so this composes with it (last writer wins). Only 0xC340 — NOT the
+   * 0xC390 per-phase EDCCA machinery (the Jaguar3 lesson: deeper CCA writes deafen
+   * RX; B_AX_CCA_ALL_EN already covers EDCCA via bit 4). No lock: Kestrel is
+   * lock-free on registers (the RX/WP-drain thread only touches the bulk-IN ep).
+   * The TX default is already CCA-off; carrier-sense TX needs the un-ported
+   * IQK/DPK cal to fully engage (see HalKestrel::sch_tx_en). */
+  namespace r = kestrel::reg;
+  uint32_t v = _device.rtw_read32(r::R_AX_CCA_CFG_0);
+  if (disabled)
+    v &= ~r::B_AX_CCA_ALL_EN;
+  else
+    v |= r::B_AX_CCA_ALL_EN;
+  _device.rtw_write32(r::R_AX_CCA_CFG_0, v);
+  _logger->info("Kestrel: MAC carrier-sense {} (CCA_CFG_0=0x{:08x})",
+                disabled ? "DISABLED (dis_cca)" : "enabled", v);
+}
+
+RxEnergy RtlKestrelDevice::GetRxEnergy() {
+  RxEnergy e; /* no phydm FA/CCA/IGI DIG monitor on Kestrel */
+  /* DEVOURER_RX_NOISE_FLOOR — active/frame-free absolute floor via the halbb NHM
+   * env-monitor. Frame-free, BB-driven, no clock-stop -> no wedge.
+   * ~mntr_time (100 ms) of control-thread wait; opt-in. Guard to a plausible
+   * idle-floor band so a not-ready/garbage report never emits a fake dBm.
+   *
+   * The C8852C NHM is band-limited to 2.4 GHz. On-air it reads correctly there
+   * (cross-matches its passive floor within ~2 dB, stable), but on 5 GHz the
+   * AGC drifts ~1.5 s after a channel tune and LOCKS the NHM ~24 dB high (a
+   * bimodal gain-state lock, not a fixed offset the halbb SW path handles — it
+   * treats the 8852C identically to the 8852B, and the physts RSSI is correct;
+   * only a full set_channel re-tune resets it, and RX traffic re-drives it). So
+   * the 8852C emits the NHM on 2.4 GHz and falls back to the passive rssi-snr
+   * floor (GetRxQuality) on 5 GHz. The C8852B NHM is correct on both bands. */
+  const bool nhm_supported =
+      _variant == kestrel::ChipVariant::C8852B ||
+      (_variant == kestrel::ChipVariant::C8852C && _channel.Channel <= 14);
+  if (_cfg.rx.abs_noise_floor && nhm_supported) {
+    int8_t nf = 0;
+    if (_hal.nhm_noise_floor(nf) && nf <= -60 && nf >= -105) {
+      e.abs_noise_floor_dbm = nf;
+      e.valid_noise_floor = true;
+    }
+  }
+  return e;
+}
+
+devourer::RxQuality RtlKestrelDevice::GetRxQuality() {
+  /* Fuse the per-frame aggregate (passive rssi-snr floor + LinkHealth, fed by
+   * the RX loop via _rxq) with the active NHM floor from GetRxEnergy. */
+  return devourer::build_rx_quality(_rxq.snapshot(), GetRxEnergy());
 }
 
 void RtlKestrelDevice::FastRetune(uint8_t channel, bool /*cache_rf*/) {
@@ -376,6 +475,26 @@ void RtlKestrelDevice::handle_c2h(const uint8_t *payload, uint32_t len) {
                     rpt.freerun_last_out, rpt.pending_1k[0], rpt.pending_1k[1],
                     rpt.pending_1k[2], rpt.pending_1k[3]);
     }
+  } else if (cls == r::FWCMD_C2H_CL_TWT) {
+    /* TWT C2H (content after the 8-byte fwcmd header). WAIT_ANNOUNCE: dword0 =
+     * wait_case[3:0] | macid0[15:8] | macid1[23:16] | macid2[31:24].
+     * TWT_NOTIFY_EVT: dword0 = type[7:0] | twt_id[10:8]; dword1/2 = TSF lo/hi —
+     * the TSF-stamped notify instant (cross-check against ReadTsf). */
+    const uint8_t *c = payload + 8;
+    const uint32_t clen = len - 8;
+    if (func == r::FWCMD_C2H_FUNC_WAIT_ANNOUNCE && clen >= 4) {
+      const uint32_t d0 = kestrel::le32(c);
+      _logger->info("Kestrel twt.wait_anno: wait_case={} macid0={} macid1={} "
+                    "macid2={}",
+                    d0 & 0xf, (d0 >> 8) & 0xff, (d0 >> 16) & 0xff,
+                    (d0 >> 24) & 0xff);
+    } else if (func == r::FWCMD_C2H_FUNC_TWT_NOTIFY_EVT && clen >= 12) {
+      const uint32_t d0 = kestrel::le32(c);
+      const uint64_t tsf = static_cast<uint64_t>(kestrel::le32(c + 4)) |
+                           (static_cast<uint64_t>(kestrel::le32(c + 8)) << 32);
+      _logger->info("Kestrel twt.notify: type={} twt_id={} tsf=0x{:016x}",
+                    d0 & 0xff, (d0 >> 8) & 0x7, tsf);
+    }
   }
 }
 
@@ -418,6 +537,8 @@ int RtlKestrelDevice::SetTxPowerOffsetQdb(int qdb) {
   if (eff < kKestrelTxMinQdb) eff = kKestrelTxMinQdb;
   if (eff > kKestrelTxMaxQdb) eff = kKestrelTxMaxQdb;
   const int16_t applied = static_cast<int16_t>(eff - base);
+  _sess_pwr_qdb = applied; /* restore target for frames without a radiotap
+                            * DBM_TX_POWER field (see send_packet) */
   _hal.set_txpwr_offset_qdb(applied);
   _logger->info("Kestrel: SetTxPowerOffsetQdb({}) -> applied {} qdB "
                 "(effective {} dBm)",
@@ -467,6 +588,116 @@ bool RtlKestrelDevice::StartBeacon(const uint8_t *beacon, size_t len,
                            /*bss_color=*/0, kestrel::reg::MAC_AX_OFDM6);
 }
 
+bool RtlKestrelDevice::SendTrigger(const devourer::TriggerConfig &cfg) {
+  if (_tx_mgmt_ep == 0) {
+    _logger->error("Kestrel: SendTrigger before InitWrite");
+    return false;
+  }
+  /* F2P_TEST is an MP-only fw entry the shipped client fw silently drops (it
+   * airs nothing). The default path host-builds a raw 802.11ax Basic Trigger and
+   * injects it through the proven mgmt TX path — the same path StartBeacon-less
+   * send_packet uses to actually put frames on the air. RA = broadcast unless
+   * cfg.ra is set (a Basic Trigger addresses its users by AID12, so an
+   * associated STA matches on its AID). TA MUST be the AP's BSSID — a station
+   * rejects a Trigger whose TA is not the AP it associated to — so use cfg.ta;
+   * fall back to the injection SA only when the caller left it unset. */
+  if (!_cfg.debug.kestrel_trigger_f2p) {
+    static const uint8_t kBcast[6] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
+    const bool have_ta = cfg.ta != std::array<uint8_t, 6>{};
+    const bool have_ra = cfg.ra != std::array<uint8_t, 6>{};
+    const uint8_t *ta = have_ta ? cfg.ta.data() : kInjectSA;
+    const uint8_t *ra = have_ra ? cfg.ra.data() : kBcast;
+    /* FC+dur+RA+TA+common + 8 users x 6B (Basic) + pad marker(2) + padding(4). */
+    uint8_t frame[2 + 2 + 6 + 6 + 8 + 8 * 6 + 2 + 4];
+    size_t flen = devourer::build_basic_trigger(cfg, ra, ta, frame,
+                                                 sizeof(frame));
+    if (flen == 0) {
+      _logger->error("Kestrel: SendTrigger build_basic_trigger failed");
+      return false;
+    }
+    /* Trigger frames air non-HT (legacy OFDM 6M — the default TxMode). Prepend
+     * the radiotap the send_packet contract expects, then the raw trigger. */
+    devourer::TxMode m; /* Legacy 6M, 20 MHz */
+    std::vector<uint8_t> pkt = devourer::build_stream_radiotap(m);
+    pkt.insert(pkt.end(), frame, frame + flen);
+    send_packet(pkt.data(), static_cast<uint32_t>(pkt.size()));
+    _logger->info("Kestrel: SendTrigger injected Basic Trigger ({} B, {} users, "
+                  "u0_aid={}) via mgmt ep",
+                  flen, cfg.n_users == 0 ? 1 : cfg.n_users, cfg.users[0].aid12);
+    return true;
+  }
+  return _hal.send_trigger(cfg);
+}
+
+bool RtlKestrelDevice::ConfigureTwt(const devourer::TwtConfig &cfg) {
+  if (_tx_mgmt_ep == 0) {
+    _logger->error("Kestrel: ConfigureTwt before InitWrite");
+    return false;
+  }
+  return _hal.configure_twt(cfg);
+}
+
+bool RtlKestrelDevice::TeardownTwt(const devourer::TwtConfig &cfg) {
+  if (_tx_mgmt_ep == 0)
+    return false;
+  return _hal.teardown_twt(cfg);
+}
+
+bool RtlKestrelDevice::TwtBindSta(const devourer::TwtStaAct &act) {
+  if (_tx_mgmt_ep == 0) {
+    _logger->error("Kestrel: TwtBindSta before InitWrite");
+    return false;
+  }
+  return _hal.twt_bind_sta(act);
+}
+
+bool RtlKestrelDevice::ConfigureTwtOfdma(const devourer::TwtOfdmaConfig &cfg) {
+  if (_tx_mgmt_ep == 0) {
+    _logger->error("Kestrel: ConfigureTwtOfdma before InitWrite");
+    return false;
+  }
+  return _hal.configure_twt_ofdma(cfg);
+}
+
+bool RtlKestrelDevice::ConfigureUlOfdma(const devourer::UlOfdmaConfig &cfg) {
+  if (_tx_mgmt_ep == 0) {
+    _logger->error("Kestrel: ConfigureUlOfdma before InitWrite");
+    return false;
+  }
+  return _hal.configure_ul_ofdma(cfg);
+}
+
+bool RtlKestrelDevice::RegisterPeerSta(const uint8_t peer_mac[6], uint8_t macid,
+                                       uint8_t addr_cam_idx) {
+  if (_tx_mgmt_ep == 0) {
+    _logger->error("Kestrel: RegisterPeerSta before InitWrite");
+    return false;
+  }
+  return _hal.register_peer_sta(peer_mac, macid, addr_cam_idx);
+}
+
+bool RtlKestrelDevice::RegisterBeamformee(const uint8_t peer_mac[6],
+                                          uint8_t macid, uint8_t addr_cam_idx,
+                                          const devourer::StaBfCaps &bf) {
+  if (_tx_mgmt_ep == 0) {
+    _logger->error("Kestrel: RegisterBeamformee before InitWrite");
+    return false;
+  }
+  /* The peer must exist as a fw role/ADDR_CAM entry first (same as a scheduled-
+   * UL peer); then layer the CSI/bf params + hw sounding maps on top. */
+  bool ok = _hal.register_peer_sta(peer_mac, macid, addr_cam_idx);
+  ok = _hal.register_beamformee(macid, addr_cam_idx, bf) && ok;
+  return ok;
+}
+
+bool RtlKestrelDevice::StartSounding(const devourer::SoundingConfig &cfg) {
+  if (_tx_mgmt_ep == 0) {
+    _logger->error("Kestrel: StartSounding before InitWrite");
+    return false;
+  }
+  return _hal.start_sounding(cfg);
+}
+
 devourer::AdapterCaps RtlKestrelDevice::GetAdapterCaps() {
   devourer::AdapterCaps c;
   c.supported = true;
@@ -480,9 +711,36 @@ devourer::AdapterCaps RtlKestrelDevice::GetAdapterCaps() {
   c.bw_mask = devourer::bw_mask_for_generation(c.generation);
   if (_variant == kestrel::ChipVariant::C8852C)
     c.bw_mask |= devourer::kBw160; /* 8852C-only (vendor bw_sup BW_CAP_160M) */
-  c.per_packet_txpower = false; /* AX power is TSSI, not the J2 descriptor LUT */
+  /* Per-packet TX power: no WD-descriptor field exists on AX — a radiotap
+   * DBM_TX_POWER dB-delta is honoured per frame by rewriting the fixed-dBm BB
+   * target between frames (2 RMWs on value change, free while constant;
+   * global, so a HW beacon airing between frames follows). Continuous
+   * quarter-dB, clamped to the [0, 23] dBm PA window around the session
+   * base. */
+  c.per_packet_txpower = true;
+  c.per_pkt_txpwr_steps = 0; /* continuous qdB, not a LUT */
+  c.per_pkt_txpwr_step_qdb = 1;
+  {
+    const int16_t base = _hal.txpwr_base_qdb();
+    c.per_pkt_txpwr_min_qdb = static_cast<int16_t>(kKestrelTxMinQdb - base);
+    c.per_pkt_txpwr_max_qdb = static_cast<int16_t>(kKestrelTxMaxQdb - base);
+  }
+  c.per_pkt_txpwr_measured = true; /* on-air: both dies, LUT-mapped session
+                                    * sweep 5/5 + radiotap cells 2/2
+                                    * (tests/txpkt_pwr_ofset_onair.sh, ch36,
+                                    * 14 dBm base, chip-RSSI ground) */
   c.narrowband_ok = true; /* 5/10 MHz BB small-BW (SDR-validated); FastSetBandwidth toggle */
   c.fastretune_ok = true; /* lean intra-band 20 MHz retune (FastRetune) */
+  /* HE ER SU + DCM: both dies (AX_TXD_DATA_ER/_BW_ER/_DCM in the TX WD; RX
+   * classifies via the descriptor ppdu_type nibble). */
+  c.he_er_su_ok = true;
+  /* 802.11ax scheduled UL: HE Trigger (F2P) + UL_FIXINFO scheduler + the TWT
+   * agreement surface — the fw command surface both dies expose. */
+  c.trigger_ul_ok = true;
+  c.twt_ok = true;
+  /* HE sounding (NDPA/NDP/BFRP -> report HE TB PPDU): the production trigger
+   * path armed in InitWrite (init_sounding) + StartSounding / RegisterBeamformee. */
+  c.sounding_ok = true;
   c.hw_rx_timestamp = true;     /* rx freerun_cnt -> RxAtrib.tsfl */
   /* The AX beacon engine (StartBeacon) airs a HW-timed beacon with the live TSF
    * inserted by the MAC at TX — on-air validated on the 8852BU. */
@@ -527,6 +785,8 @@ bool RtlKestrelDevice::send_packet(const uint8_t *packet, size_t length) {
   bool he = false; /* HE rate set directly on tr.rate (no MGN_HE code) */
   bool rate_from_radiotap = false; /* a per-packet radiotap rate overrides the
                                     * SetTxMode default */
+  int pkt_pwr_db = INT_MIN; /* radiotap DBM_TX_POWER dB-delta vs the session
+                             * base; INT_MIN = field absent (session offset) */
   kestrel::TxRate tr{}; /* defaults: 6M, 20MHz, LGI */
   auto *rth = reinterpret_cast<struct ieee80211_radiotap_header *>(
       const_cast<uint8_t *>(packet));
@@ -537,6 +797,11 @@ bool RtlKestrelDevice::send_packet(const uint8_t *packet, size_t length) {
       case IEEE80211_RADIOTAP_RATE:
         mgn = *it.this_arg;
         rate_from_radiotap = true;
+        break;
+      case IEEE80211_RADIOTAP_DBM_TX_POWER:
+        /* Per-packet TX power: a signed dB delta vs the session base, applied
+         * as a fixed-dBm BB rewrite before this frame airs (see below). */
+        pkt_pwr_db = *reinterpret_cast<const int8_t *>(it.this_arg);
         break;
       case IEEE80211_RADIOTAP_MCS: {
         rate_from_radiotap = true;
@@ -575,20 +840,54 @@ bool RtlKestrelDevice::send_packet(const uint8_t *packet, size_t length) {
           return static_cast<uint16_t>(it.this_arg[w * 2] |
                                        (it.this_arg[w * 2 + 1] << 8));
         };
-        const uint16_t d3 = rd16(2), d5 = rd16(4), d6 = rd16(5);
-        const unsigned mcs =
-            (d3 & IEEE80211_RADIOTAP_HE_DATA3_DATA_MCS) >> 8;
+        const uint16_t d1 = rd16(0), d3 = rd16(2), d5 = rd16(4), d6 = rd16(5);
+        unsigned mcs = (d3 & IEEE80211_RADIOTAP_HE_DATA3_DATA_MCS) >> 8;
         unsigned nss = d6 & IEEE80211_RADIOTAP_HE_DATA6_NSTS;
         if (nss < 1) nss = 1;
         if (nss > 4) nss = 4;
-        if (mcs <= 11) {
-          tr.rate = static_cast<uint16_t>(0x180 + (nss - 1) * 16 + mcs);
-          he = true;
-        }
         if (d3 & IEEE80211_RADIOTAP_HE_DATA3_CODING) tr.ldpc = true;
         if (d3 & IEEE80211_RADIOTAP_HE_DATA3_STBC) tr.stbc = true;
         const unsigned bw = d5 & IEEE80211_RADIOTAP_HE_DATA5_DATA_BW_RU_ALLOC;
         tr.bw = static_cast<uint8_t>(bw > 2 ? 2 : bw); /* 0=20 1=40 2=80 */
+        /* HE ER SU (extended range): FORMAT=EXT_SU selects the ER SU PPDU
+         * (AX_TXD_DATA_ER); a BW_RU_ALLOC of 106-tone picks the upper-bandwidth
+         * ER variant (AX_TXD_DATA_BW_ER). DCM (data3 bit 12) stacks on SU or
+         * ER SU. Out-of-spec combos are clamped with one W line rather than
+         * handed to the MAC — an unresolvable rate word stalls the scheduler
+         * and NAKs the bulk-OUT. */
+        if ((d1 & IEEE80211_RADIOTAP_HE_DATA1_FORMAT_MASK) ==
+            IEEE80211_RADIOTAP_HE_DATA1_FORMAT_EXT_SU) {
+          tr.er = true;
+          tr.er_106 = (bw == IEEE80211_RADIOTAP_HE_DATA5_RU_106);
+          tr.bw = 0; /* ER SU is a 20 MHz-only format */
+          const unsigned mcs_max = tr.er_106 ? 0 : 2; /* 242-tone: MCS0-2 */
+          if (nss > 1 || mcs > mcs_max) {
+            _logger->warn("Kestrel HE ER SU clamp: nss {}->1 mcs {}->{} ({}-tone)",
+                          nss, mcs, mcs > mcs_max ? mcs_max : mcs,
+                          tr.er_106 ? 106 : 242);
+            nss = 1;
+            if (mcs > mcs_max)
+              mcs = mcs_max;
+          }
+        }
+        if (d3 & IEEE80211_RADIOTAP_HE_DATA3_DATA_DCM) {
+          /* DCM pairs with MCS 0/1/3/4 (0/1 under ER SU) and excludes STBC. */
+          const bool dcm_mcs_ok =
+              tr.er ? (mcs <= 1) : (mcs <= 1 || mcs == 3 || mcs == 4);
+          if (!dcm_mcs_ok) {
+            _logger->warn("Kestrel HE DCM dropped: mcs {} not DCM-capable", mcs);
+          } else {
+            tr.dcm = true;
+            if (tr.stbc) {
+              _logger->warn("Kestrel HE DCM excludes STBC: dropping STBC");
+              tr.stbc = false;
+            }
+          }
+        }
+        if (mcs <= 11) {
+          tr.rate = static_cast<uint16_t>(0x180 + (nss - 1) * 16 + mcs);
+          he = true;
+        }
         const unsigned gi =
             (d5 & IEEE80211_RADIOTAP_HE_DATA5_GI) >>
             IEEE80211_RADIOTAP_HE_DATA5_GI_SHIFT;
@@ -610,21 +909,67 @@ bool RtlKestrelDevice::send_packet(const uint8_t *packet, size_t length) {
   }
   /* No per-packet radiotap rate -> apply the SetTxMode default (DEVOURER_TX_RATE)
    * so a rate-less frame (the demo beacon) airs at the requested rate/BW rather
-   * than the 6M/20MHz fallback. Mirrors the Jaguar path. HE-via-SetTxMode is not
-   * expressed here (HE rides the radiotap-HE path); legacy/HT/VHT + BW apply. */
+   * than the 6M/20MHz fallback. Mirrors the Jaguar path. */
   if (!rate_from_radiotap && !he && _tx_mode_default.has_value()) {
-    const devourer::TxParams tp =
-        devourer::tx_mode_to_params(*_tx_mode_default);
-    mgn = tp.fixed_rate;
-    tr.bw = tp.bwidth == CHANNEL_WIDTH_40   ? 1
-            : tp.bwidth == CHANNEL_WIDTH_80 ? 2
-                                            : 0; /* narrowband -> DATA_BW 20 */
-    tr.gi_ltf = tp.sgi ? 1 : 0;
-    tr.ldpc = tp.ldpc;
-    tr.stbc = tp.stbc;
+    const devourer::TxMode &m = *_tx_mode_default;
+    if (m.mode == devourer::TxMode::Mode::HE) {
+      /* HE expressed natively (tx_mode_to_params has no HE mapping — it would
+       * silently fall back to VHT and the frame would air as a VHT_SU PPDU,
+       * bench-caught via the RX ppdu_type nibble). ER/DCM limits were already
+       * clamped at parse time; a programmatic SetTxMode is clamped here the
+       * same way. */
+      unsigned nss = m.he_nss < 1 ? 1 : (m.he_nss > 4 ? 4 : m.he_nss);
+      unsigned mcs = m.he_mcs <= 11 ? m.he_mcs : 0;
+      tr.bw = m.bw_mhz >= 160 ? 3 : m.bw_mhz >= 80 ? 2 : m.bw_mhz >= 40 ? 1 : 0;
+      tr.gi_ltf = m.he_gi_ltf & 0x7;
+      tr.ldpc = m.ldpc;
+      tr.stbc = m.stbc;
+      if (m.he_er) {
+        tr.er = true;
+        tr.er_106 = (m.he_er == 2);
+        tr.bw = 0;
+        nss = 1;
+        const unsigned mcs_max = tr.er_106 ? 0 : 2;
+        if (mcs > mcs_max)
+          mcs = mcs_max;
+      }
+      if (m.he_dcm && (mcs <= 1 || (!m.he_er && (mcs == 3 || mcs == 4)))) {
+        tr.dcm = true;
+        tr.stbc = false; /* DCM excludes STBC */
+      }
+      tr.rate = static_cast<uint16_t>(0x180 + (nss - 1) * 16 + mcs);
+      he = true;
+    } else {
+      const devourer::TxParams tp = devourer::tx_mode_to_params(m);
+      mgn = tp.fixed_rate;
+      tr.bw = tp.bwidth == CHANNEL_WIDTH_40   ? 1
+              : tp.bwidth == CHANNEL_WIDTH_80 ? 2
+                                              : 0; /* narrowband -> DATA_BW 20 */
+      tr.gi_ltf = tp.sgi ? 1 : 0;
+      tr.ldpc = tp.ldpc;
+      tr.stbc = tp.stbc;
+    }
   }
   if (!he)
     tr.rate = kestrel::mgn_to_ax_rate(mgn);
+  /* Per-packet TX power: the AX WD descriptor has no power field, but the
+   * fixed-dBm BB target is a 2-RMW rewrite — reprogram it between frames when
+   * the requested level changes (free while it stays constant), and restore
+   * the session offset for a frame without the field. Global, like the J1
+   * BB-swing lever: a HW beacon airing between frames follows the last-written
+   * level. Clamped to the same PA-valid window as SetTxPowerOffsetQdb. */
+  {
+    int16_t target = _sess_pwr_qdb;
+    if (pkt_pwr_db != INT_MIN) {
+      const int16_t base = _hal.txpwr_base_qdb();
+      int eff = base + pkt_pwr_db * 4;
+      if (eff < kKestrelTxMinQdb) eff = kKestrelTxMinQdb;
+      if (eff > kKestrelTxMaxQdb) eff = kKestrelTxMaxQdb;
+      target = static_cast<int16_t>(eff - base);
+    }
+    if (target != _hal.txpwr_offset_qdb())
+      _hal.set_txpwr_offset_qdb(target);
+  }
   /* Route by 802.11 frame type: data frames ride the AC0 queue (BULKOUTID3) so
    * they exercise the data power-by-rate path; mgmt/beacon uses the MG0 queue
    * (BULKOUTID0). Falls back to the mgmt ep if the data ep was not resolved. */

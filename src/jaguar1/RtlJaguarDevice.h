@@ -58,6 +58,9 @@ class RtlJaguarDevice : public IRtlDevice {
   /* A-MPDU TX mode (SetAmpduMode). Read lock-free in the TX descriptor path
    * (same pattern as _tx_mode_default). */
   devourer::AmpduMode _ampdu;
+  /* Default per-packet TX-power LUT step — 8814A only (dword5 [30:28]);
+   * see SetTxPacketPowerStep. */
+  std::atomic<uint8_t> _tx_pkt_pwr_step{0};
 
   /* CW single-tone (StartCwTone/StopCwTone) saved state for a clean restore:
    * the pre-tone RF 0x00 and four BB dwords — RFE-pinmux words on 8812/8821
@@ -130,6 +133,24 @@ public:
   int SetTxPowerOffsetQdb(int qdb) override;
   void SetTxPowerIndexOverride(int idx) override;
   bool ReApplyTxPower() override;
+  /* Per-packet TX-power offset default — 8814A ONLY (its dword5 [30:28]
+   * descriptor LUT at the 8822B TXPWR_OFSET position: 0=none 1=-3 2=-7
+   * 3=-11 4=+3 5=+6 dB; see FrameParser.h). Stamped into every TX
+   * descriptor; a radiotap DBM_TX_POWER field overrides per packet (dB
+   * delta quantized to the LUT, devourer::txpkt_pwr_step_for_db). Warns and
+   * stays inert on 8812/8821 — their descriptor has no such field (rate
+   * selection is their only per-packet power lever). */
+  void SetTxPacketPowerStep(uint8_t step);
+  /* Fast global TX-power offset via the BB-swing digital scaler — the lean
+   * Jaguar1 power lever: 1-4 BB writes (~0.5 dB steps, -12..+2
+   * dB) vs the 30-50+ write TXAGC rewrite of SetTxPowerOffsetQdb. Per-burst,
+   * NOT per-packet (the 8812A/8821A descriptor has no power field — this is
+   * the closest those chips have). Composes with SetTxPowerOffsetQdb (a
+   * separate hardware stage: digital IQ scaling after the TXAGC index) and
+   * with the 8812A thermal tracker (folded post-clamp, survives its ticks).
+   * EVM caveat above 0 dB: positive digital swing eats DAC headroom, capped
+   * at +2 dB (the vendor thermal bound). Returns the applied qdB. */
+  int FastSetTxPowerOffsetQdb(int qdb);
   int SetXtalCap(int cap) override;
   int GetXtalCap() override { return _xtal_cap; }
   devourer::TxPowerState GetTxPowerState() override;
@@ -267,6 +288,16 @@ public:
    * -1 = never set (chip at the table default, all paths). */
   void SetRxPathMask(uint8_t mask);
   int GetRxPathMask();
+
+  /* Active idle-noise-floor CAL (8812A/8821A only). The vendor
+   * odm_inband_noise_monitor_ac debug-port path stops CK320/CK88 and resets
+   * BB/PMAC/CCK, which wedges a live bulk-IN RX DMA — so it MUST run RX-idle.
+   * Called at bring-up (before StartRxLoop); result cached and surfaced via
+   * GetRxEnergy. Left invalid on the 8814A (different vendor path) and when
+   * DEVOURER_RX_NOISE_FLOOR is off. */
+  void measure_idle_noise_floor();
+  int8_t _abs_noise_floor = 0;
+  bool _abs_nf_valid = false;
 
   bool should_stop = false;
 

@@ -14,6 +14,8 @@
 #include "RxSense.h"
 #include "SelectedChannel.h"
 #include "ThermalStatus.h"
+#include "Sounding.h"
+#include "TriggerTwt.h"
 #include "TxCaps.h"
 #include "TxMode.h"
 #include "TxPower.h"
@@ -242,6 +244,70 @@ public:
   virtual void ClearAmpduMode() {}
   virtual devourer::AmpduMode GetAmpduMode() { return {}; }
 
+  /* 802.11ax trigger-based UL + TWT (src/TriggerTwt.h) — the standards-native
+   * scheduled, contention-free UL access. Kestrel (RTL8852) only: the AP airs
+   * an HE Trigger frame that grants each STA a resource unit and a start time
+   * (SIFS after the trigger), and the STA MAC fires its UL-OFDMA TX at that
+   * instant in hardware. Every method returns false where unsupported (the
+   * Jaguar generations have no HE trigger/TWT firmware surface). */
+
+  /* Air one HE Basic Trigger (UL-OFDMA grant) via the firmware F2P command. */
+  virtual bool SendTrigger(const devourer::TriggerConfig & /*cfg*/) {
+    return false;
+  }
+
+  /* Create/modify a TWT agreement (wake window, interval, absolute target-wake
+   * TSF); TeardownTwt deletes it. The AP owns the timetable. */
+  virtual bool ConfigureTwt(const devourer::TwtConfig & /*cfg*/) { return false; }
+  virtual bool TeardownTwt(const devourer::TwtConfig & /*cfg*/) { return false; }
+  /* Bind/unbind a STA (macid) to a TWT config (add/del/terminate/...). */
+  virtual bool TwtBindSta(const devourer::TwtStaAct & /*act*/) { return false; }
+
+  /* Program the fw-autonomous trigger cadence inside a TWT service period
+   * (TWT-OFDMA). Returns false where the fw lacks the (non-canonical) command —
+   * ConfigureUlOfdma is the canonical fallback. */
+  virtual bool ConfigureTwtOfdma(const devourer::TwtOfdmaConfig & /*cfg*/) {
+    return false;
+  }
+
+  /* Program the production UL-OFDMA scheduler table (UL_FIXINFO). With
+   * mode=tf_periodic the fw airs Triggers autonomously at the configured
+   * interval — the transport-independent scheduled-UL primitive. */
+  virtual bool ConfigureUlOfdma(const devourer::UlOfdmaConfig & /*cfg*/) {
+    return false;
+  }
+
+  /* Register an associated peer STA (a scheduled-UL client): its macid + ADDR_CAM
+   * so a Trigger's per-user grant scores against it. `peer_mac` is the STA's
+   * address, `addr_cam_idx` must be unique per peer. The AP-side companion to
+   * SendTrigger/ConfigureUlOfdma for the end-to-end UL path. Returns false where
+   * unsupported. */
+  virtual bool RegisterPeerSta(const uint8_t /*peer_mac*/[6], uint8_t /*macid*/,
+                               uint8_t /*addr_cam_idx*/) {
+    return false;
+  }
+
+  /* Register an associated HE STA (macid) as a beamformee to sound: program its
+   * per-STA CSI/bf params (nc/nr/ng/cb/cs) + the sounding-status/CSI-buffer maps
+   * so a BFRP to it solicits a decodable compressed-beamforming report. The
+   * AP-side companion to StartSounding. Returns false where unsupported. */
+  virtual bool RegisterBeamformee(const uint8_t /*peer_mac*/[6], uint8_t /*macid*/,
+                                  uint8_t /*addr_cam_idx*/,
+                                  const devourer::StaBfCaps & /*bf*/) {
+    return false;
+  }
+
+  /* Drive one HE sounding: hand the fw the NDPA -> NDP -> BFRP descriptor set (a
+   * BFRP is an 802.11ax Trigger-frame variant) to build and air, soliciting the
+   * beamformee's report as a hardware-scheduled HE TB PPDU (RxAtrib.ppdu_type ==
+   * 10). Measured: the shipped client NIC firmware accepts the H2C but does not
+   * air the sequence (the fw sounding-transmit engine is AP-firmware-only) — the
+   * path that actually airs a Trigger on this firmware is host-injection
+   * (SendTrigger). Returns false where unsupported. See docs/he-trigger-ul.md. */
+  virtual bool StartSounding(const devourer::SoundingConfig & /*cfg*/) {
+    return false;
+  }
+
   /* Batch TX: submit `count` frames (each buffer = radiotap header + 802.11
    * MPDU, the send_packet contract) in one call. With USB TX aggregation
    * enabled (DeviceConfig tx.usb_agg_max > 0) the USB generations pack
@@ -326,17 +392,25 @@ public:
    * returns false when no beacon was active. */
   virtual bool StopBeacon() { return false; }
 
-  /* Disable / restore the MAC EDCCA energy-detect gate (the vendor dis_cca
-   * recipe). With EDCCA off the MAC does not defer TX to carrier-sense, so a
-   * TBTT beacon airs exactly on schedule instead of after a CSMA backoff — the
-   * lever that collapses the hardware-beacon downlink residual to sub-µs on a
-   * shared channel (the master owns the channel). Also DEVOURER_DIS_CCA at
-   * construction. Implemented on Jaguar2/3; a DELIBERATE no-op on Jaguar1,
-   * whose baseband EDCCA is already disabled by its init table (0x8A4 =
-   * 0x7F7F7F7F) — its hardware-beacon downlink measures ~0.34 µs RMS on a
-   * crowded channel with no MAC-side gate, and porting the J2 register
-   * recipe was bench-refuted (no gain; the 0x524[11] clear conflicts with
-   * the vendor beacon-enable state). */
+  /* Disable / restore the MAC carrier-sense gate that defers TX — both primary
+   * CCA (0x520[14], carrier-sense of a decodable preamble) and EDCCA (0x520[15],
+   * energy detect). With it off the MAC does not defer TX to a busy channel, so
+   * injected/beacon TX punches through co-channel traffic instead of backing off:
+   * a TBTT beacon airs exactly on schedule (the sub-µs hardware-beacon downlink,
+   * master-owns-the-channel), and host-injected data holds its rate through a
+   * co-channel transmitter. Measured on-air (Jaguar3, 8822EU/8812CU): monitor
+   * injection otherwise defers ~40-60% to a co-channel 802.11 flooder; clearing
+   * the gate recovers ~1.5-2.2x, back to ~90% of the unimpeded rate
+   * (tests/dis_cca_tx_onair.sh). The energy bit [15] alone is null
+   * against a decodable preamble — the primary-CCA bit [14] is what recovers the
+   * inject path. This is the MAC-gate only; the vendor's BB CCA-off writes are
+   * NOT applied (they deafen the RX). Also DEVOURER_DIS_CCA at construction.
+   * Implemented on Jaguar2/3 and Kestrel (the AX R_AX_CCA_CFG_0 all-CCA-EN field —
+   * on Kestrel injection is already CCA-off by default via sch_tx_en, so this is a
+   * runtime toggle rather than the deferral fix it is on Jaguar); a DELIBERATE
+   * no-op on Jaguar1, whose baseband EDCCA is already disabled by its init table
+   * (0x8A4 = 0x7F7F7F7F) and whose hardware-beacon downlink measures ~0.34 µs RMS
+   * on a crowded channel with no MAC-side gate. */
   virtual void SetCcaMode(bool disabled) { (void)disabled; }
 
   /* Shift the next hardware beacon TBTT by `microseconds` (>0 = later/retard,

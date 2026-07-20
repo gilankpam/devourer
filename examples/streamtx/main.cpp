@@ -195,17 +195,28 @@ int main(int argc, char **argv) {
    * guard — a second devourer on this adapter gets BUSY here and bails before
    * the reset, so it can't re-enumerate the adapter out from under the owner. */
   std::shared_ptr<devourer::UsbDeviceLock> usb_lock;
-  rc = devourer::claim_interface_then_reset(handle, devourer::find_wifi_interface(handle), logger,
+  /* Reopen variant: recovers in place when the reset re-enumerates the
+   * device (warm Kestrel firmware-drop through ROM / ZeroCD). */
+  rc = devourer::claim_interface_reset_reopen(context, handle, logger,
       termux_fd == 0 && std::getenv("DEVOURER_SKIP_RESET") == nullptr, usb_lock);
   if (rc != 0) {
-    libusb_close(handle);
+    if (handle != nullptr)
+      libusb_close(handle);
     libusb_exit(context);
     return 1;
   }
 
   WiFiDriver wifi_driver{logger};
+  auto stream_cfg = devourer_config_from_env();
+  /* FPV downlink default: disable the MAC carrier-sense gate so the video TX
+   * punches through co-channel traffic instead of deferring — on-air ~1.5-2.2x
+   * inject-rate recovery under a co-channel transmitter (SetCcaMode /
+   * DEVOURER_DIS_CCA). The link owns the channel, so CSMA back-off only stutters
+   * it. Explicit DEVOURER_DIS_CCA=0 still forces standard carrier-sense back on. */
+  if (std::getenv("DEVOURER_DIS_CCA") == nullptr)
+    stream_cfg.tuning.disable_cca = true;
   auto rtlDevice = wifi_driver.CreateRtlDevice(handle, nullptr, usb_lock,
-                                               devourer_config_from_env());
+                                               stream_cfg);
   /* Jaguar1-only research features (TXAGC override, fast-retune hopping) aren't
    * on the IRtlDevice contract — downcast for them; jag is null on Jaguar3, and
    * the downcast plus its call sites compile out when Jaguar1 isn't built. */

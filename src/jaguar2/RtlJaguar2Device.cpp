@@ -207,6 +207,12 @@ void RtlJaguar2Device::bring_up(SelectedChannel channel) {
   }
   _brought_up = true;
 
+  /* DEVOURER_DIS_CCA — disable the MAC carrier-sense gate at bring-up (as
+   * Jaguar3 does) so injected/beacon TX punches through a busy channel instead
+   * of deferring. Runtime equivalent: SetCcaMode. */
+  if (_cfg.tuning.disable_cca)
+    SetCcaMode(true);
+
   /* DEVOURER_XTAL_CAP — apply the crystal-cap trim once the AFE is up
    * (issue #217, the narrowband CFO lever). */
   if (_cfg.tuning.xtal_cap)
@@ -556,7 +562,14 @@ void RtlJaguar2Device::StartRxLoop(Action_ParsedRadioPacket packetProcessor) {
       off += f.next_offset;
     }
   };
-  _device.bulk_read_async_loop(32 * 1024, 8, on_data, [this]() -> bool {
+  /* ≤16 KB per URB — some MediaTek Android xhci hosts never complete larger
+   * bulk-IN reads (OpenIPC/PixelPilot#6; see DeviceConfig::Rx::urb_bytes).
+   * Paired with the ≤16 KB agg threshold in HalmacJaguar2MacInit::init_usb_cfg
+   * so an aggregate never spans two URBs and breaks the next_offset walk. */
+  int rx_urb_bytes = _cfg.rx.urb_bytes.value_or(16 * 1024);
+  if (rx_urb_bytes < 4096)
+    rx_urb_bytes = 4096;
+  _device.bulk_read_async_loop(rx_urb_bytes, 8, on_data, [this]() -> bool {
     return _rx_stop || g_devourer_should_stop;
   });
   stop_dig();
@@ -807,9 +820,17 @@ void RtlJaguar2Device::FastRetune(uint8_t channel, bool cache_rf) {
     return;
   /* Serialize against the thermal-track tick's RF-window read. */
   std::lock_guard<std::mutex> lk(_reg_mu);
+  const bool band_change = (_channel.Channel <= 14) != (channel <= 14);
   if (_hal.fast_retune(channel, static_cast<uint8_t>(_channel.ChannelWidth),
                        _channel.ChannelOffset, cache_rf)) {
     _channel.Channel = channel;
+    /* Only the fw fast path (DEVOURER_FASTRETUNE_FW=2) accepts a band
+     * change; the firmware retunes the chip but TXAGC folding is host-side —
+     * re-fold active power knobs against the new band's table (the same
+     * gating SetMonitorChannel applies). */
+    if (band_change && _brought_up &&
+        (_tx_pwr_offset_steps != 0 || _tx_pwr_override >= 0))
+      apply_tx_power_current();
     return;
   }
   /* Fast path declined (band change / never tuned) — full channel set at the
@@ -863,6 +884,58 @@ RxEnergy RtlJaguar2Device::GetRxEnergy() {
         _device.phy_set_bb_reg(a, m, v);
       },
       e);
+
+  /* DEVOURER_RX_NOISE_FLOOR — active/frame-free absolute floor. The
+   * vendor phydm_idle_noise_measure_ac: the BB maintains an idle-time power
+   * report at 0x0FF0 (path-A [7:0], path-B [15:8], sval = byte>>1); freeze it
+   * (0x9E4[30]=1) for a clean read, then noise = -110 + IGI(0xC50/0xE50) + mean.
+   * Wedge-free: no clock-stop and no BB/PMAC/CCK reset (unlike the 8812A/8821A
+   * debug-port path), so it runs safely under live RX. Serialized on _reg_mu.
+   *
+   * BEST-EFFORT on the tested 8812BU (1x1 8822B cut): the report is only rarely
+   * populated in devourer's monitor bring-up — most reads return the 0x80/0x00
+   * "no idle sample" sentinels. Investigated: there is no vendor
+   * enable step for it (the report is HW-automatic and the vendor runs the
+   * measurement from a full associated init, not monitor mode); the sentinel
+   * rate is channel-independent, oversampling barely helps, and pausing DIG
+   * (fixing IGI) makes it worse. So this oversamples and GUARDS: 0x80/0x00 bytes
+   * are dropped and >=3 live samples in a plausible band are required, else
+   * valid_noise_floor stays false (never a fake dBm) — accuracy over valid-rate.
+   * When it does read, it cross-matches the Jaguar1 floor within a few dB on the
+   * same channel. A 2T2R 8822BU or a fuller init may populate it reliably. */
+  if (_cfg.rx.abs_noise_floor) {
+    std::lock_guard<std::mutex> lk(_reg_mu);
+    const int paths = _hal.chip_version().rf_2t2r ? 2 : 1;
+    int sum[2] = {0, 0}, cnt[2] = {0, 0};
+    bool any_nonzero = false;
+    for (int s = 0; s < 48; ++s) {
+      _device.phy_set_bb_reg(0x09E4, 1u << 30, 1); /* freeze idle-power report */
+      const uint32_t tmp = _device.rtw_read<uint32_t>(0x0FF0);
+      _device.phy_set_bb_reg(0x09E4, 1u << 30, 0); /* resume 5-us updates */
+      for (int p = 0; p < paths; ++p) {
+        const uint8_t byte = (tmp >> (8 * p)) & 0xff;
+        if (byte == 0x80 || byte == 0x00) /* "no idle sample" sentinels */
+          continue;
+        any_nonzero = true;
+        sum[p] += static_cast<int8_t>(byte) >> 1;
+        ++cnt[p];
+      }
+    }
+    const bool ok = any_nonzero && cnt[0] >= 3 && (paths == 1 || cnt[1] >= 3);
+    if (ok) {
+      int noise = -110 + (_device.rtw_read8(0x0C50) & 0x7f) + sum[0] / cnt[0];
+      if (paths == 2)
+        noise = (noise + (-110 + (_device.rtw_read8(0x0E50) & 0x7f) +
+                          sum[1] / cnt[1])) /
+                2;
+      if (noise <= -70 && noise >= -105) { /* plausible idle-floor band; a read
+                                              outside it is interference or a bad
+                                              report sample, not the idle floor */
+        e.abs_noise_floor_dbm = static_cast<int8_t>(noise);
+        e.valid_noise_floor = true;
+      }
+    }
+  }
   return e;
 }
 
@@ -978,7 +1051,13 @@ devourer::AdapterCaps RtlJaguar2Device::GetAdapterCaps() {
                            ? 0x20
                            : (_hal.efuse_logical_byte(0xB9) & 0x3f);
   c.fastretune_ok = true;
-  c.per_packet_txpower = true; /* TX descriptor TXPWR_OFSET LUT — Jaguar2 only */
+  /* TX descriptor TXPWR_OFSET LUT — on-air-confirmed: the RSSI sweep tracks
+   * the vendor 0/-3/-7/-11/+3/+6 dB rungs (tests/txpkt_pwr_ofset_onair.sh). */
+  c.per_packet_txpower = true;
+  c.per_pkt_txpwr_steps = 6;
+  c.per_pkt_txpwr_min_qdb = -44; /* -11 dB LUT floor */
+  c.per_pkt_txpwr_max_qdb = 24;  /* +6 dB LUT top */
+  c.per_pkt_txpwr_measured = true;
   /* LDPC RX: both variants decode HT+VHT LDPC (bench: encoding-matrix
    * devourer↔devourer cells at full delivery, 8822BU cross-checked reporting
    * ldpc=1) and report it per-frame from PHY-status byte7[5]
@@ -1643,14 +1722,18 @@ int32_t RtlJaguar2Device::PinBeaconTbtt(int32_t offset_us) {
 
 void RtlJaguar2Device::SetCcaMode(bool disabled) {
   std::lock_guard<std::mutex> lk(_reg_mu);
+  /* Both MAC carrier-sense bits in REG_TX_PTCL_CTRL: primary CCA 0x520[14] +
+   * EDCCA [15], plus EDCCA_MSK_COUNTDOWN 0x524[11]. The primary-CCA bit is the
+   * one that stops TX deferring to a co-channel transmitter; 0x520
+   * is the same HalMAC layout as the on-air-validated Jaguar3. */
   uint32_t v520 = _device.rtw_read<uint32_t>(0x0520);
   uint32_t v524 = _device.rtw_read<uint32_t>(0x0524);
-  if (disabled) { v520 |= (1u << 15); v524 &= ~(1u << 11); }
-  else          { v520 &= ~(1u << 15); v524 |= (1u << 11); }
+  if (disabled) { v520 |= (1u << 15) | (1u << 14); v524 &= ~(1u << 11); }
+  else          { v520 &= ~((1u << 15) | (1u << 14)); v524 |= (1u << 11); }
   _device.rtw_write<uint32_t>(0x0520, v520);
   _device.rtw_write<uint32_t>(0x0524, v524);
-  _logger->info("Jaguar2: MAC EDCCA {}", disabled ? "DISABLED (dis_cca)"
-                                                  : "enabled (default)");
+  _logger->info("Jaguar2: MAC carrier-sense {}",
+                disabled ? "DISABLED (dis_cca: CCA+EDCCA)" : "enabled (default)");
 }
 
 uint64_t RtlJaguar2Device::ReadTsf() {

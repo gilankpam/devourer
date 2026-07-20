@@ -36,6 +36,7 @@
 #include "HopSchedule.h"
 #include "RxPacket.h"
 #include "SweepSpec.h"
+#include "TxPower.h" /* txpkt_pwr_db_for_step — DEVOURER_TX_PKT_OFSET fan-out */
 #include "caps_event.h"
 #if defined(DEVOURER_HAVE_JAGUAR1)
 #include "jaguar1/RtlJaguarDevice.h"
@@ -248,31 +249,54 @@ int main(int argc, char **argv) {
       const auto want_bus =
           static_cast<uint8_t>(std::strtoul(bus_env, nullptr, 0));
       const char *port_env = std::getenv("DEVOURER_USB_PORT");
-      libusb_device **list = nullptr;
-      ssize_t n = libusb_get_device_list(context, &list);
-      for (ssize_t i = 0; i < n && handle == NULL; ++i) {
-        libusb_device_descriptor dd{};
-        if (libusb_get_device_descriptor(list[i], &dd) != 0) continue;
-        if (dd.idVendor != target_vid) continue;
-        if (target_pid != 0 && dd.idProduct != target_pid) continue;
-        if (libusb_get_bus_number(list[i]) != want_bus) continue;
-        if (port_env != nullptr) {
-          uint8_t ports[8];
-          int pc = libusb_get_port_numbers(list[i], ports, sizeof(ports));
-          std::string path;
-          for (int p = 0; p < pc; ++p)
-            path += (path.empty() ? "" : ".") + std::to_string(ports[p]);
-          if (path != port_env) continue;
+      /* A named socket is EXPECTED to hold the device — but the previous
+       * session's close/kill leaves the chip re-enumerating (firmware reload
+       * through ROM, sometimes via the ZeroCD id) for several seconds. Poll
+       * bounded instead of failing on the first empty scan. */
+      const auto deadline =
+          std::chrono::steady_clock::now() + std::chrono::seconds(15);
+      bool waited = false;
+      do {
+        libusb_device **list = nullptr;
+        ssize_t n = libusb_get_device_list(context, &list);
+        for (ssize_t i = 0; i < n && handle == NULL; ++i) {
+          libusb_device_descriptor dd{};
+          if (libusb_get_device_descriptor(list[i], &dd) != 0) continue;
+          if (dd.idVendor != target_vid) continue;
+          if (target_pid != 0 && dd.idProduct != target_pid) continue;
+          if (libusb_get_bus_number(list[i]) != want_bus) continue;
+          if (port_env != nullptr) {
+            uint8_t ports[8];
+            int pc = libusb_get_port_numbers(list[i], ports, sizeof(ports));
+            std::string path;
+            for (int p = 0; p < pc; ++p)
+              path += (path.empty() ? "" : ".") + std::to_string(ports[p]);
+            if (path != port_env) continue;
+          }
+          if (libusb_open(list[i], &handle) == 0)
+            logger->info("Opened device {:04x}:{:04x} on bus {} port {}",
+                         dd.idVendor, dd.idProduct, want_bus,
+                         port_env ? port_env : "(any)");
         }
-        if (libusb_open(list[i], &handle) == 0)
-          logger->info("Opened device {:04x}:{:04x} on bus {} port {}",
-                       dd.idVendor, dd.idProduct, want_bus,
-                       port_env ? port_env : "(any)");
-      }
-      if (list != nullptr) libusb_free_device_list(list, 1);
-      if (handle == NULL)
+        if (list != nullptr) libusb_free_device_list(list, 1);
+        if (handle != NULL) break;
+        if (!waited) {
+          logger->warn("DEVOURER_USB_BUS={} PORT={} matched no device — "
+                       "waiting for it to (re-)enumerate",
+                       want_bus, port_env ? port_env : "(any)");
+          waited = true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+      } while (std::chrono::steady_clock::now() < deadline);
+      /* Topology selection is strict: falling through to the VID:PID loop
+       * here would silently open a DIFFERENT adapter sharing the id (the
+       * exact ambiguity DEVOURER_USB_BUS exists to resolve) — fail instead. */
+      if (handle == NULL) {
         logger->error("DEVOURER_USB_BUS={} PORT={} matched no device", want_bus,
                       port_env ? port_env : "(any)");
+        libusb_exit(context);
+        return 1;
+      }
     }
 
     for (uint16_t pid : kRealtekProductIds) {
@@ -316,13 +340,16 @@ int main(int argc, char **argv) {
      * bail here before the reset, so it can't re-enumerate the adapter out from
      * under the owner. Reset skipped in termux_mode (forked child shares the
      * fd) and for DEVOURER_SKIP_RESET (warm pickup). */
-    rc = devourer::claim_interface_then_reset(handle, devourer::find_wifi_interface(handle), logger,
+    /* Reopen variant: recovers in place when the reset re-enumerates the
+     * device (warm Kestrel firmware-drop through ROM / ZeroCD). */
+    rc = devourer::claim_interface_reset_reopen(context, handle, logger,
         !termux_mode && std::getenv("DEVOURER_SKIP_RESET") == nullptr, usb_lock);
     devourer::Ev(*g_ev, "init.timing")
         .f("stage", "txdemo.usb_reset")
         .f("ms", ms_since_start());
     if (rc != 0) {
-      libusb_close(handle);
+      if (handle != nullptr)
+        libusb_close(handle);
       libusb_exit(context);
       return 1;
     }
@@ -534,14 +561,57 @@ int main(int argc, char **argv) {
     rtlDevice->SetTxPowerOffsetQdb(
         static_cast<int>(std::strtol(p, nullptr, 0)));
 
-  /* DEVOURER_TX_PKT_OFSET=N — (Jaguar2 8822B/8821C) default per-packet
-   * TXPWR_OFSET LUT step written into every TX descriptor: 0=none, 1=-3dB,
-   * 2=-7dB, 3=-11dB, 4=+3dB, 5=+6dB. The measurement driver for the descriptor
-   * per-packet power lever (tests/txpkt_pwr_ofset_onair.sh). */
-#if defined(DEVOURER_HAVE_JAGUAR2)
+  /* DEVOURER_TX_PKT_OFSET=N — default per-packet TX-power LUT step written
+   * into every TX descriptor: 0=none, 1=-3dB, 2=-7dB, 3=-11dB, 4=+3dB,
+   * 5=+6dB. One env var, four families: Jaguar2 8822B/8821C
+   * (descriptor TXPWR_OFSET, on-air-confirmed), Jaguar1 8814A (dword5
+   * [30:28], same LUT), Jaguar3 8822C/8822E (the step's nominal dB is
+   * mapped onto a programmable 0x1e70 offset bank), and Kestrel 8852B/8852C
+   * (no descriptor field — the nominal dB rides the session fixed-dBm
+   * offset, which a radiotap DBM_TX_POWER still overrides per frame). The
+   * measurement driver for tests/txpkt_pwr_ofset_onair.sh. */
   if (const char *p = std::getenv("DEVOURER_TX_PKT_OFSET")) {
+    const uint8_t step = static_cast<uint8_t>(std::strtol(p, nullptr, 0));
+#if defined(DEVOURER_HAVE_JAGUAR2)
     if (jag2)
-      jag2->SetTxPacketPowerStep(static_cast<uint8_t>(std::strtol(p, nullptr, 0)));
+      jag2->SetTxPacketPowerStep(step);
+#endif
+#if defined(DEVOURER_HAVE_JAGUAR1)
+    if (jag)
+      jag->SetTxPacketPowerStep(step);
+#endif
+#if defined(DEVOURER_HAVE_JAGUAR3)
+    if (jag3)
+      jag3->SetTxPacketPowerOffsetQdb(4 *
+                                      devourer::txpkt_pwr_db_for_step(step));
+#endif
+    if (rtlDevice->GetAdapterCaps().generation ==
+        devourer::ChipGeneration::Kestrel)
+      rtlDevice->SetTxPowerOffsetQdb(4 *
+                                     devourer::txpkt_pwr_db_for_step(step));
+    (void)step;
+  }
+
+  /* DEVOURER_TX_PKT_PWR_QDB=N — Jaguar3-only fine-grained per-packet power
+   * default in quarter-dB (the bank mechanism is continuous, unlike the LUT
+   * families). Overrides DEVOURER_TX_PKT_OFSET's mapped value when both are
+   * set. */
+#if defined(DEVOURER_HAVE_JAGUAR3)
+  if (const char *p = std::getenv("DEVOURER_TX_PKT_PWR_QDB")) {
+    if (jag3)
+      jag3->SetTxPacketPowerOffsetQdb(
+          static_cast<int>(std::strtol(p, nullptr, 0)));
+  }
+#endif
+
+  /* DEVOURER_TX_FAST_PWR_QDB=N — Jaguar1 fast global BB-swing power offset
+   * (FastSetTxPowerOffsetQdb): 0.5 dB steps, -12..+2 dB, 1-4 BB writes.
+   * Per-burst, NOT per-packet — the compensating lever for the 8812A/8821A,
+   * whose descriptors have no per-frame power field. */
+#if defined(DEVOURER_HAVE_JAGUAR1)
+  if (const char *p = std::getenv("DEVOURER_TX_FAST_PWR_QDB")) {
+    if (jag)
+      jag->FastSetTxPowerOffsetQdb(static_cast<int>(std::strtol(p, nullptr, 0)));
   }
 #endif
 

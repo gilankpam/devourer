@@ -11,6 +11,7 @@
 #include "DeviceConfig.h"
 #include "IRtlDevice.h"
 #include "RtlAdapter.h"
+#include "RxQuality.h" /* RxQualityAccumulator + build_rx_quality */
 #include "SelectedChannel.h"
 
 #include "ChipVariant.h"
@@ -67,7 +68,13 @@ public:
     stop_wp_drain();
   }
   void SetMonitorChannel(SelectedChannel channel) override;
+  /* Disable / restore the MAC carrier-sense gate (R_AX_CCA_CFG_0 all-CCA-EN:
+   * primary + sec20/40/80 + EDCCA). Injection is already CCA-off by default here
+   * (EnableTxScheduler clears these gates), so this is a runtime toggle, not the
+   * co-channel-deferral fix it is on Jaguar. */
+  void SetCcaMode(bool disabled) override;
   bool send_packet(const uint8_t *packet, size_t length) override;
+  devourer::TxStats GetTxStats() override { return _device.GetTxStats(); }
   SelectedChannel GetSelectedChannel() override { return _channel; }
 
   /* Static capability aggregate (resolved from chip identity; thread-safe,
@@ -77,7 +84,9 @@ public:
 
   /* Runtime TX-power lever: fixed-dBm BB power (halbb_set_txpwr_dbm) with a
    * quarter-dB offset relative to the DEVOURER_TX_PWR base. Sticky across
-   * SetMonitorChannel. */
+   * SetMonitorChannel. Per-packet: a radiotap DBM_TX_POWER dB-delta on a
+   * frame overrides this for that frame via a fixed-dBm rewrite in
+   * send_packet (2 BB RMWs on value change, free while constant). */
   devourer::TxPowerCaps GetTxPowerCaps() override;
   int SetTxPowerOffsetQdb(int qdb) override;
   devourer::TxPowerState GetTxPowerState() override;
@@ -104,10 +113,43 @@ public:
    * the efuse baseline. Control-thread only (does an RF read). */
   devourer::ThermalStatus GetThermalStatus() override;
 
+  /* Frame-free RX energy snapshot. On Kestrel this carries only the active
+   * absolute noise floor (halbb NHM env-monitor) when DEVOURER_RX_NOISE_FLOOR is
+   * set — there is no phydm FA/CCA/IGI DIG monitor on this generation. */
+  RxEnergy GetRxEnergy() override;
+  /* Windowed RX link-quality: the passive rssi-snr floor + LinkHealth verdict
+   * (fed per frame via _rxq) fused with the active NHM floor from GetRxEnergy. */
+  devourer::RxQuality GetRxQuality() override;
+
   /* Arm the AX HW beacon engine (mac_send_bcn_h2c + AP port timing). Requires a
    * prior InitWrite. `beacon` is a full 802.11 beacon; the MAC airs it every
    * `interval_tu` TU with the live TSF inserted. */
   bool StartBeacon(const uint8_t *beacon, size_t len, int interval_tu) override;
+
+  /* 802.11ax scheduled UL: air an HE Basic Trigger (UL-OFDMA grant), program
+   * TWT agreements + STA binds, and the fw-autonomous trigger cadence
+   * (TWT-OFDMA or the UL_FIXINFO table). Require a prior InitWrite. */
+  bool SendTrigger(const devourer::TriggerConfig &cfg) override;
+  bool ConfigureTwt(const devourer::TwtConfig &cfg) override;
+  bool TeardownTwt(const devourer::TwtConfig &cfg) override;
+  bool TwtBindSta(const devourer::TwtStaAct &act) override;
+  bool ConfigureTwtOfdma(const devourer::TwtOfdmaConfig &cfg) override;
+  bool ConfigureUlOfdma(const devourer::UlOfdmaConfig &cfg) override;
+
+  /* Register an associated peer STA (macid/addr-cam) so a Trigger's per-user
+   * grant scores against it — the AP-side companion to SendTrigger for the
+   * end-to-end UL path. */
+  bool RegisterPeerSta(const uint8_t peer_mac[6], uint8_t macid,
+                       uint8_t addr_cam_idx) override;
+
+  /* HE sounding command surface: register an associated beamformee, then drive a
+   * sounding intended to air NDPA -> NDP -> BFRP and receive the report HE TB
+   * PPDU. NB the shipped client NIC fw accepts SET_SND_PARA but does not air it
+   * (AP-firmware-only transmit engine); see docs/he-trigger-ul.md. */
+  bool RegisterBeamformee(const uint8_t peer_mac[6], uint8_t macid,
+                          uint8_t addr_cam_idx,
+                          const devourer::StaBfCaps &bf) override;
+  bool StartSounding(const devourer::SoundingConfig &cfg) override;
 
   /* AX-native identity read (no power-on needed — the identity block is alive
    * as soon as the USB function enumerates). kestrelprobe stage "id" and the
@@ -173,9 +215,18 @@ private:
   uint8_t _tx_data_ep = 0; /* AC0 data bulk-OUT ep (BULKOUTID3) */
   uint16_t _tx_seq = 0;    /* rolling 12-bit wifi sequence for injected frames */
   std::optional<devourer::TxMode> _tx_mode_default; /* SetTxMode default */
+  int16_t _sess_pwr_qdb = 0; /* offset applied by SetTxPowerOffsetQdb — the
+                              * restore target for frames without a radiotap
+                              * DBM_TX_POWER field */
   /* Per-chain RSSI (RSSI% = dBm+110) cached from the last PPDU-status physts
    * header, attached to the following WIFI frame(s) in the aggregate. */
   uint8_t _last_rssi[2] = {0, 0};
+  /* Per-frame SNR (raw U(8,1) = dB*2), cached from the physts header alongside
+   * RSSI for the passive noise floor (rssi_dbm - snr_db). 0 = unknown. */
+  uint8_t _last_snr = 0;
+  /* Windowed RX link-quality accumulator (passive noise floor + LinkHealth),
+   * fed per decoded frame from the RX loop; drained by GetRxQuality. */
+  devourer::RxQualityAccumulator _rxq;
 };
 
 #endif /* RTL_KESTREL_DEVICE_H */

@@ -27,8 +27,8 @@ option(DEVOURER_JAGUAR3_8822C "RTL8812CU / 8822CU (Jaguar3, rtl8822c)"          
 option(DEVOURER_JAGUAR3_8822E "RTL8812EU / 8822EU (Jaguar3, rtl8822e)"          ON)
 # Kestrel — the Wi-Fi 6 / 802.11ax generation (Realtek "G6 phl" architecture,
 # vendor trees reference/rtl8852bu + reference/rtl8852cu): monitor RX, TX
-# injection and channel/BW on-air validated on both chips (see src/kestrel/
-# and the CLAUDE.md Kestrel section).
+# injection and channel/BW on-air validated on both chips (see
+# src/kestrel/CLAUDE.md).
 option(DEVOURER_KESTREL_8852B "RTL8852BU / 8832BU (Kestrel 11ax, G6)"           ON)
 option(DEVOURER_KESTREL_8852C "RTL8852CU / 8832CU (Kestrel 11ax, G6)"           ON)
 # PCIe transport (vfio-pci). Linux-only. The transport implements the HalMAC-
@@ -146,6 +146,23 @@ add_library(devourer
     src/LinkHealth.cpp
     src/LinkHealth.h
     src/RxQuality.h
+    src/chanmig/ChannelScore.cpp
+    src/chanmig/ChannelScore.h
+    src/chanmig/MigGate.cpp
+    src/chanmig/MigGate.h
+    src/chanmig/ChannelDef.h
+    src/chanmig/ActiveLink.h
+    src/chanmig/EvidenceStore.h
+    src/chanmig/ScanPlan.h
+    src/chanmig/SurveyRecord.h
+    src/chanmig/SurveyJsonl.h
+    src/chanmig/JsonlLite.h
+    src/chanmig/MigTypes.h
+    src/chanmig/MigWire.h
+    src/chanmig/MigConfig.h
+    src/chanmig/MigClock.h
+    src/chanmig/MigProposer.h
+    src/chanmig/MigResponder.h
     src/IRtlDevice.h
     src/SignalStop.cpp
     src/SignalStop.h
@@ -321,6 +338,8 @@ if(DEVOURER_KESTREL)
         src/kestrel/MacRegAx.h
         src/kestrel/HalKestrel.cpp src/kestrel/HalKestrel.h
         src/kestrel/KestrelFw.cpp src/kestrel/KestrelFw.h
+        src/kestrel/KestrelFwSched.cpp
+        src/kestrel/KestrelLe.h
         src/kestrel/RtlKestrelDevice.cpp src/kestrel/RtlKestrelDevice.h)
     target_compile_definitions(devourer PUBLIC DEVOURER_HAVE_KESTREL=1)
 endif()
@@ -463,6 +482,7 @@ target_link_libraries(reglat PUBLIC devourer PRIVATE PkgConfig::libusb)
 add_executable(rxdemo
     examples/rx/main.cpp
     examples/common/env_config.cpp
+    examples/common/usb_select.cpp
 )
 target_link_libraries(rxdemo PUBLIC devourer)
 target_include_directories(rxdemo PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/examples/common)
@@ -473,6 +493,17 @@ add_executable(txdemo
 )
 target_link_libraries(txdemo PUBLIC devourer PRIVATE PkgConfig::libusb)
 target_include_directories(txdemo PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/examples/common)
+
+# dwell-1 A/B injection over the firmware channel switch (issue #272 data
+# plane): one admitted data-frame opportunity per wall-clock slot, with
+# bounded admission so a frame for context A can never air on B.
+add_executable(dwelltx
+    examples/dwelltx/main.cpp
+    examples/common/env_config.cpp
+    examples/common/usb_select.cpp
+)
+target_link_libraries(dwelltx PUBLIC devourer PRIVATE PkgConfig::libusb)
+target_include_directories(dwelltx PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/examples/common)
 
 # Pre-modulator subcarrier PoC: transmits PSDU bytes shaped by
 # tools/precoder/encode_subcarriers.py so chosen OFDM data subcarriers carry
@@ -570,6 +601,30 @@ target_include_directories(sense PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/examples/co
 # enumerate and init green but read stochastic EFUSE garbage / never boot the
 # MCU (the #205 failure mode). Pure CLI; exit code carries the verdict. See
 # docs/adapter-doctor.md.
+# chanmig — the coordinated channel-migration endpoint (ground proposes /
+# drone commits). Duplex RX+TX on one adapter, the pure Mig* state machines
+# driving an authenticated control protocol over own 802.11 frames.
+add_executable(chanmig
+    examples/chanmig/main.cpp
+    examples/common/env_config.cpp
+    examples/common/usb_select.cpp
+)
+target_link_libraries(chanmig PUBLIC devourer PRIVATE PkgConfig::libusb)
+target_include_directories(chanmig PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/examples/common)
+
+# chanscout — the passive second-adapter ground spectrum scout (adaptive
+# channel migration): plan-driven candidate dwells with counter-hygiene
+# discard barriers, emitting versioned survey.dwell / scout.health JSONL
+# while a separate primary receiver owns the video channel. Pure logic in
+# src/chanmig/ (selftested); this binary is the device I/O shell.
+add_executable(chanscout
+    examples/chanscout/main.cpp
+    examples/common/env_config.cpp
+    examples/common/usb_select.cpp
+)
+target_link_libraries(chanscout PUBLIC devourer PRIVATE PkgConfig::libusb)
+target_include_directories(chanscout PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/examples/common)
+
 add_executable(doctor
     examples/doctor/main.cpp
 )
@@ -606,6 +661,15 @@ target_link_libraries(ToneMaskSelftest PRIVATE devourer)
 
 add_test(NAME tone_mask_math COMMAND ToneMaskSelftest)
 
+# Headless guard for the active idle-noise-floor math (src/NoiseFloorMath.h): the
+# phydm sign/pwdb helpers the Jaguar1 0x0FA0 debug-port measurement uses. Pure
+# math, header-only.
+add_executable(NoiseFloorMathSelftest tests/noise_floor_math_selftest.cpp)
+target_include_directories(NoiseFloorMathSelftest PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src)
+
+add_test(NAME noise_floor_math COMMAND NoiseFloorMathSelftest)
+
 # Headless round-trip guard for the 802.11ax HE TX radiotap path
 # (src/RadiotapBuilder.cpp build_he + the shared Radiotap.c field-23 size entry
 # + src/ieee80211_radiotap.h HE masks): parse an HE spec -> build -> iterate ->
@@ -618,6 +682,17 @@ target_include_directories(HeRadiotapSelftest PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
 add_test(NAME he_radiotap COMMAND HeRadiotapSelftest)
+
+# Headless round-trip guard for the 802.11ax Trigger frame path (src/TriggerTwt.h
+# build_basic_trigger + he_ru_alloc, src/TriggerParse.h parse_trigger): build ->
+# parse a Basic Trigger, RU-allocation golden vectors. Generation-neutral (the
+# fw F2P encoders are guarded separately below); the on-air half (witness decode
+# of an fw-aired trigger) is tier-A validation.
+add_executable(TriggerParseSelftest tests/trigger_parse_selftest.cpp)
+target_compile_features(TriggerParseSelftest PRIVATE cxx_std_20)
+target_include_directories(TriggerParseSelftest PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src)
+add_test(NAME trigger_parse COMMAND TriggerParseSelftest)
 
 # Headless guard for the Kestrel (11ax) RX descriptor parser
 # (src/kestrel/FrameParserKestrel.h): rxd field extraction + aggregate walk
@@ -635,6 +710,15 @@ if(DEVOURER_KESTREL)
     target_include_directories(KestrelTxReportSelftest PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME kestrel_txreport COMMAND KestrelTxReportSelftest)
+
+    # Golden-bytes guard for the trigger-UL + TWT H2C content encoders
+    # (src/kestrel/SchedEncode.h): each config's emitted LE dwords vs the
+    # hand-computed vendor SET_WORD layout (F2P v0/v1, TWT, UL_FIXINFO).
+    add_executable(KestrelSchedSelftest tests/kestrel_sched_selftest.cpp)
+    target_compile_features(KestrelSchedSelftest PRIVATE cxx_std_20)
+    target_include_directories(KestrelSchedSelftest PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME kestrel_sched COMMAND KestrelSchedSelftest)
 endif()
 
 add_executable(RadiotapTxFlagsSelftest tests/radiotap_txflags_selftest.cpp)
@@ -799,6 +883,18 @@ if(DEVOURER_JAGUAR2_8822B OR DEVOURER_JAGUAR2_8821C)
     add_test(NAME txpkt_pwr_quant COMMAND TxPktPwrSelftest)
 endif()
 
+# Headless guard for the Jaguar3 per-packet power-bank planner (the
+# TxPktPwrBanks.h LRU/encode policy) + the descriptor bit positions of
+# TXPWR_OFSET_TYPE (8822C, incl. the bit30 ANTSEL_EN_V1 hazard) and the 8814A
+# TX_POWER_OFFSET. The planner header is HAL-agnostic; the descriptor parts
+# self-gate on the DEVOURER_HAVE_JAGUAR1/3 defines the library exports.
+add_executable(TxPktBankSelftest
+    tests/txpkt_bank_selftest.cpp
+)
+target_link_libraries(TxPktBankSelftest PRIVATE devourer)
+target_include_directories(TxPktBankSelftest PRIVATE src)
+add_test(NAME txpkt_bank_policy COMMAND TxPktBankSelftest)
+
 # Headless guard for the USB TX-aggregation URB packing (src/TxAggPlan.h) —
 # block alignment, the never-a-bulk-multiple boundary shim, the OQT
 # descs-per-bulk guard, the frame/byte caps — plus the HalMAC descriptor agg
@@ -821,6 +917,68 @@ add_executable(BfReportDecodeSelftest
 target_link_libraries(BfReportDecodeSelftest PRIVATE devourer)
 
 add_test(NAME bf_report_decode COMMAND BfReportDecodeSelftest)
+
+# Headless guards for the adaptive-channel-migration data model (src/chanmig/):
+# ChannelDef grid legality + the scan-plan grammar; the pure dwell scheduler
+# (coverage, revisit priority, starvation, round advancement); and the
+# evidence-store fold path (counter wrap, staleness, width coverage, mixed
+# calibration domains) + the survey.dwell JSONL round-trip + the JsonlLite
+# event-line scanner. A regression here surfaces as a silently-wrong channel
+# ranking on-air, so it fails `ctest` instead.
+add_executable(ChanDefSelftest tests/chan_def_selftest.cpp)
+target_link_libraries(ChanDefSelftest PRIVATE devourer)
+add_test(NAME chan_def_grid COMMAND ChanDefSelftest)
+
+add_executable(ScanPlanSelftest tests/scan_plan_selftest.cpp)
+target_link_libraries(ScanPlanSelftest PRIVATE devourer)
+add_test(NAME scan_plan_policy COMMAND ScanPlanSelftest)
+
+add_executable(SurveyAggSelftest tests/survey_agg_selftest.cpp)
+target_link_libraries(SurveyAggSelftest PRIVATE devourer)
+add_test(NAME survey_aggregate COMMAND SurveyAggSelftest)
+
+# The #277 gate: the RecommendEngine's two-leg policy over the issue's ten
+# offline scenarios (recommend / hold-healthy / weak!=congestion / saturation
+# / broad-degradation / overlap ordering / burst no-flap / stale / cooldown /
+# scout-down) plus age/cooldown/tie-break/generation/policy-hash edges.
+add_executable(ChanScoreSelftest tests/chan_score_selftest.cpp)
+target_link_libraries(ChanScoreSelftest PRIVATE devourer)
+add_test(NAME chan_score_policy COMMAND ChanScoreSelftest)
+
+# The #278 wire gate: known-answer bytes + MAC for every migration message,
+# the tamper/truncation sweeps, header rejects, the 96-byte bound, and the
+# ReplayWindow epoch/generation/nonce rules — so the authenticated control
+# protocol's encoding and key derivation can never silently drift.
+add_executable(ChanMigWireSelftest tests/chanmig_wire_selftest.cpp)
+target_link_libraries(ChanMigWireSelftest PRIVATE devourer)
+add_test(NAME chanmig_wire_kat COMMAND ChanMigWireSelftest)
+
+# The #278 convergence gate: the proposer + responder pure state machines
+# coupled through a drop/duplicate/reorder/delay LinkSim, driving the failure
+# matrix — every row must converge both endpoints to a shared channel in
+# {source,target,rescue}, never a lasting split-brain.
+add_executable(ChanMigProtoSelftest tests/chanmig_proto_selftest.cpp)
+target_link_libraries(ChanMigProtoSelftest PRIVATE devourer)
+add_test(NAME chanmig_proto_matrix COMMAND ChanMigProtoSelftest)
+
+# PeerClock: skew recovery + residual-percentile-derived activation guard.
+add_executable(ChanMigClockSelftest tests/chanmig_clock_selftest.cpp)
+target_link_libraries(ChanMigClockSelftest PRIVATE devourer)
+add_test(NAME chanmig_clock_math COMMAND ChanMigClockSelftest)
+
+# The #279 gate: the conservative autonomous-migration policy over the issue's
+# 13-scenario matrix (interferer appears/persists/leaves, burst, herding, rank
+# alternation, all-degrade, out-of-range, saturation, scout-stall, recover-
+# pre-commit, dest-occupied, cap-exhaustion) + mode/operator overrides + the
+# determinism guarantee (every scenario decided twice, identically).
+add_executable(ChanMigGateSelftest tests/chanmig_gate_selftest.cpp)
+target_link_libraries(ChanMigGateSelftest PRIVATE devourer)
+add_test(NAME chanmig_gate_policy COMMAND ChanMigGateSelftest)
+
+# ChanMigReplay: replay a recorded gate-input trace through the SHIPPING
+# MigGate policy (no re-implementation), for the #279 shadow / metrics runs.
+add_executable(ChanMigReplay tests/chanmig_replay_main.cpp)
+target_link_libraries(ChanMigReplay PRIVATE devourer)
 
 # Headless guard for the per-tone interference localizer's detection +
 # frequency-mapping math (tests/rx_tone_localize.py). Pure Python, no hardware:
