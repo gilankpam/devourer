@@ -38,6 +38,21 @@ bool env_long(const char *name, long *out) {
   return true;
 }
 
+/* DEVOURER_RX_MODE spelling -> RxMode (UsbTransport RX-ring strategy). Accepts
+ * hyphen or underscore; unrecognised falls back to the default async ring. */
+devourer::RxMode parse_rx_mode(const char *s) {
+  if (str_ieq(s, "sync"))
+    return devourer::RxMode::Sync;
+  if (str_ieq(s, "reorder-pool") || str_ieq(s, "reorder_pool") ||
+      str_ieq(s, "pool"))
+    return devourer::RxMode::ReorderPool;
+  if (str_ieq(s, "spsc-fat") || str_ieq(s, "spsc_fat") || str_ieq(s, "spsc"))
+    return devourer::RxMode::SpscFat;
+  if (str_ieq(s, "decoupled"))
+    return devourer::RxMode::Decoupled;
+  return devourer::RxMode::Async;
+}
+
 } // namespace
 
 devourer::DeviceConfig devourer_config_from_env() {
@@ -57,6 +72,12 @@ devourer::DeviceConfig devourer_config_from_env() {
     cfg.rx.urbs = static_cast<int>(v);
   if (env_long("DEVOURER_RX_URB_BYTES", &v))
     cfg.rx.urb_bytes = static_cast<int>(v);
+  if (const char *e = env_str("DEVOURER_RX_MODE"))
+    cfg.rx.rx_mode = parse_rx_mode(e);
+  if (env_long("DEVOURER_RX_POOL_SPARE", &v))
+    cfg.rx.pool_spare = static_cast<int>(v);
+  if (env_long("DEVOURER_RX_RING_MS", &v))
+    cfg.rx.ring_ms = static_cast<int>(v);
   cfg.rx.phy_status_8821c = !env_flag("DEVOURER_8821C_NO_PHYST");
   cfg.rx.abs_noise_floor = env_flag("DEVOURER_RX_NOISE_FLOOR");
   if (env_long("DEVOURER_IGI", &v))
@@ -118,6 +139,10 @@ devourer::DeviceConfig devourer_config_from_env() {
   cfg.tuning.disable_cca = env_flag("DEVOURER_DIS_CCA");
   if (env_long("DEVOURER_FASTRETUNE_FW", &v) && v >= 0)
     cfg.tuning.fastretune_fw = static_cast<int>(v);
+  if (env_long("DEVOURER_KFR_OFLD", &v) && v >= 0)
+    cfg.tuning.kestrel_fastretune_ofld = static_cast<int>(v);
+  if (env_long("DEVOURER_FW_TABLE_OFLD", &v) && v >= 0)
+    cfg.tuning.fw_table_offload = static_cast<int>(v);
   /* Jaguar3 per-packet power-bank step size (qdB per 0x1e70 offset-index
    * step; default 4 = 1 dB) — bench slope-calibration override. */
   if (env_long("DEVOURER_TXPKT_STEP_QDB", &v) && v > 0)
