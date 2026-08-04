@@ -1,9 +1,11 @@
 #include "UsbTransport.h"
 
+#include <algorithm>
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <deque>
 #include <mutex>
 #include <string>
@@ -83,8 +85,42 @@ struct AsyncRxShared {
    * the consumer stalls or is preempted — converting a chip-FIFO overflow
    * (dropped frames) into bounded host-queue backlog (delayed frames). The fix
    * for a stalling/preempted CONSUMER, where reorder-pool can't help because it
-   * still consumes on the pump thread. */
+   * still consumes on the pump thread.
+   *
+   * ARQ caveat, bench-measured (tests/arq_e2e_delivery.sh): keeping the ring
+   * armed means the chip ADMITS AND ACKS every frame — so a frame dropped at
+   * pool exhaustion is an ACKed-but-undelivered loss the hardware-ARQ peer
+   * will log as delivered and never retry. The default async ring loses the
+   * same frames chip-side instead, where the 8812EU declines the ACK and the
+   * ARQ loop recovers them (14,214/14,214 stall-window drops reported ok=0
+   * there, vs 5,667 ok=1-but-lost under the drop policy here).
+   *
+   * PoolExhaust picks which contract survives overload: Backpressure (the
+   * default) PARKS the completed URB unarmed — the payload still reaches the
+   * consumer queue, the ring shrinks, the chip FIFO fills and the chip
+   * declines further ACKs, so overload loss stays ARQ-visible; parked URBs
+   * re-arm as the consumer returns buffers. Drop keeps the ring armed and
+   * discards the payload (counted in pool_dropped) — smoother, but only for
+   * consumers that accept silent loss. */
   bool spsc = false;
+  bool bp = true; /* PoolExhaust::Backpressure */
+  std::atomic<unsigned long long> pool_dropped{0};
+  /* Backpressure-policy state, guarded by pool_mu with free_bufs: URBs parked
+   * bufferless at exhaustion, re-armed from the consumer's buffer-return path.
+   * parking_closed is teardown's gate — set (under pool_mu) before the cancel
+   * pass, so no late re-arm can launch an uncancellable infinite-timeout URB.
+   * pool_stalls counts park events (the backpressure counterpart of
+   * pool_dropped; nothing is lost host-side on this path). */
+  std::vector<libusb_transfer *> parked;
+  bool parking_closed = false;
+  std::atomic<unsigned long long> pool_stalls{0};
+  /* Device-gone latch. Plain async self-terminates on unplug (every URB
+   * error-retires, active hits 0, rx_loop returns) — parked URBs never
+   * complete, so backpressure mode needs an explicit signal or a dead device
+   * leaves the loop spinning until Stop(). Set from a NO_DEVICE transfer
+   * status or submit error; rx_loop exits on it and retires the parked set
+   * through the normal teardown path. */
+  std::atomic<bool> dead{false};
   std::mutex queue_mu;
   std::condition_variable queue_cv;
   std::deque<std::pair<uint8_t *, int>> queue;
@@ -109,6 +145,8 @@ inline void rx_consume(AsyncRxShared *s, const uint8_t *buf, int len) {
 
 extern "C" void LIBUSB_CALL devourer_rx_cb(libusb_transfer *t) {
   auto *s = static_cast<AsyncRxShared *>(t->user_data);
+  if (t->status == LIBUSB_TRANSFER_NO_DEVICE)
+    s->dead.store(true, std::memory_order_relaxed);
   /* This URB just completed — it has left the wire until resubmitted. */
   if (s->telemetry) {
     const int a = s->armed.fetch_sub(1, std::memory_order_relaxed) - 1;
@@ -206,9 +244,48 @@ extern "C" void LIBUSB_CALL devourer_rx_cb(libusb_transfer *t) {
         s->resubmit_fail.fetch_add(1, std::memory_order_relaxed);
     }
     /* Pool exhausted (consumer hopelessly behind under sustained overload) or
-     * submit failed: preserve the pump's never-block invariant by re-arming
-     * with the received buffer and DROPPING this frame — a bounded loss, vs the
-     * cascade an inline consume would trigger. */
+     * submit failed. Two policies (see the mode comment above):
+     *
+     * Backpressure (default): the payload is NOT lost — hand it to the
+     * consumer queue and PARK this URB bufferless; the ring shrinks, the chip
+     * FIFO fills and the chip declines further ACKs, so the overload loss
+     * happens chip-side where the ARQ peer can see and retry it. The
+     * consumer's buffer-return path re-arms parked URBs. `active` is NOT
+     * decremented: a parked URB is pending, not retired (teardown retires the
+     * parked set explicitly before its cancel pass). */
+    if (s->bp && resubmit && rlen > 0) {
+      /* Queue the payload FIRST, park LAST. Once this URB is on the parked
+       * list the teardown path may retire it, finish, and destroy the shared
+       * state — so parked.push_back must be this callback's final shared-
+       * state access (the parked-path analogue of the retire paths' trailing
+       * `active--`, which teardown likewise blocks on). */
+      t->buffer = nullptr; /* payload buffer now belongs to the queue */
+      {
+        std::lock_guard<std::mutex> lk(s->queue_mu);
+        s->queue.emplace_back(received, rlen);
+      }
+      s->queue_cv.notify_one();
+      {
+        std::lock_guard<std::mutex> lk(s->pool_mu);
+        if (!s->parking_closed) {
+          s->pool_stalls.fetch_add(1, std::memory_order_relaxed);
+          s->parked.push_back(t);
+          return; /* lock releases on return; nothing may follow the park */
+        }
+      }
+      s->active--; /* parking closed = teardown: retire without resubmit */
+      return;
+    }
+    /* Drop policy: preserve the pump's never-block invariant by re-arming
+     * with the received buffer and DROPPING this frame — a bounded loss, vs
+     * the cascade an inline consume would trigger. The chip already ACKed
+     * this frame: count every received frame dropped here, exhaustion and
+     * failed-re-arm alike — both are post-ACK host drops, and the re-arm
+     * failure is separable because it also ticks resubmit_fail. `resubmit`
+     * gates the count: a teardown-window frame (stop requested) is
+     * intentional loss, not an overload signal. */
+    if (resubmit && rlen > 0)
+      s->pool_dropped.fetch_add(1, std::memory_order_relaxed);
     if (resubmit && libusb_submit_transfer(t) == 0) {
       if (s->telemetry)
         s->armed.fetch_add(1, std::memory_order_relaxed);
@@ -237,10 +314,11 @@ UsbTransport::UsbTransport(libusb_device_handle *dev_handle, Logger_t logger,
                            libusb_context *ctx,
                            std::shared_ptr<devourer::UsbDeviceLock> usb_lock,
                            bool rx_zerocopy, RxMode rx_mode, int pool_spare,
-                           int ring_ms)
+                           int ring_ms, PoolExhaust pool_exhaust)
     : _dev_handle{dev_handle}, _ctx{ctx}, _logger{std::move(logger)},
       _rx_zerocopy{rx_zerocopy}, _rx_mode{rx_mode}, _pool_spare{pool_spare},
-      _ring_ms{ring_ms}, _usb_lock{std::move(usb_lock)} {
+      _ring_ms{ring_ms}, _pool_exhaust{pool_exhaust},
+      _usb_lock{std::move(usb_lock)} {
   libusb_device_descriptor desc{};
   if (libusb_get_device_descriptor(libusb_get_device(_dev_handle), &desc) ==
       LIBUSB_SUCCESS) {
@@ -258,16 +336,20 @@ UsbTransport::UsbTransport(libusb_device_handle *dev_handle, Logger_t logger,
 }
 
 UsbTransport::~UsbTransport() {
-  /* Drain any async-TX completions still in flight so their transfers are
-   * freed (transfer_callback runs here, on THIS thread) before the device
-   * handle / context are torn down. We reap in the caller's thread, never a
-   * background pump, so there is no thread racing the caller-owned
-   * libusb_exit. A bounded loop so a genuinely dead endpoint can't hang
-   * teardown. */
-  for (int i = 0; i < 50 && _tx_inflight.load() > 0; ++i) {
-    struct timeval tv {0, 20000};
-    libusb_handle_events_timeout_completed(_ctx, &tv, nullptr);
-  }
+  /* Backstop only. The device's Stop()/destructor quiesces TX while every
+   * owner is alive, which is the path that makes teardown safe; reaching the
+   * transport destructor with transfers still in flight means the caller tore
+   * libusb down first, and by then _ctx may already be freed — pumping it is
+   * the SIGSEGV this diagnostic exists to name. The transport is shared_ptr-
+   * owned, so it is not guaranteed the device drops the last reference; hence
+   * the drain attempt stays. */
+  if (!_tx_shutdown.load(std::memory_order_acquire) &&
+      _tx_inflight.load(std::memory_order_acquire) > 0)
+    _logger->error("USB transport destroyed with TX in flight — the owner "
+                   "should quiesce (IRtlDevice::Stop) and release the device "
+                   "BEFORE libusb_close/libusb_exit; see the teardown order in "
+                   "examples/common/DeviceSession.h");
+  quiesce_tx();
 }
 
 bool UsbTransport::write_bytes(uint16_t reg_num, const uint8_t *ptr, size_t n) {
@@ -293,6 +375,7 @@ void UsbTransport::rx_loop(
   sh.telemetry = _ring_ms > 0;
   sh.reorder = reorder;
   sh.spsc = spsc;
+  sh.bp = _pool_exhaust == PoolExhaust::Backpressure;
   sh.buf_size = buf_size;
   /* reorder-pool and spsc-fat post n_urbs URBs but allocate pool_spare extra
    * buffers so a burst / stall backlog is absorbed in the host pool instead of
@@ -375,7 +458,37 @@ void UsbTransport::rx_loop(
           sh.queue.pop_front();
         }
         rx_consume(&sh, item.first, item.second);
+        /* Buffer return. Backpressure policy: a parked (bufferless) URB gets
+         * this buffer and goes straight back on the wire — the ring re-arms
+         * exactly as fast as the consumer frees capacity. The submit stays
+         * under pool_mu so teardown's parking_closed flip (also under
+         * pool_mu) strictly precedes-or-follows any re-arm: no late launch
+         * after the cancel pass. (libusb_submit_transfer is thread-safe and
+         * the event pump never holds pool_mu while inside libusb, so there is
+         * no lock-order inversion.) */
         std::lock_guard<std::mutex> lk(sh.pool_mu);
+        if (sh.bp && !sh.parking_closed && !sh.parked.empty()) {
+          libusb_transfer *t = sh.parked.back();
+          sh.parked.pop_back();
+          t->buffer = item.first;
+          t->length = sh.buf_size;
+          const int rc = libusb_submit_transfer(t);
+          if (rc == 0) {
+            if (sh.telemetry)
+              sh.armed.fetch_add(1, std::memory_order_relaxed);
+            continue;
+          }
+          /* Submit failure: re-park the URB, pool the buffer. Device gone
+           * latches `dead` so rx_loop exits and retires the parked set —
+           * re-park-forever would otherwise pin `active` above zero with no
+           * completion ever coming. */
+          t->buffer = nullptr;
+          sh.parked.push_back(t);
+          if (rc == LIBUSB_ERROR_NO_DEVICE)
+            sh.dead.store(true, std::memory_order_relaxed);
+          if (sh.telemetry)
+            sh.resubmit_fail.fetch_add(1, std::memory_order_relaxed);
+        }
         sh.free_bufs.push_back(item.first);
       }
     });
@@ -391,7 +504,8 @@ void UsbTransport::rx_loop(
     sh.min_armed.store(a0, std::memory_order_relaxed);
   }
   auto last_ring = std::chrono::steady_clock::now();
-  while (!should_stop() && sh.active > 0) {
+  while (!should_stop() && sh.active > 0 &&
+         !sh.dead.load(std::memory_order_relaxed)) {
     struct timeval tv {0, 100000};
     libusb_handle_events_timeout_completed(_ctx, &tv, nullptr);
     if (sh.telemetry) {
@@ -426,9 +540,24 @@ void UsbTransport::rx_loop(
             .f("empties", (unsigned long long)sh.empties.load(
                               std::memory_order_relaxed))
             .f("pool_free", pool_free)
-            .f("qdepth", qdepth);
+            .f("qdepth", qdepth)
+            .f("pool_dropped", (unsigned long long)sh.pool_dropped.load(
+                                   std::memory_order_relaxed))
+            .f("pool_stalls", (unsigned long long)sh.pool_stalls.load(
+                                  std::memory_order_relaxed));
       }
     }
+  }
+  /* Close parking BEFORE the cancel pass (under pool_mu, so no consumer
+   * re-arm is mid-submit), then retire the parked URBs: they are not in
+   * flight, cancel would be a no-op on them, and the active-drain below would
+   * otherwise wait forever for completions that can never come. The transfer
+   * objects stay in `xfers` and are freed centrally. */
+  {
+    std::lock_guard<std::mutex> lk(sh.pool_mu);
+    sh.parking_closed = true;
+    sh.active -= static_cast<int>(sh.parked.size());
+    sh.parked.clear();
   }
   for (auto *t : xfers)
     libusb_cancel_transfer(t);
@@ -646,20 +775,81 @@ void UsbTransport::transfer_callback(struct libusb_transfer *transfer) {
      * clear_halt storm — now that completions are actually reaped. */
     if (transfer->status == LIBUSB_TRANSFER_STALL)
       self->_tx_wedged.store(true, std::memory_order_relaxed);
-    self->_tx_failed.fetch_add(1, std::memory_order_relaxed);
-    self->_tx_last_rc.store(-transfer->status, std::memory_order_relaxed);
-    self->_tx_last_timeout.store(
-        transfer->status == LIBUSB_TRANSFER_TIMED_OUT,
-        std::memory_order_relaxed);
-    self->_logger->error("Failed to send packet, status: {}, actual length: {}",
-                         transfer->status, transfer->actual_length);
-    devourer::Ev(self->_logger->events(), "tx.fail")
-        .f("status", (long long)transfer->status)
-        .f("actual_len", transfer->actual_length)
-        .f("timeout", transfer->status == LIBUSB_TRANSFER_TIMED_OUT);
+    /* A CANCELLED completion is quiesce_tx doing its job, not a failure —
+     * counting it would show phantom drops at the end of every session. */
+    if (transfer->status != LIBUSB_TRANSFER_CANCELLED) {
+      self->_tx_failed.fetch_add(1, std::memory_order_relaxed);
+      self->_tx_last_rc.store(-transfer->status, std::memory_order_relaxed);
+      self->_tx_last_timeout.store(
+          transfer->status == LIBUSB_TRANSFER_TIMED_OUT,
+          std::memory_order_relaxed);
+      self->_logger->error(
+          "Failed to send packet, status: {}, actual length: {}",
+          transfer->status, transfer->actual_length);
+      devourer::Ev(self->_logger->events(), "tx.fail")
+          .f("status", (long long)transfer->status)
+          .f("actual_len", transfer->actual_length)
+          .f("timeout", transfer->status == LIBUSB_TRANSFER_TIMED_OUT);
+    }
   }
-  self->_tx_inflight.fetch_sub(1, std::memory_order_relaxed);
+  {
+    std::lock_guard<std::mutex> lk(self->_tx_mu);
+    auto &live = self->_tx_live;
+    auto it = std::find(live.begin(), live.end(), transfer);
+    if (it != live.end())
+      live.erase(it);
+  }
+  /* The payload is transport-owned (allocated in tx_async) — free it with the
+   * allocator that made it, never libusb's LIBUSB_TRANSFER_FREE_BUFFER: on
+   * Windows a separately-linked libusb frees onto a different CRT heap. */
+  std::free(transfer->buffer);
   libusb_free_transfer(transfer);
+  /* Last, so a quiesce_tx loop that sees _tx_inflight == 0 knows every buffer
+   * and transfer is already freed and nothing more will touch this object. */
+  self->_tx_inflight.fetch_sub(1, std::memory_order_release);
+}
+
+/* Cancel + drain, called while the caller's libusb context is still alive.
+ * See IRtlTransport::quiesce_tx for the contract. */
+void UsbTransport::quiesce_tx() {
+  if (_tx_shutdown.exchange(true, std::memory_order_acq_rel))
+    return; /* already quiesced (Stop() then the destructor) */
+
+  /* Snapshot, then cancel outside the lock — libusb_cancel_transfer can
+   * complete the transfer inline, re-entering transfer_callback, which takes
+   * the same mutex. Cancellation is asynchronous: SUCCESS means "unlink
+   * submitted", so the drain below is what actually establishes quiescence.
+   * NOT_FOUND means the transfer already completed — its callback owns the
+   * bookkeeping, so there is nothing to do here. */
+  std::vector<libusb_transfer *> pending;
+  {
+    std::lock_guard<std::mutex> lk(_tx_mu);
+    pending = _tx_live;
+  }
+  for (auto *t : pending)
+    libusb_cancel_transfer(t);
+
+  /* Drain. Generous deadline: an unlink normally retires in microseconds (or
+   * instantly with NO_DEVICE once the adapter is unplugged), and hanging
+   * teardown forever is worse than reporting the anomaly. */
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  while (_tx_inflight.load(std::memory_order_acquire) > 0 &&
+         std::chrono::steady_clock::now() < deadline) {
+    struct timeval tv {0, 20000};
+    if (libusb_handle_events_timeout_completed(_ctx, &tv, nullptr) != 0)
+      break; /* context is gone or broken — nothing left to reap with */
+  }
+
+  const int residual = _tx_inflight.load(std::memory_order_acquire);
+  if (residual > 0) {
+    /* Proceeding means libusb_close will run with live transfers, which is
+     * undefined behaviour — so say so loudly rather than fail silently. */
+    _logger->error("TX quiesce timed out with {} transfer(s) still in flight — "
+                   "the USB close that follows is unsafe",
+                   residual);
+    devourer::Ev(_logger->events(), "tx.quiesce_timeout").f("inflight", residual);
+  }
 }
 
 bool UsbTransport::tx_async(uint8_t tx_ep, uint8_t *packet, size_t length,
@@ -673,6 +863,11 @@ bool UsbTransport::tx_async(uint8_t tx_ep, uint8_t *packet, size_t length,
    * fail, and TX collapses (issue #240). If the in-flight depth is already high
    * (a fast caller outrunning the air), block briefly to reap — bounded
    * backpressure that also caps latency. */
+  /* Refused before the pump below, so a late send can't re-enter libusb after
+   * teardown has begun. Counts as neither submitted nor failed: a frame handed
+   * to us after we were told to stop is not a drop. */
+  if (_tx_shutdown.load(std::memory_order_acquire))
+    return false;
   {
     struct timeval zero {0, 0};
     libusb_handle_events_timeout_completed(_ctx, &zero, nullptr);
@@ -691,6 +886,19 @@ bool UsbTransport::tx_async(uint8_t tx_ep, uint8_t *packet, size_t length,
     _logger->error("Failed to allocate transfer");
     return false;
   }
+
+  /* The URB outlives this call by definition (that is what "async" buys), so
+   * it cannot reference the caller's buffer: every caller so far builds its
+   * frame in a local that dies on return. Copy into a transport-owned block,
+   * freed in transfer_callback. One memcpy per frame is far below the
+   * libusb_alloc_transfer above it and the kernel's own copy at submit. */
+  auto *payload = static_cast<uint8_t *>(std::malloc(length));
+  if (!payload) {
+    _logger->error("Failed to allocate TX payload ({} bytes)", length);
+    libusb_free_transfer(transfer);
+    return false;
+  }
+  std::memcpy(payload, packet, length);
 
   /* Recover a bulk-OUT that a prior async TX wedged (TIMED_OUT / stall). Only
    * the first send used to clear_halt; a mid-stream stall (e.g. hardware NDP
@@ -745,7 +953,7 @@ bool UsbTransport::tx_async(uint8_t tx_ep, uint8_t *packet, size_t length,
    * Over-submission is bounded by the in-flight soft cap above, not by
    * dropping frames on a timer. `timeout_ms` is kept for the sync path. */
   (void)timeout_ms;
-  libusb_fill_bulk_transfer(transfer, _dev_handle, tx_ep, packet, length,
+  libusb_fill_bulk_transfer(transfer, _dev_handle, tx_ep, payload, length,
                             &UsbTransport::transfer_callback, (void *)this,
                             /*timeout=*/0);
   /* Upstream OOT (rtl8814a/usb/rtl8814au_xmit.c) sets URB_ZERO_PACKET on
@@ -758,12 +966,27 @@ bool UsbTransport::tx_async(uint8_t tx_ep, uint8_t *packet, size_t length,
   /* Count the submission here; async completion (incl. TIMED_OUT) is counted
    * in transfer_callback, a submit error just below. */
   _tx_submitted.fetch_add(1, std::memory_order_relaxed);
+  /* Register and count BEFORE submitting: the completion can be delivered from
+   * another thread's pump the instant the URB is queued, and it must find its
+   * own entry to remove. */
+  {
+    std::lock_guard<std::mutex> lk(_tx_mu);
+    _tx_live.push_back(transfer);
+  }
+  _tx_inflight.fetch_add(1, std::memory_order_relaxed);
   int rc = libusb_submit_transfer(transfer);
   if (rc == LIBUSB_SUCCESS) {
-    _tx_inflight.fetch_add(1, std::memory_order_relaxed);
     DVR_DEBUG(_logger, "Packet sent successfully, length: {}", length);
     return true;
   }
+  /* Never submitted, so no callback will run — undo the bookkeeping here. */
+  {
+    std::lock_guard<std::mutex> lk(_tx_mu);
+    auto it = std::find(_tx_live.begin(), _tx_live.end(), transfer);
+    if (it != _tx_live.end())
+      _tx_live.erase(it);
+  }
+  _tx_inflight.fetch_sub(1, std::memory_order_relaxed);
   _tx_failed.fetch_add(1, std::memory_order_relaxed);
   _tx_last_rc.store(rc, std::memory_order_relaxed);
   _tx_last_timeout.store(rc == LIBUSB_ERROR_TIMEOUT, std::memory_order_relaxed);
@@ -771,6 +994,7 @@ bool UsbTransport::tx_async(uint8_t tx_ep, uint8_t *packet, size_t length,
   devourer::Ev(_logger->events(), "tx.fail")
       .f("rc", rc)
       .f("timeout", rc == LIBUSB_ERROR_TIMEOUT);
+  std::free(payload);
   libusb_free_transfer(transfer);
   return false;
 }

@@ -1,6 +1,7 @@
 #ifndef RTL_KESTREL_DEVICE_H
 #define RTL_KESTREL_DEVICE_H
 
+#include <atomic>
 #include <cstdint>
 #include <optional>
 #include <thread>
@@ -15,6 +16,7 @@
 #include "SelectedChannel.h"
 
 #include "ChipVariant.h"
+#include "FrameParserKestrel.h" /* KestrelPhySts (cached per-path phy-status) */
 #include "HalKestrel.h"
 
 namespace kestrel {
@@ -91,6 +93,15 @@ public:
   int SetTxPowerOffsetQdb(int qdb) override;
   devourer::TxPowerState GetTxPowerState() override;
 
+  /* Caller-supplied per-rate power shape (src/TxPower.h). This family has no
+   * per-rate TXAGC table, so the diff for the frame's own rate folds into the
+   * fixed-dBm target inside send_packet — see the two consequences documented
+   * on _rate_diff_qdb below. */
+  bool SetTxPowerRateDiffs(
+      const std::optional<devourer::TxRateDiffsQdb> &diffs) override;
+  /* The configured diff (qdB) for one MGN_* rate, 0 when no table is set. */
+  int rate_diff_qdb_for(uint8_t mgn_rate) const;
+
   /* Runtime TX-mode default (DEVOURER_TX_RATE): rate/BW/GI/LDPC/STBC applied to
    * a rate-less frame (e.g. the demo beacon). A per-packet radiotap rate always
    * wins. Mirrors the Jaguar behaviour so DEVOURER_TX_RATE works uniformly. */
@@ -116,10 +127,15 @@ public:
   /* Frame-free RX energy snapshot. On Kestrel this carries only the active
    * absolute noise floor (halbb NHM env-monitor) when DEVOURER_RX_NOISE_FLOOR is
    * set — there is no phydm FA/CCA/IGI DIG monitor on this generation. */
-  RxEnergy GetRxEnergy() override;
+  RxEnergy GetRxEnergy(bool with_nhm) override;
   /* Windowed RX link-quality: the passive rssi-snr floor + LinkHealth verdict
    * (fed per frame via _rxq) fused with the active NHM floor from GetRxEnergy. */
   devourer::RxQuality GetRxQuality() override;
+  /* Live per-chain RX-path activity (fed via _rxpaths in the RX loop): per-
+   * antenna RSSI/SNR/EVM window means from the physts per-path pages. */
+  devourer::ActiveRxPaths GetActiveRxPaths() override {
+    return _rxpaths.snapshot();
+  }
 
   /* Arm the AX HW beacon engine (mac_send_bcn_h2c + AP port timing). Requires a
    * prior InitWrite. `beacon` is a full 802.11 beacon; the MAC airs it every
@@ -218,15 +234,29 @@ private:
   int16_t _sess_pwr_qdb = 0; /* offset applied by SetTxPowerOffsetQdb — the
                               * restore target for frames without a radiotap
                               * DBM_TX_POWER field */
-  /* Per-chain RSSI (RSSI% = dBm+110) cached from the last PPDU-status physts
-   * header, attached to the following WIFI frame(s) in the aggregate. */
-  uint8_t _last_rssi[2] = {0, 0};
-  /* Per-frame SNR (raw U(8,1) = dB*2), cached from the physts header alongside
-   * RSSI for the passive noise floor (rssi_dbm - snr_db). 0 = unknown. */
-  uint8_t _last_snr = 0;
+  /* SetTxPowerRateDiffs, as a flat array in the TxRateDiffsQdb field order
+   * (cck, legacy, mcs0..7) rather than the struct, so send_packet can read the
+   * single entry its frame's rate needs with a relaxed atomic load: no lock
+   * lands on the TX hot path, and a table swapped mid-stream can only ever
+   * split BETWEEN frames, never within one. Two consequences of folding in
+   * software rather than in a per-rate hardware table, both real:
+   *   - the BB target is global, so a hardware-timed beacon airing between two
+   *     host frames inherits the last frame's rate diff, not its own rate's;
+   *   - a stream that alternates rates pays 2 BB register writes per change
+   *     (a fixed-rate stream pays once and then nothing). */
+  std::atomic<bool> _rate_diffs_on{false};
+  std::atomic<int8_t> _rate_diff_qdb[10]{};
+  /* Per-path RSSI/SNR/EVM (rx_pkt_attrib raw conventions) parsed from the last
+   * PPDU-status physts blob (kestrel::parse_physts_8852), attached to the
+   * following WIFI frame(s) in the aggregate. snr_avg (raw dB*2, IE01) feeds
+   * the passive noise floor (rssi_dbm - snr_db). 0 = not measured. */
+  kestrel::KestrelPhySts _last_physts{};
   /* Windowed RX link-quality accumulator (passive noise floor + LinkHealth),
    * fed per decoded frame from the RX loop; drained by GetRxQuality. */
   devourer::RxQualityAccumulator _rxq;
+  /* Live per-chain RX-path activity (per-antenna RSSI/SNR/EVM window means),
+   * fed per decoded frame; drained by GetActiveRxPaths. */
+  devourer::RxPathActivityAccumulator _rxpaths;
 };
 
 #endif /* RTL_KESTREL_DEVICE_H */

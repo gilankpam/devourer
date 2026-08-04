@@ -405,13 +405,16 @@ public:
    * against a decodable preamble — the primary-CCA bit [14] is what recovers the
    * inject path. This is the MAC-gate only; the vendor's BB CCA-off writes are
    * NOT applied (they deafen the RX). Also DEVOURER_DIS_CCA at construction.
-   * Implemented on Jaguar2/3 and Kestrel (the AX R_AX_CCA_CFG_0 all-CCA-EN field —
-   * on Kestrel injection is already CCA-off by default via sch_tx_en, so this is a
-   * runtime toggle rather than the deferral fix it is on Jaguar); a DELIBERATE
-   * no-op on Jaguar1, whose baseband EDCCA is already disabled by its init table
-   * (0x8A4 = 0x7F7F7F7F) and whose hardware-beacon downlink measures ~0.34 µs RMS
-   * on a crowded channel with no MAC-side gate. */
-  virtual void SetCcaMode(bool disabled) { (void)disabled; }
+   *
+   * Pure virtual: every generation implements or loudly refuses — a silent
+   * no-op here reads as "carrier-sense changed" to the caller. Default
+   * state on Jaguar1/2/3 is carrier-sense + EDCCA ENABLED (Jaguar1 programs
+   * its BB EDCCA thresholds at bring-up — its init table parks them at
+   * never-trigger); Kestrel's TX path keeps the gates cleared because
+   * carrier-sense TX 103-stalls without the un-ported IQK/DPK cal
+   * (perpetual-busy detectors) — it logs that loudly instead of
+   * pretending. */
+  virtual void SetCcaMode(bool disabled) = 0;
 
   /* Shift the next hardware beacon TBTT by `microseconds` (>0 = later/retard,
    * <0 = earlier/advance), quantized to whole TU (1 TU = 1024 µs). One-shot
@@ -517,10 +520,17 @@ public:
   /* Frame-free RX energy / channel-busy snapshot (see RxSense.h) — the read side
    * of the DEVOURER_CW_TONE emitter, used for spectrum-sensing / interferer
    * detection. Reads the chip's phydm false-alarm + CCA counters, DIG/IGI, and
-   * (optionally) the NHM power histogram. FA/CCA counts are the delta since the
+   * (when asked) the NHM power histogram. FA/CCA counts are the delta since the
    * previous call. Default returns an all-invalid snapshot; each generation
-   * overrides with a real reader. */
-  virtual RxEnergy GetRxEnergy() { return {}; }
+   * overrides with a real reader.
+   *
+   * `with_nhm` is a cost decision, not a preference: the NHM read arms a ~2 ms
+   * measurement window and then polls a ready bit at 1 ms granularity
+   * (src/NhmReader.h), so it dominates the call — the scalar FA/CCA/IGI path is
+   * a handful of register reads. Pass false for the throwaway read that resets
+   * the delta counters before an observation window, and for any caller
+   * sampling faster than a few times a second. */
+  virtual RxEnergy GetRxEnergy(bool with_nhm) { (void)with_nhm; return {}; }
 
   /* Consolidated windowed RX link-quality snapshot (see RxQuality.h) — the
    * runtime feed a closed-loop adaptive-link controller reads instead of
@@ -552,6 +562,22 @@ public:
    * Init/InitWrite). On Jaguar1 a failed FW boot does not abort bring-up —
    * this is the only place the failure is visible to a caller. */
   virtual devourer::FwBootStatus GetFwBootStatus() { return {}; }
+
+  /* Dump the chip's canary register set (BB / MAC / per-path RF) to the
+   * diagnostic plane. Reads only — no writes, no calibration, no bring-up.
+   *
+   * The point is that it is callable on a device that has NOT been Init'ed, so
+   * a chip left in whatever state a previous session abandoned it in can be
+   * inspected AS IT IS. Every other path into this driver reconfigures the chip
+   * on the way in, which destroys exactly the evidence a state bug leaves
+   * behind. Pair it with an open that skips libusb_reset_device
+   * (claim_interface_then_reset's `do_reset=false`) — a USB reset re-runs the
+   * chip's own boot and is just as destructive.
+   *
+   * Output format matches DEVOURER_DUMP_CANARY, so two dumps diff directly with
+   * tests/canary_diff.py. Reading a powered-down chip yields garbage or throws;
+   * interpreting that is the caller's job. No-op where unsupported (default). */
+  virtual void DumpChipState() {}
 };
 
 #endif /* IRTL_DEVICE_H */

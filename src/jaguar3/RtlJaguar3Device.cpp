@@ -320,7 +320,8 @@ void RtlJaguar3Device::StartRxLoop(Action_ParsedRadioPacket packetProcessor) {
         p.Data = std::span<uint8_t>(const_cast<uint8_t *>(f.frame), f.frame_len);
         if (!p.RxAtrib.crc_err) {
           _rxq.add(p.RxAtrib.rssi[0], p.RxAtrib.snr[0], p.RxAtrib.evm[0]);
-          _rxpaths.add(p.RxAtrib.rssi, 2); /* 8822C/8822E are 2T2R */
+          _rxpaths.add(p.RxAtrib.rssi, p.RxAtrib.snr, p.RxAtrib.evm,
+                       2); /* 8822C/8822E are 2T2R */
           if (_cfg.tuning.cfo_track)
             _cfo.add(p.RxAtrib.cfo_tail); /* closed-loop CFO input (#217) */
         }
@@ -382,6 +383,10 @@ void RtlJaguar3Device::StartRxLoop(Action_ParsedRadioPacket packetProcessor) {
  * (exception path / caller that drops the device) — a joinable std::thread in
  * the destructor would otherwise std::terminate. Idempotent with Stop(). */
 RtlJaguar3Device::~RtlJaguar3Device() {
+  /* Inert on this generation (its send path is synchronous), but the invariant
+   * belongs to every device: nothing gets released while a transfer the
+   * transport still owns is outstanding. */
+  _device.quiesce_tx();
   /* Safety net: restore the chip if a CW tone is still armed (before the coex
    * thread is joined — StopCwTone serializes on _reg_mu with it). */
   StopCwTone();
@@ -874,6 +879,14 @@ void RtlJaguar3Device::InitWrite(SelectedChannel channel) {
   else
     _txpkt_img.store(0, std::memory_order_relaxed);
   apply_dpdt_route_8822e(); /* 8822E DPDT/eFEM pin-mux (post-coex) */
+  /* ACK window (DEVOURER_ACK_TIMEOUT_US): one library default on every
+   * generation, replacing the halmac per-bandwidth REG_ACKTO defaults
+   * init_wmac_cfg just wrote (the 128 default covers the slowest
+   * narrowband ACK) — see the DeviceConfig field doc. */
+  _device.rtw_write8(0x0640, static_cast<uint8_t>(
+      _cfg.tx.ack_timeout_us > 255   ? 255
+      : _cfg.tx.ack_timeout_us < 1 ? 1
+                                     : _cfg.tx.ack_timeout_us));
   apply_replay_wseq(); /* DEVOURER_REPLAY_WSEQ golden-init replay (debug) */
   if (_cfg.debug.bb_dump) {
     /* Full MAC+BB dump (0x000..0x4ffc — MAC plane, then BB incl. the RF
@@ -1066,7 +1079,7 @@ void RtlJaguar3Device::StopContinuousTx() {
  * channel-busy signal (a CW tone spikes OFDM CCA); OFDM FA is the vendor sum of
  * the sub-counters. Read-then-reset for a per-call delta; serialized on _reg_mu
  * so it does not race the coex thread's register access. */
-RxEnergy RtlJaguar3Device::GetRxEnergy() {
+RxEnergy RtlJaguar3Device::GetRxEnergy(bool with_nhm) {
   std::lock_guard<std::mutex> lk(_reg_mu);
   RxEnergy e;
   auto rd = [this](uint16_t addr) { return _device.rtw_read<uint32_t>(addr); };
@@ -1091,7 +1104,8 @@ RxEnergy RtlJaguar3Device::GetRxEnergy() {
    * ~2 ms measurement window before the FA-counter reset below (0x1eb4[25] also
    * clears BB HW counters). Holds _reg_mu across the short wait — tolerable at
    * the emitter's >=100 ms cadence vs the coex thread's ~2 s tick. */
-  devourer::read_nhm(
+  if (with_nhm)
+    devourer::read_nhm(
       devourer::nhm_regs_jgr3(), e.igi, rd,
       [this](uint16_t a, uint32_t m, uint32_t v) {
         _device.phy_set_bb_reg(a, m, v);
@@ -1293,12 +1307,12 @@ void RtlJaguar3Device::apply_tx_power_current(bool full) {
        * caller-supplied diff table when SetTxPowerRateDiffs has one set;
        * otherwise the default phy_reg_pg walk. */
       if (_rate_diffs)
-        _radioManagement.apply_rate_diffs_8822e(ra, rb, *_rate_diffs);
+        _radioManagement.apply_rate_diffs(ra, rb, *_rate_diffs);
       else
         _radioManagement.apply_power_by_rate_8822e(_channel.Channel, ra, rb);
       _diffs_zeroed = false;
     } else {
-      _radioManagement.apply_tx_power_refs_8822e(ra, rb);
+      _radioManagement.apply_tx_power_refs(ra, rb);
     }
     return;
   }
@@ -1306,9 +1320,20 @@ void RtlJaguar3Device::apply_tx_power_current(bool full) {
   /* 8822c (CU): preserve the flat reference the demo used to impose (40) so
    * the SDR-validated CU TX power is unchanged. The CU's efuse-calibrated
    * per-rate default is a follow-up; the offset shifts this reference. */
-  _radioManagement.set_tx_power_ref(
-      clamp127(static_cast<int>(JAGUAR3_TXPWR_REF_BASE_8822C) + off),
-      /*zero_diffs=*/!_diffs_zeroed);
+  const uint8_t rc = clamp127(static_cast<int>(JAGUAR3_TXPWR_REF_BASE_8822C) + off);
+  if (_rate_diffs) {
+    /* A caller table shapes the CU through the same TXAGC block the EU uses
+     * (set_tx_power_ref is the rtw8822c routine): the flat reference becomes
+     * the MCS7 anchor and the caller's qdB land in the 0x3a00 diff table. */
+    if (full || _diffs_zeroed) {
+      _radioManagement.apply_rate_diffs(rc, rc, *_rate_diffs);
+      _diffs_zeroed = false;
+    } else {
+      _radioManagement.apply_tx_power_refs(rc, rc);
+    }
+    return;
+  }
+  _radioManagement.set_tx_power_ref(rc, /*zero_diffs=*/!_diffs_zeroed);
   _diffs_zeroed = true;
 }
 
@@ -1327,6 +1352,16 @@ devourer::TxPowerCaps RtlJaguar3Device::GetTxPowerCaps() {
   caps.step_measured = _variant == jaguar3::ChipVariant::C8822C;
   caps.offset_min_qdb = -127;
   caps.offset_max_qdb = 127;
+  /* Both dies drive the same TXAGC reference + 0x3a00 per-rate diff block. */
+  caps.rate_diffs = true;
+  caps.rate_diffs_hw_table = true;
+  /* On-air (tests/txpwr_rate_diffs_onair.sh): the 8822CU reads -8.0 dB for a
+   * -32 qdB MCS0 trim (implied 0.25 dB/idx — the nominal step; the offset
+   * knob's 6-point fit gave 0.325, and one A/B point does not arbitrate
+   * between them). The 8822EU moves -9.0 dB but its ref->power transfer is
+   * TSSI-reshaped and non-linear, so its cell asserts sign only and the
+   * measured flag stays false there, exactly as step_measured does. */
+  caps.rate_diffs_measured = _variant == jaguar3::ChipVariant::C8822C;
   return caps;
 }
 
@@ -1367,10 +1402,6 @@ void RtlJaguar3Device::SetTxPowerIndexOverride(int idx) {
 
 bool RtlJaguar3Device::SetTxPowerRateDiffs(
     const std::optional<devourer::TxRateDiffsQdb> &diffs) {
-  if (_variant != jaguar3::ChipVariant::C8822E) {
-    _logger->warn("SetTxPowerRateDiffs: 8822E-only");
-    return false;
-  }
   if (_cw_active) {
     _logger->warn("SetTxPowerRateDiffs refused: CW tone active");
     return false;
@@ -1380,16 +1411,7 @@ bool RtlJaguar3Device::SetTxPowerRateDiffs(
    * the sign of an over-range int8_t: a caller asking for -100 (a big cut)
    * would land +28 (a power boost). Same guard the ref path applies against
    * its own over-range wrap. */
-  std::optional<devourer::TxRateDiffsQdb> clamped = diffs;
-  if (clamped) {
-    auto cl = [](int8_t v) -> int8_t {
-      return v < -64 ? -64 : (v > 63 ? 63 : v);
-    };
-    clamped->cck = cl(clamped->cck);
-    clamped->legacy = cl(clamped->legacy);
-    for (int i = 0; i < 8; ++i)
-      clamped->mcs[i] = cl(clamped->mcs[i]);
-  }
+  const auto clamped = devourer::clamp_rate_diffs(diffs);
   std::lock_guard<std::mutex> lk(_reg_mu);
   _rate_diffs = clamped;
   if (_brought_up)
@@ -1514,6 +1536,10 @@ devourer::AdapterCaps RtlJaguar3Device::GetAdapterCaps() {
   c.tx_chains = 2; /* 8822C/8822E are 2T2R */
   c.rx_chains = 2;
   c.per_chain_rssi = true;
+  /* Hardware ARQ (truth table at the AdapterCaps declarations): both dies
+   * measured — responder matrix + retry-knob A/B + the arq_e2e ledgers. */
+  c.ack_responder_ok = true;
+  c.tx_retry_limit_ok = true;
   /* Per-packet TX power: the TXPWR_OFSET_TYPE bank selector + programmable
    * 0x1e70 offset banks (SetTxPacketPowerOffsetQdb / radiotap DBM_TX_POWER;
    * TxPktPwrBanks.h). Continuous in step_qdb units, ±63/-64 index travel, 2
@@ -1561,6 +1587,11 @@ devourer::AdapterCaps RtlJaguar3Device::GetAdapterCaps() {
     c.marketing_names = "RTL8812CU/RTL8822CU";
     c.chip_id = 0x13;
     c.variant = "C8822C";
+    /* 8812CU on air: VHT 1SS MCS0 and MCS4 on 2.4 GHz, every sampled frame
+     * decoded as the commanded VHT rate by an 8814AU peer. Not set for the
+     * 8822E above — its 2.4 GHz TX is undecodable under the vendor driver too
+     * (docs/8822e-quirks.md), which this flag would otherwise paper over. */
+    c.vht_2g4_ok = true;
   }
   return c;
 }
@@ -1615,7 +1646,7 @@ devourer::TxPowerState RtlJaguar3Device::GetTxPowerState() {
     const uint32_t cck =
         (_device.rtw_read32(0x18a0) >> 16) & 0x7f;
     if (_rate_diffs && s.flat_index < 0) {
-      /* A custom per-rate diff table is live (8822E SetTxPowerRateDiffs) and
+      /* A custom per-rate diff table is live (SetTxPowerRateDiffs) and
        * no flat override is overriding it on the chip: the shared reference
        * alone is no longer the effective index for any rate, so report
        * ref + diff[rate] instead of the artifact where cck/ofdm/mcs7 all read
@@ -1947,7 +1978,13 @@ size_t RtlJaguar3Device::build_tx_block(const uint8_t *packet, size_t length,
   uint8_t bw_desc = (bwidth == CHANNEL_WIDTH_40)   ? 1
                     : (bwidth == CHANNEL_WIDTH_80) ? 2
                                                    : 0;
-  uint8_t rate_id = vht ? 9 : 8;
+  /* RA group by rate family/NSS/band (rateid_for_mgn): the group is the
+   * rate-space the fw retry ladder walks. The inherited `vht ? 9 : 8` put
+   * HT frames in VHT_2SS (retries fell back through the legacy chain) and
+   * legacy frames in the CCK-only B group. Witness-measured per copy: the
+   * family-correct group steps MCSx -> MCS(x-1) -> 6M floor instead. */
+  uint8_t rate_id = rateid_for_mgn(static_cast<unsigned char>(fixed_rate),
+                                   _channel.Channel > 14);
 
   /* 40-in-80: a 40 MHz frame on an 80 MHz-configured channel needs a data
    * sub-channel telling the PHY which 40 MHz half to use — the lower 40 (which
@@ -1981,14 +2018,38 @@ size_t RtlJaguar3Device::build_tx_block(const uint8_t *packet, size_t length,
       bw_desc, sgi != 0, ldpc != 0, stbc, bmc, ndpa, data_sc, pwr_type,
       pkt_offset);
   if (_cfg.tx.report) {
-    /* DEVOURER_TX_REPORT: SPE_RPT asks the fw for a per-frame CCX TX report;
-     * the report echoes SW_DEFINE's low byte, so stamp a rotating tag for
-     * per-frame correlation (src/TxReport.h). Both fields sit inside the
-     * checksummed span — re-checksum (idempotent). */
-    SET_TX_DESC_SPE_RPT_8822C(out, 1);
-    SET_TX_DESC_SW_DEFINE_8822C(out, _tx_rpt_tag.fetch_add(1) & 0xff);
+    /* DEVOURER_TX_REPORT: SPE_RPT asks the fw for a CCX TX report; the
+     * report echoes SW_DEFINE's low byte, so stamp a rotating tag for
+     * per-frame correlation (src/TxReport.h). The tag goes on EVERY frame
+     * while the request samples every Nth (cfg value = N): the fw's CCX
+     * emission saturates at ~1.3k reports/s, and with the tag continuous a
+     * received-report tag delta other than N is a dropped report. Both
+     * fields sit inside the checksummed span — re-checksum (idempotent). */
+    const uint64_t k = _tx_rpt_tag.fetch_add(1);
+    SET_TX_DESC_SPE_RPT_8822C(
+        out, k % static_cast<uint64_t>(_cfg.tx.report) == 0 ? 1 : 0);
+    SET_TX_DESC_SW_DEFINE_8822C(out, static_cast<uint16_t>(k & 0xff));
     jaguar3::cal_txdesc_chksum_8822c(out);
   }
+  /* Per-frame retry limit from cfg (DEVOURER_TX_RETRY_LIMIT, default 0) —
+   * the fill_data_tx_desc builder hardcodes 12, which floods a busy
+   * half-duplex link. Both fields sit inside the checksummed span. */
+  SET_TX_DESC_RTY_LMT_EN_8822C(out, 1);
+  SET_TX_DESC_RTS_DATA_RTY_LMT_8822C(out, _cfg.tx.retry_limit);
+  /* RA-group override (DEVOURER_TX_RATEID): the ladder-sweep lever the
+   * retry-ladder probe drives (tests/retry_ladder_probe.sh). Checksummed
+   * span. */
+  if (_cfg.debug.tx_rateid)
+    SET_TX_DESC_RATE_ID_8822C(out, *_cfg.debug.tx_rateid);
+  /* Retry rate-fallback control (DEVOURER_TX_RETRY_FALLBACK): default leaves
+   * the builder's DISDATAFB=0 — the fw ladder, MCS-native now that the RA
+   * group is family-correct (MCSx -> MCS(x-1) -> 6M floor; CCK floor at
+   * 2.4 GHz); Off pins retries at the descriptor rate. No floor form (the
+   * RetryFallback note in DeviceConfig.h has the measurement). Same
+   * checksummed span as the retry limit. */
+  if (_cfg.tx.retry_fallback == devourer::RetryFallback::Off)
+    SET_TX_DESC_DISDATAFB_8822C(out, 1);
+  jaguar3::cal_txdesc_chksum_8822c(out);
   const devourer::AmpduMode am = _ampdu; /* one lock-free load */
   if (am.enabled || _cfg.debug.tx_qsel || _cfg.debug.tx_ampdu_max) {
     /* A-MPDU descriptor half. The product SetAmpduMode state applies first,
@@ -2000,7 +2061,7 @@ size_t RtlJaguar3Device::build_tx_block(const uint8_t *packet, size_t length,
       SET_TX_DESC_AGG_EN_8822C(out, 1);
       SET_TX_DESC_MAX_AGG_NUM_8822C(out, am.max_num & 0x1f);
       SET_TX_DESC_AMPDU_DENSITY_8822C(out, am.density & 0x7);
-      SET_TX_DESC_RTS_DATA_RTY_LMT_8822C(out, am.no_ack ? 0 : 12);
+      SET_TX_DESC_RTS_DATA_RTY_LMT_8822C(out, am.no_ack ? 0 : _cfg.tx.retry_limit);
     }
     if (_cfg.debug.tx_qsel)
       SET_TX_DESC_QSEL_8822C(out, *_cfg.debug.tx_qsel);

@@ -124,6 +124,12 @@ public:
   int SetXtalCap(int cap) override;
   int GetXtalCap() override { return _xtal_cap; }
   devourer::TxPowerState GetTxPowerState() override;
+  /* Caller-supplied per-rate power shape (src/TxPower.h): replaces the efuse
+   * per-rate walk, anchored on the HT MCS7 section index and quantized to this
+   * family's 0.5 dB step. Sticky across SetMonitorChannel / FastRetune and a
+   * flat-override round trip; std::nullopt restores the calibrated walk. */
+  bool SetTxPowerRateDiffs(
+      const std::optional<devourer::TxRateDiffsQdb> &diffs) override;
   devourer::ThermalStatus GetThermalStatus() override;
   /* Per-chip TX caps (IRtlDevice): the 8821C is 1T1R (no STBC), the 8822B
    * 2T2R. send_packet drops an STBC request the variant can't honour. */
@@ -171,12 +177,12 @@ public:
   /* Frame-free RX energy snapshot (see RxSense.h) — the FA/CCA/IGI values
    * dig_step samples over its ~100 ms window, plus a fresh NHM power histogram.
    * The read side of the CW tone. */
-  RxEnergy GetRxEnergy() override;
+  RxEnergy GetRxEnergy(bool with_nhm) override;
 
   /* Consolidated windowed RX link-quality snapshot (see RxQuality.h) — subsumes
    * GetRxEnergy. Fed per decoded frame in the RX loop via _rxq. */
   devourer::RxQuality GetRxQuality() override {
-    return devourer::build_rx_quality(_rxq.snapshot(), GetRxEnergy());
+    return devourer::build_rx_quality(_rxq.snapshot(), GetRxEnergy(true));
   }
 
   /* Adapter-health probes (see src/AdapterHealth.h). EFUSE probe re-reads the
@@ -234,11 +240,21 @@ private:
    * override -1 = efuse per-rate baseline; offset in 0.5 dB index steps. */
   std::atomic<int> _tx_pwr_override{-1};
   std::atomic<int> _tx_pwr_offset_steps{0};
+  /* Caller-supplied per-rate diff table (SetTxPowerRateDiffs) in place of the
+   * efuse per-rate walk; std::nullopt = that walk. Read/written under _reg_mu
+   * like every other apply input. `_rate_diffs_on` mirrors its presence for
+   * GetTxPowerState, which reports a lock-free snapshot. */
+  std::optional<devourer::TxRateDiffsQdb> _rate_diffs;
+  std::atomic<bool> _rate_diffs_on{false};
   /* Default per-packet TXPWR_OFSET LUT step (0 = none) — see SetTxPacketPowerStep. */
   std::atomic<uint8_t> _tx_pkt_pwr_step{0};
   /* Rotating SW_DEFINE tag stamped when tx.report is on — the CCX report
-   * echoes its low byte, correlating reports to frames (src/TxReport.h). */
-  std::atomic<uint16_t> _tx_rpt_tag{0};
+   * echoes its low byte, correlating reports to frames (src/TxReport.h).
+   * 64-bit: the counter also gates the sampled SPE_RPT request (every Nth
+   * frame), and a narrow counter's wrap would jump the sampling phase for
+   * any N that doesn't divide it — off-modulo tag deltas masquerading as
+   * dropped reports at every seam. */
+  std::atomic<uint64_t> _tx_rpt_tag{0};
   /* A-MPDU TX mode (SetAmpduMode). Read lock-free in the TX descriptor path
    * (same pattern as _tx_mode_default); a control-plane write during TX is
    * the caller's to sequence and at worst tears one frame's mode benignly. */

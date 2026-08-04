@@ -101,7 +101,7 @@ public:
    * Jaguar3 caps: 7-bit TXAGC reference, 0.25 dB (1 qdB) per step. The offset
    * shifts the per-path reference anchor (0x18e8/0x41e8 OFDM, 0x18a0/0x41a0
    * CCK) — the 0x3a00 per-rate diff table is offset-invariant, so a live step
-   * is ~8 gated register writes (apply_tx_power_refs_8822e / a diffs-kept
+   * is ~8 gated register writes (apply_tx_power_refs / a diffs-kept
    * set_tx_power_ref) under _reg_mu, serialized against the coex tick's
    * pwr_track (which RMWs the [7:0] thermal field of the SAME 0x18a0/0x41a0
    * dwords — field-disjoint, so thermal compensation and the offset compose).
@@ -179,14 +179,14 @@ public:
    * FA (0x1a5c), OFDM FA (sum of 0x2d04/08/10/20/0c), IGI (0x1d70) — reset via
    * 0x1a2c + 0x1eb4[25]. Read-then-reset for a per-call delta; serialized on
    * _reg_mu against the coex runtime thread. The read side of the CW tone. */
-  RxEnergy GetRxEnergy() override;
+  RxEnergy GetRxEnergy(bool with_nhm) override;
 
   /* Consolidated windowed RX link-quality snapshot (see RxQuality.h) — subsumes
    * GetRxEnergy. Fed per decoded frame in the RX loop via _rxq. On Jaguar3 the
    * noise-floor is the passive rssi-snr estimate (this generation has no
    * background DIG, so IGI is static and can't track the floor). */
   devourer::RxQuality GetRxQuality() override {
-    return devourer::build_rx_quality(_rxq.snapshot(), GetRxEnergy());
+    return devourer::build_rx_quality(_rxq.snapshot(), GetRxEnergy(true));
   }
 
   /* dis_cca / EDCCA-disable investigation knob (DEVOURER_DIS_CCA). Writes the
@@ -249,8 +249,12 @@ private:
   std::atomic<int> _tx_pwr_override{-1};
   std::atomic<int> _tx_pwr_offset_steps{0};
   /* Rotating SW_DEFINE tag stamped when tx.report is on — the CCX report
-   * echoes its low byte, correlating reports to frames (src/TxReport.h). */
-  std::atomic<uint16_t> _tx_rpt_tag{0};
+   * echoes its low byte, correlating reports to frames (src/TxReport.h).
+   * 64-bit: the counter also gates the sampled SPE_RPT request (every Nth
+   * frame), and a narrow counter's wrap would jump the sampling phase for
+   * any N that doesn't divide it — off-modulo tag deltas masquerading as
+   * dropped reports at every seam. */
+  std::atomic<uint64_t> _tx_rpt_tag{0};
   /* Per-packet TX-power banks (SetTxPacketPowerOffsetQdb / radiotap
    * DBM_TX_POWER). _txpkt_banks is the allocation policy,
    * mutated under _reg_mu; _txpkt_img mirrors its committed 0x1e70[31:16]
@@ -307,11 +311,13 @@ private:
   uint8_t _pwr_ref_a = 0, _pwr_ref_b = 0;
   bool _pwr_ref_valid = false;
   /* True while the 0x3a00 per-rate diff table is zeroed (flat semantics /
-   * 8822C default) — repeated flat steps then skip the 32-dword re-zero. */
+   * 8822C default shape) — repeated flat steps then skip the 32-dword
+   * re-zero. */
   bool _diffs_zeroed = false;
   /* Caller-supplied per-rate TXAGC diffs (SetTxPowerRateDiffs), in place of
-   * phy_reg_pg's table when set. 8822E-only; std::nullopt = default table.
-   * Read/written under _reg_mu once brought up. */
+   * the die's default shape (the 8822E's phy_reg_pg table, the 8822C's flat
+   * reference). std::nullopt = that default. Read/written under _reg_mu once
+   * brought up. */
   std::optional<devourer::TxRateDiffsQdb> _rate_diffs;
   /* Re-program TXAGC from the current knob state. full=true re-derives the
    * 8822E efuse refs + rewrites the per-rate diff table (bring-up / channel

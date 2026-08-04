@@ -62,6 +62,13 @@ class RtlJaguarDevice : public IRtlDevice {
    * see SetTxPacketPowerStep. */
   std::atomic<uint8_t> _tx_pkt_pwr_step{0};
 
+  /* CCX report sampling counter (cfg.tx.report = N — request a report on
+   * every Nth frame). The 8812 report format has no SW_DEFINE tag echo, so
+   * unlike Jaguar2/3 this counter drives only the request cadence. 64-bit:
+   * a narrow counter's wrap jumps the sampling phase for any N that doesn't
+   * divide it (2^32 is ~20 days at field frame rates). */
+  std::atomic<uint64_t> _tx_ccx_ctr{0};
+
   /* CW single-tone (StartCwTone/StopCwTone) saved state for a clean restore:
    * the pre-tone RF 0x00 and four BB dwords — RFE-pinmux words on 8812/8821
    * (0xCB0/0xEB0/0xCB4/0xEB4), per-path TX-scale words on 8814 (0xC1C/0xE1C/
@@ -95,6 +102,12 @@ public:
    * once, then runs this on its own std::thread next to the TX loop. */
   void StartRxLoop(Action_ParsedRadioPacket packetProcessor) override;
   void StopRxLoop() override { should_stop = true; }
+  /* Jaguar1's send path is the only asynchronous one in the tree, so its
+   * Stop() is TX quiesce and nothing else: cancel and reap the outstanding
+   * bulk-OUT URBs while the caller's libusb context is still up. Deliberately
+   * NOT a card-disable power sequence — this family has never run one, and
+   * adding it here would be an unvalidated change of on-the-wire behaviour. */
+  void Stop() override;
   void SetMonitorChannel(SelectedChannel channel) override;
   /* Lean frequency-hop retune: switches the RF channel only, skipping the
    * per-rate TX-power loop, bandwidth post-set, and thermal pwrtrk tick that
@@ -132,6 +145,12 @@ public:
   devourer::TxPowerCaps GetTxPowerCaps() override;
   int SetTxPowerOffsetQdb(int qdb) override;
   void SetTxPowerIndexOverride(int idx) override;
+  /* Caller-supplied per-rate power shape (src/TxPower.h): replaces the EFUSE
+   * per-rate walk, anchored on the HT MCS7 index and quantized to this
+   * family's 0.5 dB step. Carried by the same per-rate walk every channel-set
+   * runs, so it is sticky by construction; std::nullopt restores the walk. */
+  bool SetTxPowerRateDiffs(
+      const std::optional<devourer::TxRateDiffsQdb> &diffs) override;
   bool ReApplyTxPower() override;
   /* Per-packet TX-power offset default — 8814A ONLY (its dword5 [30:28]
    * descriptor LUT at the 8822B TXPWR_OFSET position: 0=none 1=-3 2=-7
@@ -199,12 +218,12 @@ public:
    * IGI noise-floor (0xC50), then resets the counters so the next call is a
    * fresh delta. The read side of the CW tone. NB: if DEVOURER_PHYDM_WATCHDOG is
    * also running it shares/steals these counters. */
-  RxEnergy GetRxEnergy() override;
+  RxEnergy GetRxEnergy(bool with_nhm) override;
 
   /* Consolidated windowed RX link-quality snapshot (see RxQuality.h) — subsumes
    * GetRxEnergy. Fed per decoded frame in the RX loop via _rxq. */
   devourer::RxQuality GetRxQuality() override {
-    return devourer::build_rx_quality(_rxq.snapshot(), GetRxEnergy());
+    return devourer::build_rx_quality(_rxq.snapshot(), GetRxEnergy(true));
   }
 
   /* Adapter-health probes (see src/AdapterHealth.h). The EFUSE probe re-runs
@@ -215,6 +234,8 @@ public:
   devourer::FwBootStatus GetFwBootStatus() override {
     return _halModule.GetFwBootStatus();
   }
+  /* Read-only canary dump, safe to call without Init — see IRtlDevice. */
+  void DumpChipState() override { _radioManagement->DumpCanary(); }
 
   /* Runtime TX-mode default. send_packet honours a frame's own radiotap rate
    * fields per-packet; when a frame's radiotap carries no rate, this mode
@@ -235,6 +256,11 @@ public:
   /* Hardware ACK responder (IRtlDevice contract; src/AckResponder.h). */
   bool SetAckResponder(const devourer::MacAddr &mac) override;
   void ClearAckResponder() override;
+  /* Carrier-sense gate (IRtlDevice contract): MAC 0x520[14]/[15] like the
+   * HalMAC generations, plus this family's BB EDCCA thresholds (0x8a4) —
+   * parked at never-trigger by the BB table, programmed to the vendor
+   * operating point on enable (EDCCA only exists once they are set). */
+  void SetCcaMode(bool disabled) override;
   /* A-MPDU TX mode (IRtlDevice contract; src/AmpduMode.h). Programs the
    * Jaguar1 aggregate-fill timer (0x0456 — NOT the 0x0455 the HalMAC chips
    * use) + the 8814A burst-mode gate (0x04BC), and records the descriptor

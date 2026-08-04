@@ -138,6 +138,50 @@ struct AdapterCaps {
    * offsets 16/20 unparsed, and the Jaguar1 phy_status_rpt has no ldpc bit). */
   bool ldpc_rx_flag = false;
 
+  /* Bench-derived like the ldpc_rx_* trio above, and a TRANSMIT claim: the
+   * baseband emits a VHT PPDU that a peer decodes on the 2.4 GHz band.
+   * 802.11ac is a 5 GHz standard, so nothing guarantees a 2.4 GHz VHT frame
+   * works at all; devourer's TX path
+   * never reads the band when resolving a rate, which makes it *selectable*
+   * everywhere, and this flag is the separate question of whether it flies.
+   * False means unmeasured on that chip, not incapable.
+   *
+   * Scope: VHT *format* on 2.4 GHz. The 256-QAM points that motivate the
+   * extension (the "NitroQAM" / "TurboQAM" marketing) are confirmed on the
+   * 8812A only — VHT1SS_MCS8 at 20 MHz, decoded by an 8822BU peer. Measuring
+   * them needs a chip that has been VBUS cold-cycled: high-order constellation
+   * TX degrades across warm re-inits until 64-QAM and up stop decoding, which
+   * reads exactly like a link too weak to carry them (docs/vht-on-2g4.md).
+   * Note VHT MCS9 is not a legal rate at 20 MHz for 1-2 streams; hardware
+   * falls back to MCS8 there, so 40 MHz is required to exercise MCS9 at all.
+   *
+   * A standards-only 802.11n receiver decodes none of it either way: this is a
+   * strong-link, close-range mode, the opposite of a range mode. */
+  bool vht_2g4_ok = false;
+
+  /* --- hardware-ARQ capability (bench-derived truth table, on-air responder
+   * matrix + retry-knob A/B; the measured contract is docs/scheduled-mac.md).
+   * ack_responder_ok: SetAckResponder measurably closes a hardware-ARQ loop
+   * as the RESPONDER (SIFS ACKs that a soliciting TX's CCX reports confirm).
+   * Measured true: 8812A (works, degraded — intermittent SIFS ACKs), 8814A,
+   * 8821A (61–64% single-shot MCS3, 94% at retry 8, disarm-proof-verified —
+   * an earlier "broken" verdict was a harness artifact: the responder's arm
+   * was never verified, so a silently dead responder read as on=0/off=0),
+   * 8822B, 8812C/8822C, 8812E/8822E (the 8811A rides the 8812 die path and
+   * inherits its row). False-as-unmeasured (the
+   * vht_2g4_ok reading: unmeasured, not incapable): the 8821C — it shares
+   * the recipe but no 8821CU/CE cell has run. FALSE on Kestrel:
+   * SetAckResponder is not implemented on the AX generation.
+   * tx_retry_limit_ok: DEVOURER_TX_RETRY_LIMIT drives hardware autonomous
+   * retransmission (measured 12/0/12 A/B: 8821AU, 8812BU, 8822CU; Kestrel
+   * 8832CU witness-measured — the AX WD DATA_TXCNT_LMT field counts
+   * ATTEMPTS, folded +1 to the N-retries contract, limits {0,2,8} -> modal
+   * on-air copies {1,3,8-9}). FALSE on the 8814A die (the vendor
+   * DATA_RETRY_LIMIT=0 carve-out is kept — knob inert) and
+   * false-as-unmeasured on the 8821C. */
+  bool ack_responder_ok = false;
+  bool tx_retry_limit_ok = false;
+
   /* --- feature flags --- */
   /* Per-packet TX power: a per-frame power trim driven by radiotap
    * DBM_TX_POWER (dB delta vs the calibrated table / session base) or a

@@ -55,22 +55,58 @@ the halbb per-band LNA/TIA gain-error cache, without which 5 GHz is deaf), TX
 (mgmt injection — the OpenIPC video path via `streamtx`; legacy/HT/VHT/HE
 rates), channel/BW **5/10/20/40/80 MHz on both dies + 160 MHz on the 8852C**
 (the 8852B die has no 160 MHz — vendor bw_sup; caps report accordingly).
-40 MHz tunes to the block center (primary ±2); 80/160 MHz derive
-center/pri_ch from the channel plan (160 = an 8-wide block, center =
-block_start+14). **6 GHz TX tops out at 80 MHz**: the 6G 160 MHz TX does not
+40 MHz tunes to the block center (primary ±2); 80/160 MHz derive the center
+from the channel plan (160 = an 8-wide block, center = block_start+14).
+`halbb_ctrl_bw_ch`'s `pri_ch` argument is the primary **channel number**, not a
+sub-band index (vendor phl passes `rtw_chan_def::chan` through unchanged): the
+vendor derives the 0x4978[11:8] sub-band index from `pri_ch` vs `central_ch`,
+indexes the 2.4 GHz CCK SCO threshold tables with `pri_ch - 1`, and places the
+NBI spur notch from it. All three are RX-side — feeding it an index costs CCK
+reception and all >20 MHz reception while TX is unaffected, so an SDR duty
+check cannot see it (`tests/kestrel_prich_onair.sh`). **6 GHz TX tops out at 80 MHz**: the 6G 160 MHz TX does not
 radiate on the C8852C (the RF synth locks and RX-160 works, but the 6G+160
 TX-enable path is un-ported — B210-confirmed 0% duty vs 45% at 6G-80 / 40% at
 5G-160; a MAC TXAGC-max / RF-TX-path gap, not a chip limit — the vendor
 drives it). 5/10 MHz narrowband is the BB "small BW" field with the RF left
 in 20 MHz mode (no ADC re-clock, unlike Jaguar). RX bulk-IN delivery requires
-the USB RXAGG engine enabled (`B_AX_RXAGG_EN`). TX airs with the CMAC
-EDCCA/CCA gate disabled (`sch_tx_en`, TX path only) — the intended
-injection/monitor-link mode. `ReadTsf` reads the per-port MAC TSF;
+the USB RXAGG engine enabled (`B_AX_RXAGG_EN`). TX carrier-sense
+defaults are per-die (8852C enabled / 8852B cleared-and-warned pending its
+measurement arm) — the numbers and knob interplay live at the bring-up
+comment in `RtlKestrelDevice.cpp` and the gate doc in `MacRegAx.h`;
+harness: `tests/kestrel_cca_default_check.sh`. `ReadTsf` reads the per-port MAC TSF;
 `StartBeacon` drives the AX HW beacon engine.
+
+**Per-frame retry limit** (`DEVOURER_TX_RETRY_LIMIT`): the AX WD wd_info
+dword1 `DATA_TXCNT_LMT[30:25]` + SEL(31) — NOT a mac_ax H2C (the per-MACID
+CCTRL twin exists but the WD field is the injection-path mechanism). The
+field counts **attempts** (witness-measured on the 8832CU, unACKable-unicast
+copy counts: limit-value 2 → modal 2 copies where the 11ac retries-field
+gives 3; value 0 hardware-clamps to one attempt), so `send_packet` folds +1
+to keep N-means-N-retries across generations. The neighbouring
+`DATA_RTY_LOWEST_RATE` floor field stays unwritten (the 11ac floor-form
+anomaly, `RetryFallback` note in `DeviceConfig.h`). No CCX `tx.report`
+exists on this family — `tests/kestrel_retry_witness.sh` (stamped-pctr copy
+counting on a witness monitor) is the retry ground truth.
 
 **HE ER SU + DCM extended range** (both dies): per-packet via radiotap-HE
 FORMAT=EXT_SU or `DEVOURER_TX_RATE=.../ER[/DCM]`; RX classifies the format in
 `RxAtrib.ppdu_type` (7=HE_SU, 8=HE_ERSU) — `docs/he-extended-range.md`.
+
+**Per-antenna RSSI/SNR/EVM** (physts per-path pages): the RX loop parses the
+whole PPDU-status blob (`kestrel::parse_physts_8852` — 8-byte header rssi_td +
+IE01 avg SNR + IE04/05 path pages) into `RxAtrib.rssi/snr/evm[0..1]` and the
+`GetActiveRxPaths()` window. The IE04..07 pages only appear when
+`halbb_physts_parsing_init` shifts a `num_rf_path` mask into the physts IE
+bitmap — the glue must set `bb.num_rf_path`/`num_ss` itself (its bb_info is
+memset-zeroed; a zero mask silently drops the pages and per-path SNR falls
+back to the IE01-average+RSSI-distance derivation, which shadows the loss —
+the tell is per-path SNR exactly tracking the RSSI split). On-air-validated on
+the C8852C (direct snr_lgy + per-path EVM). The C8852B path is untested on
+air: its bring-up skips `halbb_physts_parsing_init` (physts fills from the BB
+table default), so whether its bitmap includes the path pages — and thus
+whether its per-path EVM is real or 0 — is unmeasured; its per-path SNR is the
+derivation either way (the 8852B BB does not drive snr_lgy — vendor
+`halbb_physts_ie_04_07` chip branch).
 
 Async packet-C2H (bulk-IN rpkt_type=10) delivery works — routed by
 `handle_c2h` on the C2H class/func — so the #236 C2H surface (TWT/F2P
@@ -148,6 +184,20 @@ between frames (2 BB RMWs on value change, free while constant; 0.25 dB
 steps, clamped to the 0..23 dBm PA window around the `DEVOURER_TX_PWR` base;
 global, so a HW beacon airing between frames follows the last-written level;
 a field-less frame restores the `SetTxPowerOffsetQdb` session offset).
+
+**Per-rate diffs** (`SetTxPowerRateDiffs`) ride that same rewrite, because no
+per-rate TXAGC table exists under the fixed-dBm model — this is the only family
+where `GetTxPowerCaps().rate_diffs_hw_table` is false. `send_packet` resolves
+the frame's own MGN rate to its diff and folds it into the target, so a
+fixed-rate stream writes once and then costs nothing while a rate ladder pays
+the 2-RMW rewrite at each change. There is no calibrated shape underneath, so
+"replace the shape" degenerates to "add to the flat session target". Two
+consequences, neither of them papered over: HE and VHT frames carry no diff (the
+caller struct is the CCK / legacy / 1SS-HT ladder), and the target is global, so
+a hardware-timed beacon airing between host frames inherits the last frame's
+rate diff rather than its own rate's. The table is stored as a flat
+`std::atomic<int8_t>[10]` so the TX path reads the one entry it needs without a
+lock — a swap can only split between frames, never within one.
 
 ## 8852C vs 8852B divergences
 

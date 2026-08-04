@@ -76,6 +76,17 @@ void RtlJaguarDevice::InitWrite(SelectedChannel channel) {
   if (_cfg.rx.ack_responder)
     SetAckResponder(*_cfg.rx.ack_responder); /* DEVOURER_ACK_RESPONDER */
 
+  /* Carrier-sense default: EDCCA + primary CCA enabled unless
+   * DEVOURER_DIS_CCA. Always applied — the enable path is what programs
+   * the BB EDCCA thresholds off their parked never-trigger table value. */
+  SetCcaMode(_cfg.tuning.disable_cca);
+  /* ACK window (DEVOURER_ACK_TIMEOUT_US): one library default on every
+   * generation — see the DeviceConfig field doc. */
+  _device.rtw_write8(0x0640, static_cast<uint8_t>(
+      _cfg.tx.ack_timeout_us > 255   ? 255
+      : _cfg.tx.ack_timeout_us < 1 ? 1
+                                     : _cfg.tx.ack_timeout_us));
+
   /* DEVOURER_XTAL_CAP — crystal-cap trim (issue #217, narrowband CFO lever). */
   if (_cfg.tuning.xtal_cap)
     SetXtalCap(*_cfg.tuning.xtal_cap);
@@ -270,7 +281,7 @@ void RtlJaguarDevice::StopContinuousTx() {
  * (0xC50), then resets the counters (phydm_false_alarm_counter_reg_reset AC:
  * 0x9a4[17], 0xa2c[15], 0xb58[0]) so the next call sees only the delta. Same
  * register set PhydmWatchdog::ReadFaCountersAc uses. */
-RxEnergy RtlJaguarDevice::GetRxEnergy() {
+RxEnergy RtlJaguarDevice::GetRxEnergy(bool with_nhm) {
   RxEnergy e;
   auto bb = [this](uint16_t addr) {
     return _radioManagement->phy_query_bb_reg_public(addr, 0xFFFFFFFF);
@@ -292,8 +303,11 @@ RxEnergy RtlJaguarDevice::GetRxEnergy() {
   _device.phy_set_bb_reg(0x0B58, 1u << 0, 1);
   _device.phy_set_bb_reg(0x0B58, 1u << 0, 0);
 
-  /* NHM 12-bucket power histogram (frame-free, 11AC register map). */
-  devourer::read_nhm(
+  /* NHM 12-bucket power histogram (frame-free, 11AC register map). Skipped
+   * when the caller did not ask: it arms a ~2 ms window and polls at 1 ms
+   * granularity, which dwarfs the register reads above. */
+  if (with_nhm)
+    devourer::read_nhm(
       devourer::nhm_regs_11ac(), e.igi,
       [this](uint16_t a) { return _device.rtw_read<uint32_t>(a); },
       [this](uint16_t a, uint32_t m, uint32_t v) {
@@ -747,6 +761,51 @@ void RtlJaguarDevice::ClearAckResponder() {
   _logger->info("Jaguar1: hardware ACK responder disarmed (net_type=NoLink)");
 }
 
+void RtlJaguarDevice::SetCcaMode(bool disabled) {
+  /* MAC carrier-sense gate: the same REG_TX_PTCL_CTRL bits as the HalMAC
+   * generations — the vendor's phydm_mac_edcca_state drives 0x520[15] on
+   * this family too; [14] is the primary-CCA defer. */
+  uint32_t v520 = _device.rtw_read<uint32_t>(0x0520);
+  if (disabled)
+    v520 |= (1u << 15) | (1u << 14);
+  else
+    v520 &= ~((1u << 15) | (1u << 14));
+  _device.rtw_write<uint32_t>(0x0520, v520);
+
+  /* BB EDCCA thresholds (rEDCCA_Jaguar 0x8a4: L2H byte0 / H2L byte1). The
+   * BB init table parks them at 0x7f/0x7f = never-trigger — the vendor's
+   * adaptivity-off default (CONFIG_RTW_ADAPTIVITY_EN 0). Parked, the BB
+   * never raises the EDCCA signal, so the MAC gate [15] has nothing to
+   * honour — enable must program the vendor operating point from the live
+   * IGI for EDCCA to exist at all; disable re-parks. */
+  const auto ic = _eepromManager->version_id.ICType;
+  if (disabled) {
+    _device.phy_set_bb_reg(0x8a4, 0xFFFF, 0x7f7f);
+  } else {
+    const int8_t th_ini = ic == CHIP_8814A ? -14 : -17;
+    const uint8_t igi = static_cast<uint8_t>(
+        _radioManagement->phy_query_bb_reg_public(0xc50, 0x7f));
+    const int8_t l2h = jaguar1_edcca_l2h(th_ini, igi);
+    _device.phy_set_bb_reg(0x8a4, 0xFF, static_cast<uint8_t>(l2h));
+    _device.phy_set_bb_reg(0x8a4, 0xFF00, static_cast<uint8_t>(l2h - 7));
+    if (ic == CHIP_8812) {
+      /* Vendor 8812A enable-hang erratum ("fix AC series when enable EDCCA
+       * hang issue"): pulse the ADC mask once after programming. */
+      _device.phy_set_bb_reg(0x800, 1u << 10, 1);
+      _device.phy_set_bb_reg(0x800, 1u << 10, 0);
+    }
+    _logger->info("Jaguar1: EDCCA thresholds L2H/H2L = {}/{} (igi=0x{:02x})",
+                  l2h, l2h - 7, igi);
+  }
+  /* With the watchdog running, DIG walks IGI — hand it the re-track so the
+   * threshold follows (vendor couples them per adaptivity cycle). */
+  if (auto *wd = _halModule.phydm_watchdog())
+    wd->SetEdccaTrack(!disabled);
+  _logger->info("Jaguar1: MAC carrier-sense {}",
+                disabled ? "DISABLED (dis_cca: CCA+EDCCA)"
+                         : "enabled (default)");
+}
+
 bool RtlJaguarDevice::SetAmpduMode(const devourer::AmpduMode &mode) {
   /* A-MPDU TX mode (src/AmpduMode.h): record the descriptor state the TX path
    * reads and program the Jaguar1 MAC pacing registers. NB the aggregate-fill
@@ -1160,16 +1219,31 @@ size_t RtlJaguarDevice::build_tx_block(const uint8_t *packet, size_t length,
     SET_TX_DESC_GID_8812(usb_frame, static_cast<uint8_t>(0x3F));
   }
   SET_TX_DESC_SW_DEFINE_8812(usb_frame, static_cast<uint16_t>(0x001));
-  /* DEVOURER_TX_REPORT: SPE_RPT asks the fw for a per-frame CCX TX report
-   * (delivered / retry count / queue time — src/TxReport.h). Dword2, inside
-   * the checksummed 32 bytes. */
+  /* DEVOURER_TX_REPORT: SPE_RPT asks the fw for a CCX TX report (delivered /
+   * retry count / queue time — src/TxReport.h), sampled every Nth frame
+   * (cfg value = N). The 8812 report format has no tag echo, so sampling
+   * here only relieves the report rate — per-frame attribution stays
+   * order-based. Dword2, inside the checksummed 32 bytes. */
   if (_cfg.tx.report)
-    SET_TX_DESC_SPE_RPT_8812(usb_frame, 1);
+    SET_TX_DESC_SPE_RPT_8812(
+        usb_frame,
+        _tx_ccx_ctr.fetch_add(1) % static_cast<uint64_t>(_cfg.tx.report) == 0
+            ? 1
+            : 0);
   SET_TX_DESC_RETRY_LIMIT_ENABLE_8812(usb_frame, 1);
+  /* Retry rate-fallback control (DEVOURER_TX_RETRY_FALLBACK): the data path
+   * leaves DISABLE_FB at 0 (the fw ladder) by default — only the NDPA branch
+   * disables it. Off pins retries at the descriptor rate; there is no floor
+   * form (the RetryFallback note in DeviceConfig.h has the measurement).
+   * Dword3, inside the checksummed 32 bytes. */
+  if (_cfg.tx.retry_fallback == devourer::RetryFallback::Off)
+    SET_TX_DESC_DISABLE_FB_8812(usb_frame, 1);
   if (!is_8814a) {
     /* 88XXau leaves DATA_RETRY_LIMIT=0 for monitor injection on 8814A
-     * (RETRY_LIMIT_ENABLE stays set to 1 in both). */
-    SET_TX_DESC_DATA_RETRY_LIMIT_8812(usb_frame, 12);
+     * (RETRY_LIMIT_ENABLE stays set to 1 in both).
+     * Use cfg.tx.retry_limit (DEVOURER_TX_RETRY_LIMIT, default 0) instead of
+     * the hardcoded 12 — retries flood the air on a busy half-duplex link. */
+    SET_TX_DESC_DATA_RETRY_LIMIT_8812(usb_frame, _cfg.tx.retry_limit);
   }
   if (sgi) {
     _logger->info("short gi enabled,set sgi");
@@ -1225,7 +1299,7 @@ size_t RtlJaguarDevice::build_tx_block(const uint8_t *packet, size_t length,
       SET_TX_DESC_AGG_ENABLE_8812(usb_frame, 1);
       SET_TX_DESC_MAX_AGG_NUM_8812(usb_frame, am.max_num & 0x1f);
       SET_TX_DESC_AMPDU_DENSITY_8812(usb_frame, am.density & 0x7);
-      SET_TX_DESC_DATA_RETRY_LIMIT_8812(usb_frame, am.no_ack ? 0 : 12);
+      SET_TX_DESC_DATA_RETRY_LIMIT_8812(usb_frame, am.no_ack ? 0 : _cfg.tx.retry_limit);
     }
     if (_cfg.debug.tx_qsel)
       SET_TX_DESC_QUEUE_SEL_8812(usb_frame, *_cfg.debug.tx_qsel);
@@ -1260,6 +1334,17 @@ void RtlJaguarDevice::Init(Action_ParsedRadioPacket packetProcessor,
 
   if (_cfg.rx.ack_responder)
     SetAckResponder(*_cfg.rx.ack_responder); /* DEVOURER_ACK_RESPONDER */
+
+  /* Carrier-sense default: EDCCA + primary CCA enabled unless
+   * DEVOURER_DIS_CCA. Always applied — the enable path is what programs
+   * the BB EDCCA thresholds off their parked never-trigger table value. */
+  SetCcaMode(_cfg.tuning.disable_cca);
+  /* ACK window (DEVOURER_ACK_TIMEOUT_US): one library default on every
+   * generation — see the DeviceConfig field doc. */
+  _device.rtw_write8(0x0640, static_cast<uint8_t>(
+      _cfg.tx.ack_timeout_us > 255   ? 255
+      : _cfg.tx.ack_timeout_us < 1 ? 1
+                                     : _cfg.tx.ack_timeout_us));
 
   /* DEVOURER_XTAL_CAP — crystal-cap trim (issue #217, narrowband CFO lever). */
   if (_cfg.tuning.xtal_cap)
@@ -1428,7 +1513,8 @@ void RtlJaguarDevice::StartRxLoop(Action_ParsedRadioPacket packetProcessor) {
         break;
       if (!p.RxAtrib.crc_err) {
         _rxq.add(p.RxAtrib.rssi[0], p.RxAtrib.snr[0], p.RxAtrib.evm[0]);
-        _rxpaths.add(p.RxAtrib.rssi, _eepromManager->numTotalRfPath);
+        _rxpaths.add(p.RxAtrib.rssi, p.RxAtrib.snr, p.RxAtrib.evm,
+                     _eepromManager->numTotalRfPath);
         if (_cfg.tuning.cfo_track)
           _cfo.add(p.RxAtrib.cfo_tail); /* closed-loop CFO input (#217) */
       }
@@ -1534,6 +1620,16 @@ devourer::TxPowerCaps RtlJaguarDevice::GetTxPowerCaps() {
       _eepromManager->version_id.ICType != CHIP_8821;
   caps.offset_min_qdb = -126;
   caps.offset_max_qdb = 126;
+  /* Per-rate indices are computed in software and written per rate (the
+   * 8812A/8821A register fanout, the 8814A packed port), so a caller table
+   * replaces the EFUSE walk at no per-frame cost — at the family's 0.5 dB
+   * resolution, not the caller's qdB. */
+  caps.rate_diffs = true;
+  caps.rate_diffs_hw_table = true;
+  /* On-air (tests/txpwr_rate_diffs_onair.sh, MCS0-only -32 qdB trim against a
+   * ground-station RSSI reference): 8812AU -8.0 dB, 8814AU -8.0 dB, 8821AU
+   * -7.0 dB at 2.4 GHz vs -8.0 nominal, with 6M unmoved in every case. */
+  caps.rate_diffs_measured = true;
   return caps;
 }
 
@@ -1564,6 +1660,39 @@ void RtlJaguarDevice::SetTxPowerIndexOverride(int idx) {
   _radioManagement->SetTxPowerOverride(idx < 0 ? -1 : (idx > 63 ? 63 : idx));
   if (_brought_up)
     _radioManagement->ApplyTxPower();
+}
+
+bool RtlJaguarDevice::SetTxPowerRateDiffs(
+    const std::optional<devourer::TxRateDiffsQdb> &diffs) {
+  if (_cw_active) {
+    _logger->warn("SetTxPowerRateDiffs refused: CW tone active");
+    return false;
+  }
+  if (diffs && !_eepromManager->TxPowerInfoLoaded)
+    _logger->warn("SetTxPowerRateDiffs: EFUSE per-rate table not loaded — the "
+                  "caller shape anchors on the flat pre-EFUSE fallback, not a "
+                  "calibrated reference");
+  if (diffs && _eepromManager->version_id.ICType == CHIP_8821)
+    _logger->warn("SetTxPowerRateDiffs: the 8821A's 5 GHz chain ignores BB "
+                  "TXAGC (registers move, on-air power does not) — the shape "
+                  "is 2.4 GHz-only on this part");
+  _radioManagement->SetTxPowerRateDiffs(diffs);
+  if (diffs)
+    /* Report the APPLIED values: this family quantizes to 0.5 dB, so an odd
+     * qdB rounds and a table measured on a 0.25 dB part will not replay
+     * verbatim here. */
+    _logger->info("TX-power per-rate diffs set (cck {} legacy {} mcs0 {} "
+                  "mcs7 {} qdB -> {} {} {} {} index steps)",
+                  diffs->cck, diffs->legacy, diffs->mcs[0], diffs->mcs[7],
+                  devourer::rate_diff_steps(diffs->cck, 2),
+                  devourer::rate_diff_steps(diffs->legacy, 2),
+                  devourer::rate_diff_steps(diffs->mcs[0], 2),
+                  devourer::rate_diff_steps(diffs->mcs[7], 2));
+  else
+    _logger->info("TX-power per-rate diffs cleared (EFUSE walk restored)");
+  if (_brought_up)
+    _radioManagement->ApplyTxPower();
+  return true;
 }
 
 bool RtlJaguarDevice::ReApplyTxPower() {
@@ -1663,6 +1792,11 @@ devourer::AdapterCaps RtlJaguarDevice::GetAdapterCaps() {
     c.narrowband_ok = true;
   }
   c.fastretune_ok = true; /* phy_SwChnl8812_fast (8812/8821) + full-path fallback */
+  /* Hardware ARQ (truth table at the AdapterCaps declarations): responder
+   * measured working on all four dies — 8821A included; the 8814A die keeps
+   * the vendor retry carve-out (knob inert). */
+  c.ack_responder_ok = true;
+  c.tx_retry_limit_ok = _eepromManager->version_id.ICType != CHIP_8814A;
   /* Per-packet TX power: 8814A only — its dword5 [30:28] descriptor LUT (the
    * 8822B TXPWR_OFSET position; vendor-defined, vendor-unused). measured
    * stays false until tests/txpkt_pwr_ofset_onair.sh proves it moves on-air
@@ -1705,6 +1839,9 @@ devourer::AdapterCaps RtlJaguarDevice::GetAdapterCaps() {
     c.ldpc_rx_ht = true;
     c.ldpc_rx_vht = true;
     c.ldpc_rx_flag = false;
+    /* Decodes 2.4 GHz VHT on the bench (it served as the ground station for
+     * the other dies' runs), but its own TX side is unmeasured there, and
+     * vht_2g4_ok is a transmit claim. */
     break;
   case CHIP_8821:
     c.chip_name = "RTL8821A";
@@ -1719,6 +1856,11 @@ devourer::AdapterCaps RtlJaguarDevice::GetAdapterCaps() {
     c.ldpc_rx_ht = true;
     c.ldpc_rx_vht = true;
     c.ldpc_rx_flag = true;
+    /* 8812AU on air, cold-cycled: VHT 1SS up to MCS8 — 256-QAM — on 2.4 GHz,
+     * every sampled frame decoded as the commanded VHT rate by an 8822BU peer.
+     * The 8811A is the 1T1R cut of the same die on the same path, unmeasured
+     * on its own. */
+    c.vht_2g4_ok = true;
     if (_eepromManager->version_id.RFType == RF_TYPE_1T1R) {
       c.chip_name = "RTL8811A";
       c.marketing_names = "RTL8811AU/RTL8811AR";
@@ -1765,6 +1907,7 @@ devourer::TxPowerState RtlJaguarDevice::GetTxPowerState() {
         0, static_cast<uint8_t>(MGN_MCS7), 0);
     s.hw_readback = false;
   }
+  s.rate_diffs_custom = _radioManagement->HasTxPowerRateDiffs();
   return s;
 }
 
@@ -1801,7 +1944,43 @@ bool RtlJaguarDevice::NetDevOpen(SelectedChannel selectedChannel) {
   return true;
 }
 
+/* Clean shutdown — see IRtlDevice::Stop. Quiesce TX first so the de-init writes
+ * are not racing frames the transport still owns, then power the chip down.
+ *
+ * The power-down is the point: without it a Jaguar1 chip stays in ACT with its
+ * RF front end live for as long as the adapter is plugged in, long after the
+ * owning process has exited. That is wrong on its own terms, it is what every
+ * other generation already avoids (HalJaguar2::power_off,
+ * HalJaguar3::rtw_hal_deinit), and it is what makes a beacon loaded into the
+ * MAC's reserved page stop airing when the session ends instead of
+ * transmitting indefinitely.
+ *
+ * No performance claim is attached. An earlier revision cited a delivery
+ * recovery here; that measurement came from a ground station too marginal to
+ * support it (docs/warm-tx-degradation.md).
+ *
+ * Best-effort: a chip that already dropped off the bus makes the writes fail,
+ * which is fine on a teardown path. */
+void RtlJaguarDevice::Stop() {
+  _device.quiesce_tx();
+  if (!_cfg.tuning.teardown_power_down) {
+    _logger->info("Jaguar1: Stop() leaving the chip powered "
+                  "(tuning.teardown_power_down=0)");
+    return;
+  }
+  try {
+    _halModule.rtw_hal_deinit();
+  } catch (...) {
+    _logger->info("Jaguar1: Stop() de-init writes failed (chip already gone?)");
+  }
+}
+
 RtlJaguarDevice::~RtlJaguarDevice() {
+  /* First, before any member starts unwinding: the async bulk-OUT URBs point
+   * at transport-owned memory and complete on whichever thread pumps libusb,
+   * so nothing may be released while they are still live. Idempotent, so the
+   * usual Stop()-then-destroy path pays nothing here. */
+  _device.quiesce_tx();
   /* Safety net: if a CW tone is still armed (caller forgot StopCwTone), restore
    * the chip before teardown so it isn't left radiating a bare carrier. */
   StopCwTone();
@@ -1816,6 +1995,16 @@ RtlJaguarDevice::~RtlJaguarDevice() {
   _rxmask_stop.store(true);
   if (_rxmask_thread.joinable()) {
     _rxmask_thread.join();
+  }
+  /* Backstop for a caller that destroys without Stop(): power the chip down so
+   * it is not left in ACT indefinitely. After the thread joins, so nothing is
+   * still touching the chip. Harmless if Stop() already ran. */
+  if (_cfg.tuning.teardown_power_down) {
+    try {
+      _halModule.rtw_hal_deinit();
+    } catch (...) {
+      /* Teardown path — a chip that already left the bus is not an error. */
+    }
   }
 }
 
