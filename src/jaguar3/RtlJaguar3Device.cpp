@@ -315,10 +315,11 @@ void RtlJaguar3Device::StartRxLoop(Action_ParsedRadioPacket packetProcessor) {
          * frame whose drvinfo is too short (e.g. CCK, which carries no OFDM
          * report). The report sits immediately after the 24-byte descriptor. */
         if (!is_c2h && f.drvinfo_size >= 28)
-          jaguar3::parse_phy_sts_jgr3(data + off + jaguar3::RXDESC_SIZE_8822C,
-                                      f.drvinfo_size, p.RxAtrib);
+          p.RxAtrib.physt = jaguar3::parse_phy_sts_jgr3(
+              data + off + jaguar3::RXDESC_SIZE_8822C, f.drvinfo_size,
+              p.RxAtrib);
         p.Data = std::span<uint8_t>(const_cast<uint8_t *>(f.frame), f.frame_len);
-        if (!p.RxAtrib.crc_err) {
+        if (!p.RxAtrib.crc_err && p.RxAtrib.physt) {
           _rxq.add(p.RxAtrib.rssi[0], p.RxAtrib.snr[0], p.RxAtrib.evm[0]);
           _rxpaths.add(p.RxAtrib.rssi, p.RxAtrib.snr, p.RxAtrib.evm,
                        2); /* 8822C/8822E are 2T2R */
