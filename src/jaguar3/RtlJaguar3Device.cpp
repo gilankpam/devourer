@@ -313,8 +313,13 @@ void RtlJaguar3Device::StartRxLoop(Action_ParsedRadioPacket packetProcessor) {
          * present (monitor_rx_cfg enables APP_PHYSTS + RX_DRVINFO_SZ=4, so the
          * 32-byte report is counted in drvinfo). Skips C2H reports and any
          * frame whose drvinfo is too short (e.g. CCK, which carries no OFDM
-         * report). The report sits immediately after the 24-byte descriptor. */
-        if (!is_c2h && f.drvinfo_size >= 28)
+         * report). The report sits immediately after the 24-byte descriptor.
+         * f.physt (RX desc DW0 bit 26) says the PHY actually WROTE a report
+         * for this frame — the drvinfo space itself is reserved on every
+         * frame, so on A-MPDU subframes without the bit it holds stale bytes
+         * whose page nibble can alias 0/1 (contaminated RSSI/SNR tails,
+         * 2026-09-01). */
+        if (!is_c2h && f.physt && f.drvinfo_size >= 28)
           p.RxAtrib.physt = jaguar3::parse_phy_sts_jgr3(
               data + off + jaguar3::RXDESC_SIZE_8822C, f.drvinfo_size,
               p.RxAtrib);

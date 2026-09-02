@@ -217,6 +217,11 @@ struct Rx8822cFrame {
   uint8_t shift;         /* SHIFT_SZ */
   uint32_t tsfl;         /* hardware TSF-low at receive */
   bool paggr;            /* MPDU arrived inside an A-MPDU */
+  bool physt;            /* a PHY-status report was written for THIS frame;
+                          * drvinfo space is reserved on every frame
+                          * (RX_DRVINFO_SZ is global), so without this bit the
+                          * area holds stale bytes — notably on all-but-one
+                          * subframe of an A-MPDU */
   uint8_t ppdu_cnt;      /* 2-bit received-PPDU counter */
   uint32_t next_offset;  /* 8-byte-aligned offset of the next frame in an agg */
 };
@@ -239,6 +244,7 @@ inline bool parse_rx_8822c(const uint8_t *buf, size_t buflen,
   out.rx_rate = static_cast<uint8_t>(GET_RX_DESC_RX_RATE_8822C(buf));
   out.tsfl = static_cast<uint32_t>(GET_RX_DESC_TSFL_8822C(buf));
   out.paggr = GET_RX_DESC_PAGGR_8822C(buf) != 0;
+  out.physt = GET_RX_DESC_PHYST_8822C(buf) != 0;
   out.ppdu_cnt = static_cast<uint8_t>(GET_RX_DESC_PPDU_CNT_8822C(buf));
 
   uint32_t frame_off =
