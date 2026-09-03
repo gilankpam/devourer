@@ -17,6 +17,7 @@
 #include "RadiotapPeek.h"
 #include "RadiotapTxFlags.h" /* HT MCS field decoder (LDPC/STBC) */
 #include "TxAggPlan.h"
+#include "RxParseAbort.h" /* rx.parse_abort — abandoned-aggregate event */
 #include "TxReport.h"
 
 #include "BeamformingSounder.h"
@@ -364,10 +365,30 @@ void RtlJaguar2Device::apply_replay_wseq() {
 }
 
 bool RtlJaguar2Device::SetAckResponder(const devourer::MacAddr &mac) {
+  if (!devourer::ack::is_unicast(mac.data())) {
+    /* A station cannot ACK-target a group address, so this arm could never
+     * fire. Refusing beats returning true for a responder that will read as
+     * silently dead — the shape AdapterCaps.h records from the 8821AU
+     * episode. Only the precondition is enforced here: adopting the shared
+     * readback verify() too wants a bench cell per die, since a family whose
+     * 0x0102 does not read back would start refusing healthy arms. */
+    _logger->error("{}: ACK responder needs a UNICAST MAC (I/G set in "
+                   "{:02x}) — not armed",
+                   "Jaguar2", mac.bytes[0]);
+    return false;
+  }
   /* Hardware ACK responder (src/AckResponder.h): port identity + net_type so
    * the MAC auto-ACKs unicast frames to `mac`. Same registers the proven
    * StartBeacon/AP path programs, minus the beacon machinery. */
-  devourer::ack::enable(_device, mac.data());
+  if (!devourer::ack::enable(_device, mac.data())) {
+    if (!devourer::ack::disable_verified(_device)) {
+      _logger->error("Jaguar2: ACK responder arm failed and rollback did "
+                     "not latch; hardware state is unknown");
+    } else {
+      _logger->error("Jaguar2: ACK responder arm register write failed");
+    }
+    return false;
+  }
   _logger->info("Jaguar2: hardware ACK responder armed for "
                 "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
                 mac.bytes[0], mac.bytes[1], mac.bytes[2], mac.bytes[3],
@@ -376,7 +397,10 @@ bool RtlJaguar2Device::SetAckResponder(const devourer::MacAddr &mac) {
 }
 
 void RtlJaguar2Device::ClearAckResponder() {
-  devourer::ack::disable(_device);
+  if (!devourer::ack::disable_verified(_device)) {
+    _logger->error("Jaguar2: ACK responder disarm did not latch");
+    return;
+  }
   _logger->info("Jaguar2: hardware ACK responder disarmed (net_type=NoLink)");
 }
 
@@ -457,8 +481,10 @@ void RtlJaguar2Device::Init(Action_ParsedRadioPacket packetProcessor,
     }
   }
 
-  if (_cfg.rx.ack_responder)
-    SetAckResponder(*_cfg.rx.ack_responder); /* DEVOURER_ACK_RESPONDER */
+  if (_cfg.rx.ack_responder &&
+      !SetAckResponder(*_cfg.rx.ack_responder)) /* DEVOURER_ACK_RESPONDER */
+    throw std::runtime_error(
+        "Jaguar2: configured ACK responder could not be armed");
   apply_replay_wseq();
 
   if (_cfg.debug.bb_dump) {
@@ -548,15 +574,22 @@ void RtlJaguar2Device::StartRxLoop(Action_ParsedRadioPacket packetProcessor) {
   /* RX loop: async bulk-IN URB queue; walk the aggregated 8822B RX descriptors
    * per completion and hand each PSDU to the packet processor. */
   uint64_t frames = 0, reads = 0;
+  long long parse_aborts = 0;
   auto on_data = [&](const uint8_t *data, int n) {
     cfo_tick();
     if (++reads <= 8)
       _logger->info("Jaguar2 RX: completion #{} -> {} bytes", reads, n);
     uint32_t off = 0;
     while (off + jaguar2::RXDESC_SIZE_8822B <= static_cast<uint32_t>(n)) {
-      jaguar2::Rx8822bFrame f;
-      if (!jaguar2::parse_rx_8822b(data + off, static_cast<size_t>(n) - off, f))
+      jaguar2::Rx8822bFrame f{};
+      if (!jaguar2::parse_rx_8822b(data + off, static_cast<size_t>(n) - off,
+                                   f)) {
+        devourer::emit_rx_parse_abort(_logger->events(), data + off,
+                                      static_cast<size_t>(n) - off, off, n,
+                                      f.frame_len, f.drvinfo_size, f.shift,
+                                      parse_aborts);
         break;
+      }
       if (_packetProcessor) {
         Packet p{};
         p.RxAtrib.pkt_len = static_cast<uint16_t>(f.frame_len);
@@ -669,8 +702,10 @@ void RtlJaguar2Device::InitWrite(SelectedChannel channel) {
    * center frequency. DEVOURER_CW_TONE_GAIN=0..31 sets RF 0x00[4:0]. */
   if (_cfg.tx.cw_tone)
     StartCwTone(_cfg.tx.cw_tone_gain & 0x1F);
-  if (_cfg.rx.ack_responder)
-    SetAckResponder(*_cfg.rx.ack_responder); /* DEVOURER_ACK_RESPONDER */
+  if (_cfg.rx.ack_responder &&
+      !SetAckResponder(*_cfg.rx.ack_responder)) /* DEVOURER_ACK_RESPONDER */
+    throw std::runtime_error(
+        "Jaguar2: configured ACK responder could not be armed");
   if (_cfg.tx.ampdu)
     SetAmpduMode(*_cfg.tx.ampdu); /* DEVOURER_TX_AMPDU_MODE */
   apply_replay_wseq();
@@ -1245,7 +1280,12 @@ bool RtlJaguar2Device::send_packet(const uint8_t *packet, size_t length) {
   int rc = _device.bulk_send_sync_ep(_device.first_bulk_out_ep(),
                                      usb_frame.data(), usb_frame.size(),
                                      /*timeout_ms=*/20);
-  return rc >= 0;
+  /* bulk_send_sync_ep returns BYTES SUBMITTED, so `rc >= 0` would also cover
+   * a short write — a frame the chip got only a prefix of must not be
+   * reported as sent. No error log on the failure path: until the TX-enable
+   * registers are programmed the chip NAKs every frame and the caller backs
+   * off, so logging here would flood exactly then. */
+  return rc == static_cast<int>(usb_frame.size());
 }
 
 size_t RtlJaguar2Device::send_packets(const TxPacketView *pkts, size_t count) {
@@ -1336,12 +1376,24 @@ size_t RtlJaguar2Device::send_packets(const TxPacketView *pkts, size_t count) {
     const int rc = _device.bulk_send_sync_ep(_device.first_bulk_out_ep(),
                                              urb.data(), urb.size(),
                                              /*timeout_ms=*/50);
+    /* Full write or nothing submitted: a truncated URB means the chip got a
+     * prefix — some trailing block partial or absent — and there is no way to
+     * say which frames aired, so none may be counted. A genuine short write
+     * (rc >= 0) is rare and actionable, so it is logged; rc < 0 stays quiet
+     * like the single-frame path (NAK-backoff flood). */
+    const bool sent_all = rc == static_cast<int>(urb.size());
+    if (rc >= 0 && !sent_all)
+      _logger->error("8822B aggregated TX short on EP 0x{:02x}: {}/{} "
+                     "({} frames dropped)",
+                     _device.first_bulk_out_ep(), rc, urb.size(),
+                     plan.frames());
     devourer::Ev(_logger->events(), "tx.agg")
         .f("frames", (unsigned long long)plan.frames())
         .f("bytes", (unsigned long long)urb.size())
+        .f("sent", (long long)rc)
         .f("shim", plan.shim)
-        .f("ok", rc >= 0);
-    if (rc >= 0)
+        .f("ok", sent_all);
+    if (sent_all)
       ok += plan.frames();
     done += plan.frames();
   }
