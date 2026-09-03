@@ -20,7 +20,6 @@
 #include "ChannelFreq.h" /* radiotap CHANNEL freq -> channel (per-packet hop) */
 #include "FrameParserJaguar3.h"
 #include "NhmReader.h"       /* frame-free NHM power histogram (shared) */
-#include "RadiotapTxFlags.h" /* shared HT MCS known/flag decode (LDPC/STBC) */
 #include "RateDefinitions.h" /* MGN_* rate enum (shared across the family) */
 #include "SignalStop.h" /* g_devourer_should_stop — set by demo signal handlers */
 #include "ToneMask.h"   /* DEVOURER_RX_CSI_MASK / DEVOURER_RX_NBI knobs */
@@ -327,8 +326,7 @@ void RtlJaguar3Device::StartRxLoop(Action_ParsedRadioPacket packetProcessor) {
          * f.physt (RX desc DW0 bit 26) says the PHY actually WROTE a report
          * for this frame — the drvinfo space itself is reserved on every
          * frame, so on A-MPDU subframes without the bit it holds stale bytes
-         * whose page nibble can alias 0/1 (contaminated RSSI/SNR tails,
-         * 2026-09-01). */
+         * whose page nibble can alias 0/1 (contaminated RSSI/SNR tails). */
         if (!is_c2h && f.physt && f.drvinfo_size >= 28)
           p.RxAtrib.physt = jaguar3::parse_phy_sts_jgr3(
               data + off + jaguar3::RXDESC_SIZE_8822C, f.drvinfo_size,

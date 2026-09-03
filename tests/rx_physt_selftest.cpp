@@ -3,9 +3,9 @@
  * Inside an A-MPDU the drvinfo space is reserved on every subframe
  * (RX_DRVINFO_SZ is a global register) but the PHY writes a report only
  * where this bit is set — parsing the reserved bytes anyway reads stale
- * garbage that can alias a valid page number (the 2026-09-01 contaminated
- * RSSI/SNR finding, mabur dq-spike findings §12 addendum). A bit-position
- * or plumbing regression here fails ctest instead of poisoning RF EMAs. */
+ * garbage that can alias a valid page number, which contaminates the
+ * RSSI/SNR tails. A bit-position or plumbing regression here fails ctest
+ * instead of poisoning the RF EMAs. */
 #include <cstdio>
 #include <cstring>
 

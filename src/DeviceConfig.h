@@ -521,8 +521,8 @@ struct DeviceConfig {
      * memory (libusb_dev_mem_alloc / USBDEVFS_ALLOC) so incoming frames DMA
      * straight into the userspace buffer, eliminating the per-URB usbfs copy
      * on reap. Linux + capable HCD only. DEFAULT OFF: intermittent
-     * zero-frame delivery observed on an xhci desktop host (2026-07-11 —
-     * same host/dongle/channel worked on one run, deaf on the next; the heap
+     * zero-frame delivery observed on an xhci desktop host (same
+     * host/dongle/channel worked on one run, deaf on the next; the heap
      * path was 100% reliable). Opt in with =1 until root-caused. */
     bool rx_zerocopy = false;
   } usb;

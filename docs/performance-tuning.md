@@ -143,7 +143,7 @@ does much — the structural win above is already the dominant effect:
   structurally-correct, low-risk path (and a base to develop further), not a
   measured CPU win at these rates.
 
-  > **Known issue (2026-07-11):** on an xhci desktop host the zerocopy ring
+  > **Known issue:** on an xhci desktop host the zerocopy ring
   > intermittently delivered zero frames (same host/dongle/channel: one run
   > fine, the next deaf; heap path 100% reliable). Zerocopy is therefore
   > default-OFF (`DEVOURER_RX_ZEROCOPY=1` opts in) until root-caused.
