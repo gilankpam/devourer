@@ -36,10 +36,12 @@ struct TxPacketView {
 };
 
 /* IRtlDevice is the chip-family-agnostic device contract used by the demos and
- * the WiFiDriver factory. Three implementations exist:
+ * the WiFiDriver factory. The production family implementations are:
  *   - RtlJaguarDevice   — Realtek "Jaguar" wave-1 (8812AU/8811AU/8821AU/8814AU)
  *   - RtlJaguar2Device  — Realtek "Jaguar2" (8822BU/8812BU)
  *   - RtlJaguar3Device  — Realtek "Jaguar3" (8822CU/8812EU/8822EU)
+ *   - Rtl8733bDevice    — Realtek HALMAC 87xx 11n (RTL8731BU/RTL8733BU)
+ *   - RtlKestrelDevice  — Realtek G6 11ax (RTL8852BU/RTL8852CU)
  *
  * Chip-family-specific research helpers (BB-debug-port reads, the 8814 queue
  * poller, ...) are intentionally NOT part of this interface — callers that need
@@ -218,8 +220,10 @@ public:
    * a peer TXing to `mac` with normal ack-policy gets hardware
    * retransmissions until the ACK (its tx.report shows retries~0). `mac`
    * must be unicast (I/G clear). Turning a passive monitor into an active
-   * transmitter is opt-in only — never a default. Returns false where
-   * unsupported. Clear = net_type back to No Link. */
+   * transmitter is opt-in only — never a default. Returns false when
+   * unsupported or when arm/verification fails; false is not proof of passive
+   * state, so implementations log if rollback cannot be verified. Clear is a
+   * non-throwing best effort to return net_type to No Link. */
   virtual bool SetAckResponder(const devourer::MacAddr &mac) {
     (void)mac;
     return false;

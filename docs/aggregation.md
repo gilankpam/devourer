@@ -28,10 +28,25 @@ never lands on an exact bulk-MPS multiple (the sync bulk path has no ZLP).
 
 Per-family hardware rules:
 
-- **HalMAC (8822B/8821C/8822C/8822E)**: at most **3 descriptors per bulk
+- **HalMAC 88xx (8822B/8821C/8822C/8822E)**: at most **3 descriptors per bulk
   transfer** (mainline rtw88 `usb_tx_agg_desc_num` / halmac `BLK_DESC_NUM`) —
   the library clamps. Layout is rtw88-parity: no first-block reserve; the
   8-byte PKT_OFFSET shim is inserted only to escape a bulk-boundary total.
+- **RTL8733B (HALMAC 87xx)**: the same 3-descriptor HalMAC rule and the same
+  no-reserve layout, with a 40-byte descriptor. Two things differ from the
+  88xx siblings. `DMA_TXAGG_NUM` sits at the same `dword7[31:24]`, but this
+  family's checksum is folded *inside* `fill_tx_desc_8733b`, so the count is
+  built in rather than patched on and re-checksummed — byte `0x1f` is inside
+  the checksummed span (the fold skips only `0x1c-0x1d`), so writing it after
+  the checksum yields a descriptor the chip rejects. And `BLK_DESC_NUM = 3`
+  was already programmed by MAC init before this knob existed, so no
+  bring-up change was needed to enable it.
+  **This is the family where batching actually pays.** On the CV610 craft one
+  bulk-OUT submission costs ~248 µs of CPU against ~22 µs on x86, and ~87% of
+  that is the kernel USB submit/completion path — so packing 3:1 measured
+  **248 → 148 µs per frame, 43.0% → 26.7% of one core at ~1750 fps**, with
+  the frame rate unchanged. On x86 the same A/B moves 21.5 → 10.6 µs. Where
+  the host is small, this knob is worth roughly ten points of a core.
 - **Jaguar1 (8812A/8811A/8821A/8814A)**: vendor-parity — the first block
   carries the 8-byte PKT_OFFSET reserve (dropped at a boundary total), and the
   OQT guard caps descriptor STARTS per bulk window (8812A = 1, 8814A = 3,
@@ -187,7 +202,8 @@ CCX reports: responder ON = 100% delivered at mean 0.4 retries (67%
 first-try); OFF = 0% delivered, every frame pinned at the 12-retry limit. The
 retry distribution is the per-frame TX-side link-quality sensor.
 
-The same responder is a hardware **BlockAck** responder: the MAC's
+On the adapter combinations measured by `tests/ampdu_ba_check.sh`, the same
+responder is a hardware **BlockAck** responder: the MAC's
 immediate-response engine generates a SIFS-timed BlockAck for a received
 A-MPDU addressed to its MACID, on the same MACID + net_type gate. So
 reliable-unicast **ACKed A-MPDU** works end to end — the TX runs `SetAmpduMode`
@@ -197,7 +213,15 @@ aggregates deliver at 100% / mean 0.1 retries and ~27× the throughput of the
 responder-off case (where every aggregate re-airs to the retry limit). The
 `no_ack = true` default is the broadcast/FEC flavor (OpenIPC wfb — no
 responder, no re-air storm); `false` is the reliable-unicast flavor against a
-BA responder.
+BA responder. RTL8733B is also established as the **responder** by the
+CCX-independent `tests/rtl8733b_blockack_onair.sh`: Jaguar2 `0bda:b812` TX,
+RTL8733B `0bda:f72b` responder, and Jaguar1 `0bda:8812` passive witness at
+ch36/MCS3. Armed, 128,702 unique aggregated payloads measured 1.001 witnessed
+copies/frame and the witness decoded 14,402 addressed `0x94` BlockAck frames,
+all with nonzero bitmaps. Active but unarmed, 1,605 payloads measured 12.720
+copies/frame at retry limit 12 and zero matching BlockAcks. Both arms had
+`paggr >= 0.665` and aggregate bursts of 9. RTL8733B's own A-MPDU **TX** path
+remains unported.
 
 Every MAC address in the loop must be **unicast** (I/G bit clear): the
 responder `mac` (an ACK/BlockAck cannot target a group address) and the TX
