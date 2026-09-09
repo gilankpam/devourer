@@ -786,6 +786,18 @@ target_link_libraries(TxQuiesceSelftest PRIVATE devourer PkgConfig::libusb)
 
 add_test(NAME tx_quiesce_seam COMMAND TxQuiesceSelftest)
 
+# Headless guard for the ACK-responder recipe (src/AckResponder.h): the arm,
+# the gate-only clear staying gate-only, and the retarget seam. This test does
+# not model silicon or instantiate Rtl8733bDevice; those are covered by the
+# RTL8733B-only `disarmed` phase in ack_txreport_matrix.sh. Its legacy `off`
+# phase remains a never-armed control.
+add_executable(AckResponderSelftest
+    tests/ack_responder_selftest.cpp
+)
+target_link_libraries(AckResponderSelftest PRIVATE devourer PkgConfig::libusb)
+
+add_test(NAME ack_responder_recipe COMMAND AckResponderSelftest)
+
 # Headless guard for the windowed RX-receipt primitives (src/cell/RxReceipt.h):
 # TLV round-trip, ring eviction, late accounting, ledger merge idempotence,
 # strict-parse rejections. The on-air halves are tests/receipt_verify.py over
@@ -1112,10 +1124,12 @@ target_link_libraries(TxPktBankSelftest PRIVATE devourer)
 target_include_directories(TxPktBankSelftest PRIVATE src)
 add_test(NAME txpkt_bank_policy COMMAND TxPktBankSelftest)
 
-# Headless guard for the Jaguar3 RX-descriptor PHYST bit (DW0 bit 26): the
-# "a PHY-status report was actually written for this frame" flag that keeps
-# A-MPDU subframes' reserved-but-unwritten drvinfo bytes out of the RF EMAs.
-if(DEVOURER_JAGUAR3)
+# Headless guard for the Jaguar2/Jaguar3 RX PHY-status gate: the descriptor
+# PHYST bit (DW0 bit 26) that keeps A-MPDU subframes' reserved-but-unwritten
+# drvinfo bytes out of the RF EMAs, plus the PhyStsFill tier each parser
+# returns (which fields it actually filled). Both parsers are header-only and
+# self-contained, so the test builds whenever either generation is selected.
+if(DEVOURER_JAGUAR3 OR DEVOURER_JAGUAR2_8822B OR DEVOURER_JAGUAR2_8821C)
     add_executable(RxPhystSelftest tests/rx_physt_selftest.cpp)
     target_link_libraries(RxPhystSelftest PRIVATE devourer)
     target_include_directories(RxPhystSelftest PRIVATE src)
