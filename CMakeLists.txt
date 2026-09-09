@@ -227,6 +227,7 @@ add_library(devourer
     src/IRtlDevice.h
     src/SignalStop.cpp
     src/SignalStop.h
+    src/DeviceProbe.cpp
     src/WiFiDriver.cpp
     src/WiFiDriver.h
     src/registry_priv.h
@@ -1046,6 +1047,13 @@ add_executable(AdapterCapsSelftest
 target_link_libraries(AdapterCapsSelftest PRIVATE devourer)
 
 add_test(NAME adapter_caps_derive COMMAND AdapterCapsSelftest)
+
+add_executable(DeviceProbeSelftest
+    tests/device_probe_selftest.cpp
+)
+target_link_libraries(DeviceProbeSelftest PRIVATE devourer)
+
+add_test(NAME device_probe_dispatch COMMAND DeviceProbeSelftest)
 
 if(DEVOURER_8733B)
     add_executable(Rtl8733bEfuseSelftest
