@@ -2137,6 +2137,10 @@ int main(int argc, char **argv) {
           ev.f("igi", e.igi);
         else
           ev.f("igi", nullptr);
+        if (e.valid_noise_floor) /* active absolute floor (opt-in), per bin */
+          ev.f("abs_noise_floor_dbm", e.abs_noise_floor_dbm);
+        else
+          ev.f("abs_noise_floor_dbm", nullptr);
         ev.f("retune_us", retune_us)
             .f("frames", agg.n)
             .f("frames_ldpc", agg.n_ldpc)
