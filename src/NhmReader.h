@@ -6,6 +6,7 @@
 #include <functional>
 #include <thread>
 
+#include "NoiseFloorMath.h"
 #include "RxSense.h"
 
 /* NHM (Noise Histogram Measurement) — a frame-free, hardware in-band
@@ -48,9 +49,52 @@ inline NhmRegs nhm_regs_jgr3() {
                  0x2d4c, 0x2d40, 0x2d44, 0x2d48};
 }
 
-/* Run one NHM measurement and fill e.nhm[]/nhm_duration/valid_nhm.
+/* One NHM window with explicit thresholds and config: writes th[11] + cfg,
+ * pulses the trigger, polls the ready bit, reads the 12 bucket counters and
+ * the counted duration. Returns false if the window never reported ready.
  *   read32(addr)          — read a 32-bit BB register
  *   set_bb(addr,mask,val) — masked BB-register write (phy_set_bb_reg)
+ *   cfg                   — [11:8] = (divi<<3)|(inc_tx<<2)|(inc_cca<<1)|ccx_en
+ *   period                — measurement window in 4us units (500 = ~2ms) */
+inline bool nhm_measure(const NhmRegs& r, const uint8_t th[11], uint32_t cfg,
+                        uint16_t period,
+                        const std::function<uint32_t(uint16_t)>& read32,
+                        const std::function<void(uint16_t, uint32_t, uint32_t)>& set_bb,
+                        uint8_t buckets[12], uint16_t& duration) {
+  set_bb(r.ctrl, 0xf00u, cfg & 0xfu);
+  set_bb(r.period, 0xffff0000u, static_cast<uint32_t>(period));
+  set_bb(r.th0_3, 0xffffffffu,
+         th[0] | (th[1] << 8) | (th[2] << 16) | (uint32_t(th[3]) << 24));
+  set_bb(r.th4_7, 0xffffffffu,
+         th[4] | (th[5] << 8) | (th[6] << 16) | (uint32_t(th[7]) << 24));
+  /* set_bb shifts the value to the mask's low bit (PHY_SetBBReg8812), so
+   * th[8..10] go in UNshifted like cfg/period above — pre-shifting them
+   * pushed the bits past the mask and left those thresholds at 0. */
+  set_bb(r.th8, 0xffu << r.th8_shift, th[8]);
+  set_bb(r.ctrl, 0xffff0000u, th[9] | (uint32_t(th[10]) << 8));
+  /* Trigger (pulse bit1 0->1). */
+  set_bb(r.ctrl, 0x2u, 0);
+  set_bb(r.ctrl, 0x2u, 1);
+  /* Poll ready (bit16). Window ~period*4us; cap the wait so a stuck read never
+   * stalls the caller (holds a register lock on Jaguar3). */
+  bool ready = false;
+  for (int i = 0; i < 15 && !ready; i++) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    if (read32(r.ready) & (1u << 16))
+      ready = true;
+  }
+  if (!ready)
+    return false;
+  const uint32_t words[3] = {read32(r.res0_3), read32(r.res4_7),
+                             read32(r.res8_11)};
+  for (int w = 0; w < 3; w++)
+    for (int k = 0; k < 4; k++)
+      buckets[w * 4 + k] = (words[w] >> (8 * k)) & 0xff;
+  duration = static_cast<uint16_t>(read32(r.ready) & 0xffff);
+  return true;
+}
+
+/* Run one NHM measurement and fill e.nhm[]/nhm_duration/valid_nhm.
  *   igi7                  — current 7-bit IGI (0xC50/0x1d70), the histogram reference
  *   period                — measurement window in 4us units (default 500 = ~2ms)
  * The thresholds follow phydm's NHM_BACKGROUND recipe (IGI-relative), so the
@@ -69,48 +113,24 @@ inline void read_nhm(const NhmRegs& r, uint8_t igi7,
     int v = base + 4 * i;
     th[i] = v > 255 ? 255 : static_cast<uint8_t>(v);
   }
-
-  /* Config [11:8] = (divi<<3)|(inc_tx<<2)|(inc_cca<<1)|ccx_en.
-   * ccx_en=1, include_cca=1 (count busy so a CW interferer registers),
+  /* ccx_en=1, include_cca=1 (count busy so a CW interferer registers),
    * include_tx=0, divider=NHM_CNT_ALL(0) -> 0b0011. */
-  set_bb(r.ctrl, 0xf00u, 0x3u);
-  set_bb(r.period, 0xffff0000u, static_cast<uint32_t>(period));
+  e.valid_nhm = nhm_measure(r, th, 0x3u, period, read32, set_bb, e.nhm,
+                            e.nhm_duration);
+}
 
-  set_bb(r.th0_3, 0xffffffffu,
-         th[0] | (th[1] << 8) | (th[2] << 16) | (uint32_t(th[3]) << 24));
-  set_bb(r.th4_7, 0xffffffffu,
-         th[4] | (th[5] << 8) | (th[6] << 16) | (uint32_t(th[7]) << 24));
-  /* set_bb shifts the value to the mask's low bit (PHY_SetBBReg8812), so
-   * th[8..10] go in UNshifted like cfg/period above — pre-shifting them
-   * pushed the bits past the mask and left those thresholds at 0. */
-  set_bb(r.th8, 0xffu << r.th8_shift, th[8]);
-  set_bb(r.ctrl, 0xffff0000u, th[9] | (uint32_t(th[10]) << 8));
-
-  /* Trigger (pulse bit1 0->1). */
-  set_bb(r.ctrl, 0x2u, 0);
-  set_bb(r.ctrl, 0x2u, 1);
-
-  /* Poll ready (bit16). Window ~period*4us; cap the wait so a stuck read never
-   * stalls the caller (holds a register lock on Jaguar3). */
-  bool ready = false;
-  for (int i = 0; i < 15 && !ready; i++) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    if (read32(r.ready) & (1u << 16))
-      ready = true;
-  }
-  if (!ready) {
-    e.valid_nhm = false;
-    return;
-  }
-
-  const uint32_t a = read32(r.res0_3), b = read32(r.res4_7),
-                 c = read32(r.res8_11);
-  const uint32_t words[3] = {a, b, c};
-  for (int w = 0; w < 3; w++)
-    for (int k = 0; k < 4; k++)
-      e.nhm[w * 4 + k] = (words[w] >> (8 * k)) & 0xff;
-  e.nhm_duration = static_cast<uint16_t>(read32(r.ready) & 0xffff);
-  e.valid_nhm = true;
+/* The absolute-threshold idle-floor window (phydm's NHM_ACS recipe, see
+ * NoiseFloorMath.h): devourer's fixed dBm table, tx-on and cca-busy samples
+ * EXCLUDED (cfg 0b0001) so only idle air is binned. Feed the result to
+ * nf::nhm_abs_floor_dbm with nf::kNhmAbsThDbm and `period`. */
+inline bool read_nhm_absolute(const NhmRegs& r,
+                              const std::function<uint32_t(uint16_t)>& read32,
+                              const std::function<void(uint16_t, uint32_t, uint32_t)>& set_bb,
+                              uint8_t buckets[12], uint16_t& duration,
+                              uint16_t period = 500) {
+  uint8_t th[11];
+  nf::nhm_abs_thresholds(th);
+  return nhm_measure(r, th, 0x1u, period, read32, set_bb, buckets, duration);
 }
 
 }  // namespace devourer

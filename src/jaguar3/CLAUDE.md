@@ -36,6 +36,15 @@ narrowband dividers, RF18 encoding), strategy interfaces `Jaguar3Calibration`
   single-path 1SS TX, spur channels, LCK, the 2.4 GHz TX kernel-parity
   limitation) live in `docs/8822e-quirks.md`.
 
+- **Absolute noise floor = NHM, not an idle-noise report.** The 8822C/E have
+  no vendor idle-noise path (phydm_noisemonitor.c returns 0 for them; the
+  vendor ACS never asks). `GetRxEnergy(with_nhm)` under
+  `DEVOURER_RX_NOISE_FLOOR` runs a second NHM window with absolute thresholds
+  and cca/tx-on excluded (the vendor ACS recipe) and averages the occupied
+  buckets — `src/NoiseFloorMath.h`, `docs/rx-spectrum-sensing.md`. Beware the
+  masked BB write shifts the value to the mask: the NHM th[8..10] writes were
+  double-shifted (read back 0) until the selftest pinned them.
+
 ## Bring-up cost and the pipelined register writes
 
 `InitWrite` is ~14k USB control transfers and nothing else (stage timing:

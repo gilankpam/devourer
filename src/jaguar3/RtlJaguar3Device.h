@@ -181,13 +181,16 @@ public:
    * the same facilities in a newer register space — OFDM/CCK CCA (0x2c08), CCK
    * FA (0x1a5c), OFDM FA (sum of 0x2d04/08/10/20/0c), IGI (0x1d70) — reset via
    * 0x1a2c + 0x1eb4[25]. Read-then-reset for a per-call delta; serialized on
-   * _reg_mu against the coex runtime thread. The read side of the CW tone. */
+   * _reg_mu against the coex runtime thread. The read side of the CW tone.
+   * With DEVOURER_RX_NOISE_FLOOR (and with_nhm) it adds the absolute idle
+   * floor from a second, absolute-threshold NHM window (the vendor ACS
+   * recipe; NoiseFloorMath.h) — this generation has no idle-noise report. */
   RxEnergy GetRxEnergy(bool with_nhm) override;
 
   /* Consolidated windowed RX link-quality snapshot (see RxQuality.h) — subsumes
    * GetRxEnergy. Fed per decoded frame in the RX loop via _rxq. On Jaguar3 the
-   * noise-floor is the passive rssi-snr estimate (this generation has no
-   * background DIG, so IGI is static and can't track the floor). */
+   * always-on noise floor is the passive rssi-snr estimate; the absolute
+   * (frame-free) one rides GetRxEnergy's NHM idle window when opted in. */
   devourer::RxQuality GetRxQuality() override {
     return devourer::build_rx_quality(_rxq.snapshot(), GetRxEnergy(true));
   }

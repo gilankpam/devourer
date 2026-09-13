@@ -177,8 +177,9 @@ struct DeviceConfig {
      * floor (dBm) in GetRxEnergy/GetRxQuality (RxEnergy.abs_noise_floor_dbm).
      * OFF by default: the vendor idle-noise measurement adds ~10 ms of USB
      * round-trips. Jaguar2 measures it live (wedge-free HW idle-noise report);
-     * Jaguar1 8812A/8821A measure it RX-idle (a CAL bracket); Jaguar3 and others
-     * leave it invalid (no vendor path). */
+     * Jaguar1 8812A/8821A measure it RX-idle (a CAL bracket); Jaguar3 and
+     * Kestrel bin idle air in an absolute-threshold NHM window (~2 ms, needs
+     * with_nhm); the RTL8733B leaves it invalid. */
     bool abs_noise_floor = false;
     /* env: DEVOURER_IGI — Jaguar2 fixed initial-gain index override, 7 bits
      * (unset = 0x40, the FA-rate-validated default). */

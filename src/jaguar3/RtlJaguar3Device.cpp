@@ -1164,13 +1164,35 @@ RxEnergy RtlJaguar3Device::GetRxEnergy(bool with_nhm) {
    * ~2 ms measurement window before the FA-counter reset below (0x1eb4[25] also
    * clears BB HW counters). Holds _reg_mu across the short wait — tolerable at
    * the emitter's >=100 ms cadence vs the coex thread's ~2 s tick. */
+  auto set_bb = [this](uint16_t a, uint32_t m, uint32_t v) {
+    _device.phy_set_bb_reg(a, m, v);
+  };
   if (with_nhm)
-    devourer::read_nhm(
-      devourer::nhm_regs_jgr3(), e.igi, rd,
-      [this](uint16_t a, uint32_t m, uint32_t v) {
-        _device.phy_set_bb_reg(a, m, v);
-      },
-      e);
+    devourer::read_nhm(devourer::nhm_regs_jgr3(), e.igi, rd, set_bb, e);
+
+  /* DEVOURER_RX_NOISE_FLOOR — active/frame-free absolute floor. Jaguar3 has no
+   * vendor idle-noise report (phydm_noisemonitor.c dispatches only to
+   * 8812/8821/8814A and 8822B/8821C, returns 0 for the 8822C/E), so this is the
+   * vendor channel-select's method instead (hal_dm_acs.c: NHM_ACS): a second
+   * NHM window with ABSOLUTE thresholds and tx-on/cca-busy samples excluded,
+   * so only idle air is binned, then the weighted bucket average -> dBm
+   * (NoiseFloorMath.h). BB-driven, no clock-stop -> wedge-free under live RX;
+   * another ~2 ms under _reg_mu, opt-in. Guarded to the plausible idle band so
+   * a saturated channel or a garbage window never emits a fake dBm; resolution
+   * is the 3 dB bucket width near the floor. */
+  if (with_nhm && _cfg.rx.abs_noise_floor) {
+    constexpr uint16_t kPeriod = 500; /* 4us units, ~2 ms */
+    uint8_t b[12] = {};
+    uint16_t dur = 0;
+    int dbm = 0;
+    if (devourer::read_nhm_absolute(devourer::nhm_regs_jgr3(), rd, set_bb, b,
+                                    dur, kPeriod) &&
+        devourer::nf::nhm_abs_floor_dbm(b, dur, kPeriod, dbm) &&
+        dbm >= -105 && dbm <= -60) {
+      e.abs_noise_floor_dbm = static_cast<int8_t>(dbm);
+      e.valid_noise_floor = true;
+    }
+  }
 
   /* Reset: CCK FA 0x1a2c[15:14] 0->2, CCK CCA 0x1a2c[13:12] 0->2, then OFDM
    * CCA/FA (phydm_reset_bb_hw_cnt jgr3: 0x1eb4[25] 1->0, wrapped by the
@@ -1184,11 +1206,6 @@ RxEnergy RtlJaguar3Device::GetRxEnergy(bool with_nhm) {
   _device.phy_set_bb_reg(0x1eb4, 1u << 25, 0x0);
   _device.phy_set_bb_reg(0x1d2c, 1u << 31, 0x1);
 
-  /* No active absolute noise floor on Jaguar3: the vendor 8822C driver
-   * has no idle-noise path (phydm_noisemonitor.c dispatches the report only to
-   * 8822B/8821C and returns 0 for the 8822C), so e.valid_noise_floor stays
-   * false. The passive rssi-snr floor (RxQuality.noise_floor_dbm) is J3's only
-   * floor. */
   return e;
 }
 
