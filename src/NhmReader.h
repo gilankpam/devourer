@@ -80,8 +80,11 @@ inline void read_nhm(const NhmRegs& r, uint8_t igi7,
          th[0] | (th[1] << 8) | (th[2] << 16) | (uint32_t(th[3]) << 24));
   set_bb(r.th4_7, 0xffffffffu,
          th[4] | (th[5] << 8) | (th[6] << 16) | (uint32_t(th[7]) << 24));
-  set_bb(r.th8, 0xffu << r.th8_shift, uint32_t(th[8]) << r.th8_shift);
-  set_bb(r.ctrl, 0xffff0000u, (th[9] | (uint32_t(th[10]) << 8)) << 16);
+  /* set_bb shifts the value to the mask's low bit (PHY_SetBBReg8812), so
+   * th[8..10] go in UNshifted like cfg/period above — pre-shifting them
+   * pushed the bits past the mask and left those thresholds at 0. */
+  set_bb(r.th8, 0xffu << r.th8_shift, th[8]);
+  set_bb(r.ctrl, 0xffff0000u, th[9] | (uint32_t(th[10]) << 8));
 
   /* Trigger (pulse bit1 0->1). */
   set_bb(r.ctrl, 0x2u, 0);
