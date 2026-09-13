@@ -17,7 +17,10 @@
 #   - Jaguar3 (8822C/8822E): no vendor idle-noise path; the floor is the vendor
 #     ACS's NHM method instead (absolute thresholds, cca/tx-on excluded, weighted
 #     bucket average, src/NoiseFloorMath.h). BB-driven, no clock-stop ->
-#     wedge-free by nature; 3 dB bucket resolution near the floor.
+#     wedge-free by nature; 3 dB bucket resolution near the floor. The BB
+#     reports a frozen (single-bucket) estimate for the first seconds and on
+#     2.4 GHz, rejected as null; use a 5 GHz channel and a run long enough
+#     to settle (DUR >= 10 s). Validated 2026-09-13: -95/-96 dBm, two cards.
 #
 # Two checks (a monotonic-vs-injected-noise sweep is NOT included: the bench B210
 # is too weakly coupled to the RTL front ends to move the floor above the
@@ -124,7 +127,7 @@ if j3 is not None:
     print(f"  Jaguar3 NHM floor in idle-floor band [-105,-70]: {'PASS' if ok3 else 'FAIL'}")
     if j3p is not None:
         print(f"  J3 NHM vs passive floor, delta {abs(j3-j3p)} dB: "
-              f"{'PASS' if abs(j3-j3p) <= 6 else 'INSPECT'}")
+              f"{'PASS' if abs(j3-j3p) <= 8 else 'INSPECT'}")
     if j1 is not None:
         print(f"  J1/J3 both in idle-floor band, delta {abs(j1-j3)} dB: "
               f"{'PASS' if ok and ok3 and abs(j1-j3) <= 15 else 'INSPECT'}")

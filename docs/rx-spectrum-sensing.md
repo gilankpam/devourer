@@ -76,8 +76,26 @@ Two noise floors are exposed on `GetRxQuality()`:
     bucket width (3 dB below −80, 5 dB above). phydm's own 11k table bottoms
     out at −92 dBm, which would clip a real 20 MHz floor — hence the lower
     devourer table (phydm's NHM_DBG 1-dB mode shows the thresholds are free).
-    **Unvalidated on air as of this commit** — `tests/rx_noise_floor_active_onair.sh`
-    cross-checks it against the Jaguar1 floor and the J3 passive floor.
+    **On-air 2026-09-13, two 8812EU on a ground station, ch36/44/100/136/149:**
+    −95…−96 dBm on both cards on every 5 GHz channel, flat for 60 s once
+    settled, and within 1 dB card-to-card; the passive floor where frames
+    existed (ch36, −87…−92) sits within 4…9 dB. The adversarial half: for the
+    first 1…7 s after bring-up the BB reports a **frozen** power estimate —
+    two constant values in turn (≈−97, then a fixed −85 regardless of card
+    or channel), each a single 3 dB bucket holding 241…255 of the 255
+    samples — before a transition (one window saturated in-band, `0x1d70`
+    momentarily reading `0x50505050`) after which the estimate is live and
+    spreads over 2…3 buckets. On **2.4 GHz** (ch6) the frozen −85 persists
+    for the whole 60 s with rare live samples (−94, matching the passive
+    −92.5); the trigger is not identified — no devourer code path writes at
+    that moment (RX-only sessions run only the phydm tick; IGI toggle, CCX
+    hw-restart, and CCA-off were each tried and change nothing; a
+    `FastRetune` re-arms it). `nf::nhm_abs_floor_dbm` therefore rejects a
+    degenerate histogram (peak bucket ≥ 236 — observed frozen minimum 241 vs
+    live maximum 220, a thin margin measured on two units) as null, so the
+    floor is null for the first seconds and for most of a 2.4 GHz session —
+    never a fake dBm. `tests/rx_noise_floor_active_onair.sh` cross-checks it
+    against the Jaguar1 floor and the J3 passive floor.
   - **Kestrel (8852B/8852C, Wi-Fi 6)** — the cleanest source: Realtek's halbb
     **NHM env-monitor** (`halbb_env_mntr_trigger`/`result` → `nhm_pwr − 110`), a
     proper frame-free BB measurement with no clock-stop → no wedge. On-air the

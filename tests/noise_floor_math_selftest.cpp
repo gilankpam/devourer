@@ -59,27 +59,40 @@ int main() {
    * buckets 0..10 = nhm_level), then rtw_acs's -100 to dBm. All mass in bucket
    * 3 (-98..-95 dBm) -> midpoint -96.5 -> -97 in phydm's integer arithmetic. */
   {
-    uint8_t b[12] = {}; b[3] = 255; int dbm = 0;
+    uint8_t b[12] = {}; b[2] = 20; b[3] = 215; b[4] = 20; int dbm = 0;
     check("bucket3 valid", nhm_abs_floor_dbm(b, th, 500, 500, dbm) ? 1 : 0, 1);
     check("bucket3 dbm", dbm, -97);
   }
   /* Bucket 0 = below the lowest threshold: weight th[0]-2, i.e. 1 dB under it. */
   {
-    uint8_t b[12] = {}; b[0] = 255; int dbm = 0;
+    uint8_t b[12] = {}; b[0] = 230; b[1] = 25; int dbm = 0;
     check("bucket0 valid", nhm_abs_floor_dbm(b, th, 500, 500, dbm) ? 1 : 0, 1);
     check("bucket0 dbm", dbm, -105);
   }
+  /* A frozen power estimate (on-air 8812EU, see docs/rx-spectrum-sensing.md):
+   * the BB reports one constant value, so the whole window lands in a single
+   * 3 dB bucket (241-255 of 255 observed, remainder <= 15 in one neighbour),
+   * whereas a live noise estimate always spreads over neighbours (max bucket
+   * <= 220 observed). Reject the degenerate histogram: never a fake dBm. */
+  {
+    uint8_t b[12] = {}; b[7] = 255; int dbm = 0;
+    check("frozen single bucket invalid", nhm_abs_floor_dbm(b, th, 500, 500, dbm) ? 1 : 0, 0);
+    uint8_t c[12] = {}; c[6] = 14; c[7] = 241;
+    check("frozen 241 invalid", nhm_abs_floor_dbm(c, th, 500, 500, dbm) ? 1 : 0, 0);
+    uint8_t d[12] = {}; d[3] = 235; d[4] = 20;
+    check("235 still live", nhm_abs_floor_dbm(d, th, 500, 500, dbm) ? 1 : 0, 1);
+  }
   /* Split mass: 128 in bucket 3 (wgt 27), 127 in bucket 4 (wgt 33) -> 29 -> -96. */
   {
-    uint8_t b[12] = {}; b[3] = 128; b[4] = 127; int dbm = 0;
+    uint8_t b[12] = {}; b[3] = 128; b[4] = 127; int dbm = 0; /* live: two buckets */
     check("split valid", nhm_abs_floor_dbm(b, th, 500, 500, dbm) ? 1 : 0, 1);
     check("split dbm", dbm, -96);
   }
   /* Bucket 11 (above the top threshold) is signal, not floor: excluded. */
   {
-    uint8_t b[12] = {}; b[3] = 20; b[11] = 235; int dbm = 0;
+    uint8_t b[12] = {}; b[3] = 12; b[4] = 8; b[11] = 235; int dbm = 0;
     check("signal excluded valid", nhm_abs_floor_dbm(b, th, 500, 500, dbm) ? 1 : 0, 1);
-    check("signal excluded dbm", dbm, -97);
+    check("signal excluded dbm", dbm, -96);
   }
   /* Too few floor samples (<8 of 255) -> no floor. */
   {
@@ -94,7 +107,7 @@ int main() {
   /* Idle time (duration, CCA/TX excluded) under 10 % of the window -> no floor;
    * exactly 10 % is enough. */
   {
-    uint8_t b[12] = {}; b[3] = 255; int dbm = 0;
+    uint8_t b[12] = {}; b[3] = 200; b[4] = 55; int dbm = 0;
     check("idle 4% invalid", nhm_abs_floor_dbm(b, th, 20, 500, dbm) ? 1 : 0, 0);
     check("idle 10% valid", nhm_abs_floor_dbm(b, th, 50, 500, dbm) ? 1 : 0, 1);
   }

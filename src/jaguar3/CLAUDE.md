@@ -41,7 +41,11 @@ narrowband dividers, RF18 encoding), strategy interfaces `Jaguar3Calibration`
   vendor ACS never asks). `GetRxEnergy(with_nhm)` under
   `DEVOURER_RX_NOISE_FLOOR` runs a second NHM window with absolute thresholds
   and cca/tx-on excluded (the vendor ACS recipe) and averages the occupied
-  buckets — `src/NoiseFloorMath.h`, `docs/rx-spectrum-sensing.md`. Beware the
+  buckets — `src/NoiseFloorMath.h`, `docs/rx-spectrum-sensing.md`. On air:
+  −95/−96 dBm on 5 GHz once settled, but the BB's power estimate is FROZEN
+  (one constant value, single-bucket histogram) for the first 1-7 s and for
+  most of a 2.4 GHz session — rejected as null by the peak-bucket guard;
+  trigger unidentified. Beware the
   masked BB write shifts the value to the mask: the NHM th[8..10] writes were
   double-shifted (read back 0) until the selftest pinned them.
 
