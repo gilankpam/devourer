@@ -540,7 +540,9 @@ struct DeviceConfig {
      *
      * MEASURED 2026-09-15, and the two hosts disagree completely:
      *   - GROUND STATION (RK3566, the deployment target): the scout read goes
-     *     from a 3372 us median to 603 us — 5.6x, -2.77 ms per call. Batching
+     *     from a 3372 us median to 603 us — 5.6x, -2.77 ms per call. A FLOOR:
+     *     measured with no RX loop running, so no RX URBs were on the libusb
+     *     context for the scout's own event pump to absorb. Batching
      *     removes 92-98% of the per-transfer cost there, because on that host
      *     that cost is host turnaround, not wire time (~290 us per completion
      *     WAIT plus only ~7-16 us per op).

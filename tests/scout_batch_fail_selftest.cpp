@@ -18,9 +18,13 @@
  * observable symptom short of a deaf radio is exactly the case that has to be
  * pinned by a test rather than by a comment.
  *
- * The fake transport overrides ctrl_batch to reproduce UsbTransport's
- * documented failure semantics exactly: a failed read op keeps the value it
- * was constructed with and the call returns false. */
+ * The fake transport overrides ctrl_batch to reproduce the ONE UsbTransport
+ * failure semantic this test turns on: a failed read op keeps the value it was
+ * constructed with, and the call returns false. It deliberately does not model
+ * the rest — UsbTransport also skips an op whose submit failed and skips the
+ * remainder of a chunk after a wait gives up, and it can finish a remainder
+ * synchronously. Immaterial here (an all-read group, and the bail-out keys on
+ * the return value alone), but the fake is not a stand-in for the transport. */
 #include <cstdio>
 #include <cstdlib>
 #include <map>

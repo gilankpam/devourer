@@ -1268,9 +1268,20 @@ RxEnergy RtlJaguar3Device::GetRxEnergy(bool with_nhm) {
  * valid_fa reports the batches' own success: a failed group yields an invalid
  * reading rather than zeros that would read as a quiet channel. A failed READ
  * group additionally suppresses the reset writes entirely — see the bail-out
- * below for why that is mandatory rather than tidy. Skipping a reset is
- * harmless: the BB counters keep accumulating, so the next successful call
- * reports a delta over a wider window than its own dwell.
+ * below for why that is mandatory rather than tidy.
+ *
+ * Skipping a reset is NOT free, though it is far cheaper than the alternative.
+ * The OFDM counters keep accumulating across the failed dwell, so the NEXT
+ * successful sample's delta covers that dwell too — and the consumers
+ * (HopsetSense / emit_sense) divide by THAT sample's own window_us. So the
+ * next sample's cca_rate/fa_rate is INFLATED, not merely taken over a longer
+ * window, and one inflated rate can read as a busy channel and bias a
+ * hold/exclude decision. Bounded — the coex thread's fa_stats() resets the
+ * same counters on its ~2 s tick — and still far better than the register
+ * corruption the bail-out prevents, but do not read it as costless. Whether
+ * 0x2c08's counters saturate or wrap when a reset is skipped is NOT
+ * established (no vendor documentation in this tree says), so the worst-case
+ * magnitude of that inflation is unknown.
  *
  * ONE ESCAPE ROUTE valid_fa does NOT cover, so a caller should know: if the
  * transport falls back to IRtlTransport::ctrl_batch's synchronous path (a
@@ -1302,8 +1313,10 @@ RxEnergy RtlJaguar3Device::GetRxEnergyScout() {
      * gate) and 0x02000000/0x00000000 into 0x1eb4 — clobbering every other bit
      * of two live BB registers and leaving the receiver deaf, permanently,
      * since the next call would read the corrupted value back and rewrite it.
-     * Dropping the sample costs nothing: the counters keep accumulating and
-     * the next successful call simply reports a wider delta. Pinned by
+     * Dropping the sample is cheap but not free — the skipped reset inflates
+     * the NEXT sample's cca_rate/fa_rate (see the header comment above), which
+     * is bounded by the coex tick and vastly preferable to corrupting two live
+     * BB registers, but is a real effect. Pinned by
      * tests/scout_batch_fail_selftest.cpp, because nothing else can see this —
      * valid_fa=false only drops the sample, and scout_read_bench's
      * plausibility tripwire is itself gated on valid_fa. */
@@ -1312,6 +1325,14 @@ RxEnergy RtlJaguar3Device::GetRxEnergyScout() {
   }
   const devourer::jgr3::ResetDwords r =
       devourer::jgr3::compose_reset(rd[6].value, rd[7].value);
+  /* KNOWN, pre-existing since the batching landed (b4c6e5a) and untouched by
+   * the read-side bail-out above: if THIS batch fails partway, it can leave
+   * 0x1d2c[31] cleared — the RX clock gate off — because the ops that would
+   * have restored it were skipped. Unlike the read-side bug that is NOT a
+   * latch: the values here are composed from a fresh read each call, so the
+   * next successful scout writes d1d2c_on = value | bit31 and the gate comes
+   * back. One dwell of deafness, self-healing, versus the permanent corruption
+   * a failed READ would have caused. Recorded, not fixed here. */
   std::vector<devourer::CtrlOp> wr = {
       {true, 0x1d2c, r.d1d2c_off}, {true, 0x1eb4, r.d1eb4_on},
       {true, 0x1eb4, r.d1eb4_off}, {true, 0x1d2c, r.d1d2c_on}};

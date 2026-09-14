@@ -584,8 +584,11 @@ public:
    * against 24 for the full GetRxEnergy(false) on the same chip, and at
    * 603 us median on the RK3566 ground station against 3372 us for the same
    * path unbatched (5.6x; the x86 bench host shows no batching win at all —
-   * see that file's header before quoting either number). The default
-   * delegates to the full read so any caller can use it on any chip. */
+   * see that file's header before quoting either number). THOSE FIGURES ARE
+   * FLOORS: the bench runs with no RX loop, so nothing was reaping RX URBs on
+   * the libusb context that the scout's own event pump will have to service
+   * under live traffic. The default delegates to the full read so any caller
+   * can use it on any chip. */
   virtual RxEnergy GetRxEnergyScout() { return GetRxEnergy(false); }
 
   /* Consolidated windowed RX link-quality snapshot (see RxQuality.h) — the

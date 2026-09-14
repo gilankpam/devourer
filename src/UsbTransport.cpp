@@ -1547,6 +1547,12 @@ bool UsbTransport::tx_async(uint8_t tx_ep, uint8_t *packet, size_t length,
   return false;
 }
 
+/* The opening flush_writes() carries the same KNOWN, DEFERRED cost as
+ * tx_async's — a send landing during a scout read or a cached hop blocks on
+ * that group's 8-11 control transfers (~600 us on the GS), and a timed-out
+ * drain cancels the scout's transfers and latches _aw_abandoned for the
+ * session. See the note above tx_async and the KNOWN, DEFERRED note on
+ * ctrl_batch. */
 int UsbTransport::tx_sync(uint8_t ep, uint8_t *packet, size_t length,
                           int timeout_ms) {
   flush_writes();

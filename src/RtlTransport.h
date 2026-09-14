@@ -108,8 +108,11 @@ public:
    * The win is strongly host-dependent: 5.6x on that ground station (3372 ->
    * 603 us for the 12-op scout read), but exactly ZERO on an x86 xHCI bench
    * host, where the per-transfer cost is wire time rather than host
-   * turnaround and nothing overlaps. See DeviceConfig::Usb::ctrl_batch and
-   * tests/scout_read_bench.cpp's header before quoting a benefit.
+   * turnaround and nothing overlaps. Both are FLOORS — measured with no RX
+   * loop running, so nothing was reaping RX URBs on the context that a
+   * ctrl_batch caller's own event pump must service under live traffic. See
+   * DeviceConfig::Usb::ctrl_batch and tests/scout_read_bench.cpp's header
+   * before quoting a benefit.
    *
    * CONTRACT, owed by every implementation:
    *   - ops execute in submission order, so a read after a write to the same
