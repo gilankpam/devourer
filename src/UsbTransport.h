@@ -185,8 +185,21 @@ private:
    * documented contract (it reads it under its own lock). */
   int _aw_wait_flag = 0;
   /* Held for the whole of ctrl_batch and across the _batch flip in
-   * write_batch_begin/end, so a bring-up write batch and a runtime control
-   * batch can never interleave over the same slot pool. */
+   * write_batch_begin/end. What that buys, precisely: runtime ctrl_batch
+   * calls are serialised against each other and against the opening/closing
+   * of a bring-up write batch.
+   *
+   * It does NOT make a concurrent bring-up safe, and must not be read as
+   * doing so. When _batch is already set, ctrl_batch falls back to the base
+   * IRtlTransport::ctrl_batch, which goes read32/write32 -> ctrl_read/
+   * ctrl_write -> async_read/async_write and takes slots from the same pool
+   * OUTSIDE this mutex, concurrently with the bring-up thread. That is safe
+   * today only because of the single-threaded-bring-up contract on
+   * write_batch_begin (IRtlTransport). Anyone making bring-up concurrent must
+   * fix that path; this mutex does not cover them.
+   *
+   * Kept in sync with the THREADING paragraph on UsbTransport::ctrl_batch's
+   * definition (UsbTransport.cpp) — change both or neither. */
   std::mutex _batch_mu;
   /* DeviceConfig::usb.ctrl_batch — false makes ctrl_batch fall back to the
    * synchronous default (the A/B knob, DEVOURER_CTRL_BATCH=0). */

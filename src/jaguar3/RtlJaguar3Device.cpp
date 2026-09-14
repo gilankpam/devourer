@@ -1268,6 +1268,18 @@ RxEnergy RtlJaguar3Device::GetRxEnergy(bool with_nhm) {
  * valid_fa reports the batch's own success: a failed group yields an invalid
  * reading rather than zeros that would read as a quiet channel.
  *
+ * ONE ESCAPE ROUTE valid_fa does NOT cover, so a caller should know: if the
+ * transport falls back to IRtlTransport::ctrl_batch's synchronous path (a
+ * dead async pool, or usb.ctrl_batch off), its reads go through
+ * UsbTransport::ctrl_read, which THROWS std::ios_base::failure on a failed
+ * register read rather than returning false. So on a dying device this
+ * 8-read group can leave by exception, bypassing ok/valid_fa entirely. That
+ * throw is pre-existing and is this codebase's house idiom for a dead
+ * register bus (every other read path on this chip behaves the same), and
+ * fast_retune's batch is all writes so the hop path is unaffected — changing
+ * the idiom would be a broad change well outside this work. Noted, not
+ * fixed.
+ *
  * Under _reg_mu like every register access here. */
 RxEnergy RtlJaguar3Device::GetRxEnergyScout() {
   std::lock_guard<std::mutex> lk(_reg_mu);

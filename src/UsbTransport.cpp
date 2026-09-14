@@ -415,10 +415,18 @@ void UsbTransport::write_batch_end() {
   /* _aw_errors belongs to THIS batch: write_batch_begin zeroes it, and a
    * runtime ctrl_batch cannot overlap a bring-up batch (it falls back to the
    * synchronous path while _batch is set, and both take _batch_mu), so
-   * nothing else can have contributed between the two. ctrl_batch reports its
-   * own failures through its return value and its own log lines rather than
-   * adding to this counter. "transfer", not "write": async_read lands here
-   * too. */
+   * nothing else can have contributed between the two.
+   *
+   * ctrl_batch does not add to this counter directly — it reports through its
+   * return value and its own log lines — but it is NOT true that it can never
+   * contribute: its wait loop calls flush_writes(), whose give-up branch does
+   * _aw_errors.fetch_add(stuck). That is harmless rather than merely
+   * unlikely, and for a reason worth writing down: the same branch latches
+   * _aw_abandoned, after which write_batch_begin returns early without
+   * setting _batch — so the `_batch && errs` test below can never fire again
+   * in this session, and those counts are never attributed to anyone's batch.
+   *
+   * "transfer", not "write": async_read lands here too. */
   const int errs = _aw_errors.load(std::memory_order_relaxed);
   if (_batch && errs)
     _logger->error("USB: {} pipelined register transfer(s) failed in this "
@@ -667,7 +675,8 @@ bool UsbTransport::async_write(uint16_t wvalue, uint16_t windex,
  * pool the bring-up thread is using, outside _batch_mu. That is safe TODAY
  * only because of the pre-existing single-threaded-bring-up contract on
  * write_batch_begin (IRtlTransport). Anyone making bring-up concurrent must
- * fix that; this mutex does not cover them.
+ * fix that; this mutex does not cover them. (The same caveat is on _batch_mu's
+ * declaration in UsbTransport.h — change both or neither.)
  * The deeper hazard is the event pump: this function pumps
  * libusb_handle_events_timeout_completed on the caller's thread while the RX
  * bulk loop pumps the same context on its own thread. libusb permits that,
@@ -692,14 +701,23 @@ bool UsbTransport::ctrl_batch(std::vector<CtrlOp> &ops) {
     return IRtlTransport::ctrl_batch(ops);
   ensure_async_slots();
 
-  /* Run ops[from..] synchronously and report the combined result. Used
-   * whenever the async pool stops being usable partway through a batch. */
-  auto finish_synchronously = [&](size_t from, bool ok_so_far) {
+  /* Run ops[from..] synchronously and report whether THAT remainder
+   * succeeded; the caller folds in whatever it already knows. Used whenever
+   * the async pool stops being usable partway through a batch.
+   *
+   * COST TRADE, recorded so nobody rediscovers it from a stall: on a
+   * genuinely dead device this pays USB_TIMEOUT (500 ms) per remaining op, so
+   * an 11-op group costs ~5.5 s under the caller's _reg_mu, against the ~2 s
+   * drain per remaining CHUNK it replaces. Crossover is around 4 remaining
+   * ops — which makes it the right trade for the two-chunk batches actually
+   * shipped here (the scout's 8-read and 4-write groups, and the 9-11-write
+   * hop), and a bad one for some future long batch. Size accordingly. */
+  auto finish_synchronously = [&](size_t from) {
     std::vector<CtrlOp> rest(ops.begin() + from, ops.end());
     const bool rok = IRtlTransport::ctrl_batch(rest);
     for (size_t i = 0; i < rest.size(); ++i)
       ops[from + i] = rest[i];
-    return rok && ok_so_far;
+    return rok;
   };
 
   struct Pending {
@@ -719,7 +737,7 @@ bool UsbTransport::ctrl_batch(std::vector<CtrlOp> &ops) {
      * the caller (RtlJaguar3Device) is holding _reg_mu throughout, so every
      * register access on the device freezes for as long as it takes. */
     if (_aw_abandoned.load(std::memory_order_acquire))
-      return finish_synchronously(base, ok);
+      return finish_synchronously(base) && ok;
 
     /* ---- ACQUIRE PHASE, and it is load-bearing ----
      * Every slot this chunk will use is taken BEFORE anything is submitted,
@@ -768,7 +786,9 @@ bool UsbTransport::ctrl_batch(std::vector<CtrlOp> &ops) {
         _logger->error("USB: ctrl_batch has no usable transfer slot at reg "
                        "{:04x}; running the remaining {} op(s) synchronously",
                        ops[base].addr, ops.size() - base);
-        finish_synchronously(base, ok);
+        /* Result deliberately discarded: this path returns false either way
+         * — a batch that could not get a slot has already failed. */
+        finish_synchronously(base);
         return false;
       }
       slots.push_back(w);
