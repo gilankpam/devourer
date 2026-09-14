@@ -62,7 +62,6 @@ public:
     _send_h2c = std::move(fn);
   }
 
-
   /* Channel/BW register-canary dump for tests/hop_parity_check.sh — the same
    * grep format as the Jaguar1 DumpCanary (BB/MAC/RF[A|B] ADDR = VALUE inside
    * === DEVOURER_DUMP_CANARY === markers). Emitted by both the full and fast

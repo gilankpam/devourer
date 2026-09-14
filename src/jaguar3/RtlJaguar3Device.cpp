@@ -1265,8 +1265,12 @@ RxEnergy RtlJaguar3Device::GetRxEnergy(bool with_nhm) {
  * same tick is the root cause of the transfer-count contamination documented
  * in tests/scout_read_bench.cpp's header.
  *
- * valid_fa reports the batch's own success: a failed group yields an invalid
- * reading rather than zeros that would read as a quiet channel.
+ * valid_fa reports the batches' own success: a failed group yields an invalid
+ * reading rather than zeros that would read as a quiet channel. A failed READ
+ * group additionally suppresses the reset writes entirely — see the bail-out
+ * below for why that is mandatory rather than tidy. Skipping a reset is
+ * harmless: the BB counters keep accumulating, so the next successful call
+ * reports a delta over a wider window than its own dwell.
  *
  * ONE ESCAPE ROUTE valid_fa does NOT cover, so a caller should know: if the
  * transport falls back to IRtlTransport::ctrl_batch's synchronous path (a
@@ -1291,14 +1295,27 @@ RxEnergy RtlJaguar3Device::GetRxEnergyScout() {
       {false, 0x2c08, 0}, {false, 0x2d04, 0}, {false, 0x2d08, 0},
       {false, 0x2d10, 0}, {false, 0x2d20, 0}, {false, 0x2d0c, 0},
       {false, 0x1d2c, 0}, {false, 0x1eb4, 0}};
-  bool ok = _device.ctrl_batch(rd);
+  if (!_device.ctrl_batch(rd)) {
+    /* NEVER compose the reset out of a failed read. ctrl_batch leaves a failed
+     * op's value at the 0 it was constructed with, so composing anyway would
+     * write full dwords of 0x00000000/0x80000000 into 0x1d2c (the RX clock
+     * gate) and 0x02000000/0x00000000 into 0x1eb4 — clobbering every other bit
+     * of two live BB registers and leaving the receiver deaf, permanently,
+     * since the next call would read the corrupted value back and rewrite it.
+     * Dropping the sample costs nothing: the counters keep accumulating and
+     * the next successful call simply reports a wider delta. Pinned by
+     * tests/scout_batch_fail_selftest.cpp, because nothing else can see this —
+     * valid_fa=false only drops the sample, and scout_read_bench's
+     * plausibility tripwire is itself gated on valid_fa. */
+    e.valid_fa = false;
+    return e;
+  }
   const devourer::jgr3::ResetDwords r =
       devourer::jgr3::compose_reset(rd[6].value, rd[7].value);
   std::vector<devourer::CtrlOp> wr = {
       {true, 0x1d2c, r.d1d2c_off}, {true, 0x1eb4, r.d1eb4_on},
       {true, 0x1eb4, r.d1eb4_off}, {true, 0x1d2c, r.d1d2c_on}};
-  ok = _device.ctrl_batch(wr) && ok;
-  e.valid_fa = ok;
+  e.valid_fa = _device.ctrl_batch(wr);
   e.cca_ofdm = (rd[0].value >> 16) & 0xffff;
   e.fa_ofdm = devourer::jgr3::fa_ofdm_sum(rd[1].value, rd[2].value,
                                           rd[3].value, rd[4].value,

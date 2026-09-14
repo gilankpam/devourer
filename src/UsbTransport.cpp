@@ -635,12 +635,13 @@ bool UsbTransport::async_write(uint16_t wvalue, uint16_t windex,
  * kept on USB, and what the brief's sketch got wrong.
  *
  * ONE WAIT PER CHUNK, NOT ONE PER BATCH. The async slot pool is
- * kAsyncWriteDepth = 8 deep, a constant tuned against the ~14k-write bring-up
- * pipeline and deliberately NOT raised for this feature. So a batch is cut
- * into chunks of at most 8 ops, and each chunk pays its own completion wait:
- * the 10-op scout read is TWO chunks and TWO waits, not one. The win is still
- * real (8 host round trips overlap instead of serializing), but quote the
- * real number.
+ * kAsyncWriteDepth = 8 deep and was deliberately NOT raised for this feature.
+ * So a batch is cut into chunks of at most 8 ops and each chunk pays its own
+ * completion wait: the cached fast-retune hop's 9-11 writes are TWO chunks and
+ * TWO waits. (The scout read's two groups — 8 reads, then 4 composed writes —
+ * are one chunk each; its two waits come from the data dependency between
+ * them, not from chunking.) The win is still real, but quote the real
+ * number.
  *
  * THE READ PAYLOAD IS COPIED INSIDE THE WAIT LOOP, right after that op's own
  * `done` is observed — not in a second pass after every wait. Two reasons,
@@ -688,10 +689,44 @@ bool UsbTransport::async_write(uint16_t wvalue, uint16_t windex,
  * pumps libusb here as well.
  * The wait therefore keys on the per-slot `done` flag, which async_write_cb
  * sets regardless of who reaped it; it never assumes "I pumped, so mine
- * finished". The RX-callback-on-our-thread direction is benign for us (it is
- * the RX path's own reentrancy, which it already tolerates from the TX
- * reaper) but it does mean a ctrl_batch call can absorb RX processing time —
- * one more reason the per-call latency numbers are quoted as distributions. */
+ * finished".
+ *
+ * THE RX-CALLBACK-ON-OUR-THREAD DIRECTION IS *NOT* UNCONDITIONALLY BENIGN,
+ * and an earlier revision of this comment said it was. The real constraint:
+ *
+ *   NO WORK REACHABLE FROM THE RX on_data CALLBACK MAY TAKE A LOCK THE
+ *   ctrl_batch CALLER ALREADY HOLDS.
+ *
+ * Both current callers hold RtlJaguar3Device::_reg_mu across the whole group
+ * (GetRxEnergyScout, and FastRetune from the TX path). In the default
+ * RxMode::Async the chain is: caller holds _reg_mu -> ctrl_batch ->
+ * async_wait_progress -> libusb_handle_events -> an RX URB completes ->
+ * on_data. If anything on that path takes _reg_mu, it self-deadlocks on the
+ * SAME thread against a non-recursive mutex. That is not hypothetical
+ * plumbing: cfo_tick() does exactly this, and is live under the shipped
+ * DEVOURER_CFO_TRACK=1 knob (default off, TXBF unarmed, which is the only
+ * reason this is latent). RtlJaguar3Device.cpp already states the matching
+ * rule from the other side — "register I/O CANNOT run on this thread" — and
+ * that rule now binds this function too.
+ *
+ * Benign it is not; what IS true is the cost: a ctrl_batch call can absorb RX
+ * processing time, one more reason the per-call latency numbers are quoted as
+ * distributions rather than a best case.
+ *
+ * KNOWN, DEFERRED (post-merge work, deliberately not fixed on this branch
+ * because it changes the TX path of a live video link and cannot be measured
+ * on the PC rig, which has no RX loop and no real TX load):
+ *   1. tx_async/tx_sync open with flush_writes(), a runtime no-op before this
+ *      branch. Every send landing during a scout or hop now blocks on that
+ *      group's 8-11 transfers (~600 us on the GS). Worse, on the drain's
+ *      timeout branch the TX thread CANCELS the scout's in-flight transfers
+ *      and latches _aw_abandoned, permanently downgrading the session to the
+ *      synchronous path.
+ *   2. _aw_wait_flag now has two concurrent waiters. The "no lost wakeups"
+ *      reasoning at async_wait_progress holds for ONE waiter: a TX thread
+ *      arming its own wait stores 0 while the scout is already blocked inside
+ *      libusb keyed on that same flag, clobbering the scout's wakeup for up
+ *      to 250 ms — a lot against a 5 ms dwell. */
 bool UsbTransport::ctrl_batch(std::vector<CtrlOp> &ops) {
   std::lock_guard<std::mutex> lk(_batch_mu);
   if (ops.empty())
@@ -1353,6 +1388,17 @@ void UsbTransport::quiesce_tx() {
   }
 }
 
+/* NOTE (2026-09-15, batched-EP0 branch): the flush_writes() that opens this
+ * and tx_sync used to be a runtime no-op — nothing was ever pipelined outside
+ * bring-up. Now a scout read or a cached hop can be in flight, so a send
+ * landing in that window blocks on that group's 8-11 control transfers
+ * (~600 us on the GS), and if the drain times out THIS thread cancels the
+ * scout's in-flight transfers and latches _aw_abandoned for the rest of the
+ * session. Known and DEFERRED, not overlooked: containing it changes the TX
+ * path of a live video link and is unmeasurable on a bench rig with no RX loop
+ * and no real TX load. See the KNOWN, DEFERRED note on ctrl_batch, which also
+ * covers this thread's second interaction with a scout — the shared
+ * _aw_wait_flag. */
 bool UsbTransport::tx_async(uint8_t tx_ep, uint8_t *packet, size_t length,
                             unsigned timeout_ms) {
   flush_writes();

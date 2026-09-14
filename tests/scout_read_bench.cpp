@@ -1,7 +1,10 @@
 // scout_read_bench.cpp — transfer-count, latency, and on-hardware reset
 // verification for IRtlDevice::GetRxEnergyScout() vs the full
-// GetRxEnergy(false), the evidence for the "~6 reads instead of ~24"
-// channel-scout claim (mabur 2026-09-14 spec §6). Same open sequence as
+// GetRxEnergy(false), the evidence for the "far fewer reads than the full
+// read" channel-scout claim (mabur 2026-09-14 spec §6). The SHIPPING scout is
+// 8 reads + 4 writes = 12 transfers; the "~6 reads" of the original plan
+// described the shadowed form that was deleted in ef4fa04. Same open sequence
+// as
 // tests/reglat.cpp (USB vid/pid, DEVOURER_VID/DEVOURER_PID env), but
 // GetRxEnergyScout is an IRtlDevice method, not a bare register op, so
 // bring-up runs InitWrite first via WiFiDriver::CreateRtlDevice — the
@@ -86,6 +89,16 @@
 // independent process invocations x 3 runs x 200 calls/function = 12 runs
 // per function total):
 //
+// >>> SUPERSEDED — this whole "MEASURED 2026-09-15" block describes the A1
+// >>> scout, which cached 0x1d2c/0x1eb4 behind a shadow and so read 6
+// >>> registers for 10 transfers/call. That form was DELETED (ef4fa04). The
+// >>> shipping scout reads 8 registers for 12 transfers/call. Everything
+// >>> below about the coex-tick contamination mechanism, the per-transfer
+// >>> cost and the reset verification still holds; only the 10/6 figures and
+// >>> the "this is the number to quote" headline are stale. The correct
+// >>> current numbers are in the TASK A2 block further down. Kept rather than
+// >>> rewritten because it is the provenance of the A1 measurement.
+//
 // FLOOR (the attributable per-call cost): GetRxEnergyScout 10 xfers/call
 // (6 reads + 4 composed full-dword writes) — GetRxEnergy(false) 24
 // xfers/call (8 reads + 8 MASKED writes, each a read-modify-write = 2
@@ -160,6 +173,11 @@
 // per-run medians and the 9 per-run minima; single best cases are not quoted.
 //
 // --- GROUND STATION (RK3566 aarch64, 8822EU, the deployment target) ---
+// READ EVERY NUMBER BELOW AS A FLOOR. This bench never calls StartRxLoop, so
+// there were no RX URBs on the libusb context to reap. In production the scout
+// and hop threads pump that same context from inside async_wait_progress, so
+// they will absorb RX frame parsing under live traffic. The hop's worst case
+// under 60 fps RX is UNMEASURED. That applies to the 5.6x headline too.
 //                      unbatched (med)    batched (med)      change
 //   scout, 10 ops      2829 us            588 us             -2.24 ms, 4.8x
 //   (shadowed form,    (2497..3055)       (501..748)
@@ -188,15 +206,22 @@
 // per-transfer cost; what is left is a per-WAIT cost that is essentially the
 // same ~290 us as one synchronous transfer.
 //
-// FOLLOW-UP LEVER, measured but NOT taken here: because the surviving term is
-// per-wait and kAsyncWriteDepth is 8, the 10-op scout is two chunks and pays
-// ~290 us twice. A pool of >= 10 would make it ONE wait: ~290 + ~100 = ~390
-// us, another ~34% off — and the shipping 12-op scout is the same two chunks,
-// so it would go ~600 -> ~390 us too. NOTE the 8 is a FLOOR, not an optimum:
-// the InitWrite source comment it came from says "depth >= 8". It was left
-// alone here as a SCOPE decision, not a disagreement — it sits on InitWrite's
-// proven ~14k-write bring-up pipeline and would need bring-up-time validation
-// on hardware before it could ship. That is the obvious next measurement.
+// FOLLOW-UP LEVER, measured but NOT taken here, AND IT IS NOT THE SCOUT.
+// Because the surviving term is per-wait and kAsyncWriteDepth is 8, any group
+// that splits across two chunks pays ~290 us for nothing. The group that
+// actually does is the cached FAST-RETUNE HOP: 9-11 writes in one ctrl_batch,
+// two chunks at depth 8, so a depth >= 11 makes it one wait — ~290 us off a
+// live channel change, which is the more valuable target anyway.
+// It does NOT help the shipping scout: that is two DEPENDENT ctrl_batch calls
+// (8 reads, then 4 writes composed from two of those reads), each already a
+// single chunk. Its two waits are a data dependency, so no pool depth can fold
+// them. (An earlier revision of this note claimed depth >= 12 would take the
+// scout ~603 -> ~390 us. That was arithmetic left over from the pre-ef4fa04
+// single 10-op group and is wrong — recorded here so it is not re-derived.)
+// NOTE the 8 is a FLOOR, not an optimum: the InitWrite source comment it came
+// from says "depth >= 8". Left alone as a SCOPE decision — it sits on
+// InitWrite's proven ~14k-write bring-up pipeline and would need bring-up-time
+// validation on hardware before it could ship.
 //
 // --- PC BENCH HOST (x86 xHCI, 8822EU on bus 5-1) ---
 //   scout 10 ops (shadowed, since deleted): 3750 us batched, 3750 unbatched.

@@ -1034,6 +1034,15 @@ add_executable(CtrlBatchSelftest tests/ctrl_batch_selftest.cpp)
 target_link_libraries(CtrlBatchSelftest PRIVATE devourer)
 add_test(NAME ctrl_batch_semantics COMMAND CtrlBatchSelftest)
 
+# Headless guard for the ONE silent-corruption path on the batched scout read:
+# GetRxEnergyScout must not compose its 0x1d2c/0x1eb4 BB reset out of a FAILED
+# read. Unlike ctrl_batch_semantics this drives the real RtlJaguar3Device over
+# a fake transport, because the bug is at that level and has no observable
+# symptom short of a permanently deaf receiver.
+add_executable(ScoutBatchFailSelftest tests/scout_batch_fail_selftest.cpp)
+target_link_libraries(ScoutBatchFailSelftest PRIVATE devourer)
+add_test(NAME scout_batch_fail COMMAND ScoutBatchFailSelftest)
+
 # Headless guard for the adapter-health classifier + EFUSE-stability probe
 # loop (src/AdapterHealth.h) — the verdict mapping behind examples/doctor,
 # with cases encoding the verdicts measured on a real dying unit vs its

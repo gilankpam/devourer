@@ -29,6 +29,16 @@
  *      write group is a sequence the chip needs finished (a 3-wire bracket
  *      left open, a BB reset left asserted), so bailing out halfway is worse
  *      than finishing and reporting.
+ *
+ * ONE DELIBERATE DIVERGENCE, so case 2's "every op still ran" is not read as
+ * a universal: clause 4 as written is what the SYNCHRONOUS default owes, and
+ * that is what this file pins. UsbTransport::ctrl_batch attempts every op but
+ * genuinely skips two classes — an op whose libusb_submit_transfer failed,
+ * and the rest of a chunk after a completion wait gave up — because there is
+ * no way to issue them. It still runs every LATER chunk, still finishes the
+ * remainder synchronously if the pool dies, and still returns false. That is
+ * intended: "attempted, and any failure reported" is the portable clause,
+ * "executed" is the default's stronger guarantee.
  */
 #include <cstdio>
 #include <cstdlib>

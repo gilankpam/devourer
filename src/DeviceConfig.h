@@ -548,8 +548,10 @@ struct DeviceConfig {
      *     either way, and the pre-existing bring-up write pipeline is no
      *     better there either. That host overlaps nothing on EP0.
      * Default ON for the target; =0 to A/B it. Numbers, the cost model and
-     * the follow-up lever (kAsyncWriteDepth >= 10 would make the scout one
-     * wait instead of two) are in tests/scout_read_bench.cpp's header. */
+     * the follow-up lever (kAsyncWriteDepth >= 11 would make the cached hop's
+     * 9-11 writes one wait instead of two; it cannot help the scout, whose
+     * two waits are a data dependency) are in tests/scout_read_bench.cpp's
+     * header. */
     bool ctrl_batch = true;
   } usb;
 
