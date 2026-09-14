@@ -62,27 +62,6 @@ public:
     _send_h2c = std::move(fn);
   }
 
-  /* Scout-shadow invalidation hook: RtlJaguar3Device's GetRxEnergyScout
-   * caches 0x1d2c/0x1eb4 shadows, and this class has no handle back to that
-   * device (same seam as set_h2c_sender above, injected for the same
-   * reason). Fired from the fw fast-retune branch only — the firmware
-   * performs the channel switch inside the chip, so nothing on the host
-   * side can prove which registers besides RF18 it leaves touched, and
-   * treating the scout shadow as trustworthy after that would be exactly
-   * the hazard _cw_primed=false guards against a line below. Unset = no-op
-   * (mirrors _send_h2c unset making the fw path inert).
-   *
-   * CALLING CONSTRAINT: invoked from inside fast_retune with FastRetune's
-   * _reg_mu already held (RtlJaguar3Device.cpp), so the installed callback
-   * must not itself try to take that lock — today's callback
-   * (`_scout_primed = false`) is a bare field write and does not, but a
-   * future hook that calls back into anything _reg_mu-guarded will
-   * deadlock. Only one device ever installs this (a single constructor,
-   * `_radioManagement` a by-value member) so the callback also never
-   * outlives `this` or needs to be unset on a live device. */
-  void set_scout_invalidate_hook(std::function<void()> fn) {
-    _invalidate_scout = std::move(fn);
-  }
 
   /* Channel/BW register-canary dump for tests/hop_parity_check.sh — the same
    * grep format as the Jaguar1 DumpCanary (BB/MAC/RF[A|B] ADDR = VALUE inside
@@ -244,9 +223,6 @@ private:
   std::function<void(uint32_t, uint32_t)> _send_h2c;
   uint8_t _fw_sw_pending = 0;
   bool fw_switch_confirm();
-  /* Device-installed scout-shadow invalidation callback; see
-   * set_scout_invalidate_hook above. */
-  std::function<void()> _invalidate_scout;
   /* BW-keyed RXBB state, re-asserted on the first fast hop of each epoch:
    * the init-time halrf calibration rewrites it after the channel set
    * (hardware-observed on the 8812EU — IQK clears the 40 MHz TX_CCK_IND bit

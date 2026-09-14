@@ -130,6 +130,14 @@ private:
     int status;
     int actual;
   };
+  /* 8 is a FLOOR, not an optimum: the InitWrite measurement this came from
+   * reads "depth >= 8". It also caps a ctrl_batch chunk, and on the RK3566
+   * ground station the cost model is ~290 us per completion WAIT against only
+   * ~7-16 us per op — so the 12-op scout read pays that ~290 us twice for
+   * nothing, and a depth >= 12 would fold it into one wait (measured basis
+   * and the expected ~590 -> ~390 us in tests/scout_read_bench.cpp's header).
+   * NOT raised here: it is on InitWrite's proven ~14k-write bring-up path and
+   * needs bring-up-time validation on hardware first. */
   static constexpr int kAsyncWriteDepth = 8;
   /* Extra event-loop turns spent reaping cancellations after a drain times
    * out. A live loop reports each cancellation promptly; a dead one fails

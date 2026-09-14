@@ -52,10 +52,6 @@ RtlJaguar3Device::RtlJaguar3Device(RtlAdapter device, Logger_t logger,
    * callers serialize on _reg_mu). */
   _radioManagement.set_h2c_sender(
       [this](uint32_t msg, uint32_t ext) { _hal.send_h2c_raw(msg, ext); });
-  /* GetRxEnergyScout's 0x1d2c/0x1eb4 shadow: RadioManagementJaguar3 has no
-   * handle back here, so it fires this hook instead — see
-   * set_scout_invalidate_hook's doc comment. */
-  _radioManagement.set_scout_invalidate_hook([this] { _scout_primed = false; });
   _logger->info("RtlJaguar3Device constructed ({})",
                 variant == jaguar3::ChipVariant::C8822E ? "8822E/EU" : "8822C/CU");
 }
@@ -738,17 +734,6 @@ void RtlJaguar3Device::Stop() {
 }
 
 void RtlJaguar3Device::InitWrite(SelectedChannel channel) {
-  /* Invalidate FIRST, unconditionally, before anything below can throw or
-   * touch the BB: nothing can scout during bring-up (no caller holds a
-   * device reference yet that isn't this constructor call), and setting it
-   * here covers every exit — the cw_tone early return, the throw at the
-   * ACK-responder check below, and the normal end — with one store instead
-   * of three, none of them reachable by a path that skips it. (A prior
-   * version set this at each exit point; the ACK-responder throw sits
-   * AFTER the BB phy_reg table rewrites 0x1D2C/0x1EB4, so that ordering
-   * missed the store on the throw path. Moving it to entry removes the
-   * question entirely — see the field's declaration in the header.) */
-  _scout_primed = false;
   _channel = channel;
   /* Concurrent TX+RX intent (DEVOURER_TX_WITH_RX / a later StartRxLoop on this
    * bring-up): enable the RX path at the same point in the sequence Init does
@@ -1120,9 +1105,6 @@ void RtlJaguar3Device::StartContinuousTx(const devourer::TxMode &mode) {
   _device.phy_set_bb_reg(0x1e70, 0xf, 0x4);        /* TX OFDM on */
 
   _cont_active = true;
-  /* 0x1eb4's packet_count field (above, masked write) dirties the low 20
-   * bits of the cached scout shadow outside its knowledge — re-prime. */
-  _scout_primed = false;
   _logger->info("Modulated continuous TX armed @ ch{} (Jaguar3 PMAC 6M HW "
                 "100%%-duty carrier; idle-hold, StopContinuousTx to end)",
                 _channel.Channel);
@@ -1148,16 +1130,6 @@ void RtlJaguar3Device::StopContinuousTx() {
   _device.phy_set_bb_reg(0x1a04, 0xf0000000, _cont_ccktx); /* restore CCK Tx */
 
   _cont_active = false;
-  /* StopContinuousTx itself touches none of 0x1c90/0x1830/0x4130/0xc30/
-   * 0x808/0x0/0x1d2c/0x1eb4 (it writes 0x1d0c/0x1d58/0x1a14/0x1a04/0x1e70/
-   * 0x1d08/0x522 only) — this is NOT a traced hazard the way
-   * StartContinuousTx's packet_count write is. It is deliberate
-   * belt-and-braces symmetry: continuous TX is a debug/bench facility, so
-   * the 2-read re-prime this costs the next scout call is cheap insurance
-   * against the BB reset pulse at 0x1d0c[16] above turning out to disturb
-   * 0x1eb4 in some case not currently traced, rather than a claim that it
-   * does. */
-  _scout_primed = false;
   _logger->info("Modulated continuous TX stopped — chip restored");
 }
 
@@ -1241,106 +1213,72 @@ RxEnergy RtlJaguar3Device::GetRxEnergy(bool with_nhm) {
 }
 
 /* Minimal frame-free OFDM FA + CCA read for the in-session channel scout
- * (mabur 2026-09-14 spec §6). 6 reads (0x2c08 + the five FA words) and the
- * 4-write OFDM counter reset composed from cached shadows of 0x1d2c/0x1eb4
- * (primed with 2 reads once, invalidated on the paths documented at the
- * shadow fields' declaration). Fills ONLY valid_fa/fa_ofdm/cca_ofdm —
- * cca_cck, fa_cck, igi/valid_igi, NHM and the noise floor are left
- * invalid/zero, and valid_cck is left at its default false: the scout
- * deliberately skips the CCK 0x1a2c reset toggles (they cost 4 more masked
- * writes for a counter this caller never asked for), so cca_cck/fa_cck
- * here are zero with NO reset behind that zero, not a real reading — see
- * RxEnergy::valid_cck (RxSense.h) for the full contract. The two in-repo
- * consumers that fold the CCK half into an occupancy estimate,
+ * (mabur 2026-09-14 spec §6). ONE batched group of 12 EP0 transfers: 8 reads
+ * (0x2c08, the five OFDM FA words, and 0x1d2c/0x1eb4) followed by the 4-write
+ * OFDM counter reset composed in memory from the two dwords just read.
+ * Composed full-dword writes, never phy_set_bb_reg — masked BB writes on JGR3
+ * have the double-shift gotcha (jaguar3/CLAUDE.md) and cost a read-modify-
+ * write each. Batched: see IRtlTransport::ctrl_batch.
+ *
+ * The reset dwords are read FRESH every call. An earlier revision cached them
+ * behind a primed shadow to save those 2 reads; once the group was batched
+ * the saving fell inside run-to-run noise on the ground station (+15 us on a
+ * ~590 us call, with per-run ratios spanning both signs), so the cache and
+ * its five hand-maintained invalidation points — one of them a firmware
+ * branch that cannot be audited from the host at all — were deleted rather
+ * than maintained. tests/scout_read_bench.cpp's header carries the numbers.
+ *
+ * Fills ONLY valid_fa/fa_ofdm/cca_ofdm — cca_cck, fa_cck, igi/valid_igi, NHM
+ * and the noise floor are left invalid/zero, and valid_cck is left at its
+ * default false: the scout deliberately skips the CCK 0x1a2c reset toggles
+ * (4 more masked writes for a counter this caller never asked for), so
+ * cca_cck/fa_cck here are zero with NO reset behind that zero, not a real
+ * reading — see RxEnergy::valid_cck (RxSense.h) for the full contract. The
+ * two in-repo consumers that fold the CCK half into an occupancy estimate,
  * src/chanmig/EvidenceStore.h and src/hopset/HopsetSense.h, gate on
- * valid_cck for exactly this reason — a caller landing here should do the
- * same rather than read cca_cck/fa_cck directly. Which register actually
- * owns clearing 0x2c08's CCK half (the 0x1a2c toggles, 0x1eb4[25], or
- * both) remains unverified — in both GetRxEnergy and
- * PhydmRuntimeJaguar3::fa_stats() the 0x1a2c toggles and the 0x1eb4[25]
- * reset always run together — but that no longer matters for correctness
- * now that valid_cck makes the caller's obligation explicit instead of
- * resting on an inferred mechanism. 0x1eb4[25] also clears the NHM
- * counters, but the scout never arms an NHM window so that is moot.
+ * valid_cck for exactly this reason. Which register actually owns clearing
+ * 0x2c08's CCK half (the 0x1a2c toggles, 0x1eb4[25], or both) remains
+ * unverified — in both GetRxEnergy and PhydmRuntimeJaguar3::fa_stats() the
+ * 0x1a2c toggles and the 0x1eb4[25] reset always run together — but that
+ * does not affect correctness now that valid_cck makes the caller's
+ * obligation explicit. 0x1eb4[25] also clears the NHM counters; the scout
+ * never arms an NHM window, so that is moot.
  *
  * The OFDM FA/CCA delta is shared with PhydmRuntimeJaguar3::fa_stats() (the
  * coex thread's periodic ~2 s tick performs the identical 0x1d2c/0x1eb4
  * reset under this same _reg_mu, consuming whatever accumulated since the
- * last reset from either source) — pre-existing sharing (GetRxEnergy has
- * it too), not something this path can fix; a caller reading a
- * suspiciously-small delta right after a coex tick is seeing that, not a
- * scout bug. The same tick is also the root cause of the transfer-count
- * contamination documented in tests/scout_read_bench.cpp's header: the
- * tick's own fa_statistics_and_reset() (8 reads + 8 masked writes, ~24
- * transfers by itself) plus its other register/H2C work all run under
- * _reg_mu, so a bench call that blocks waiting for that lock has the
- * tick's transfers folded into ITS usb_ctrl_xfers() delta once it
- * finally runs — see the bench for the fix (per-call bracketing).
+ * last reset from either source) — pre-existing sharing (GetRxEnergy has it
+ * too), not something this path can fix; a caller reading a suspiciously
+ * small delta right after a coex tick is seeing that, not a scout bug. The
+ * same tick is the root cause of the transfer-count contamination documented
+ * in tests/scout_read_bench.cpp's header.
+ *
+ * valid_fa reports the batch's own success: a failed group yields an invalid
+ * reading rather than zeros that would read as a quiet channel.
  *
  * Under _reg_mu like every register access here. */
 RxEnergy RtlJaguar3Device::GetRxEnergyScout() {
   std::lock_guard<std::mutex> lk(_reg_mu);
-  return scout_energy_locked(/*use_shadow=*/true);
-}
-
-/* The body of GetRxEnergyScout, parameterised on the one thing that is still
- * an open design question (P10, mabur 2026-09-14): whether the cached
- * 0x1d2c/0x1eb4 shadow is worth its coherence protocol now that the transfers
- * are batched.
- *
- *   use_shadow = true  (production): 10 ops in ONE ctrl_batch — 6 reads, then
- *     the 4 reset writes composed from the shadow. At kAsyncWriteDepth = 8
- *     that is two chunks and TWO completion waits, not one.
- *   use_shadow = false (bench only, DebugScoutShadowless): no shadow at all —
- *     batch #1 is 8 reads (the 6 counters PLUS 0x1d2c and 0x1eb4, one chunk,
- *     one wait), then the reset is composed from what was just read and
- *     written as batch #2 (4 ops, one chunk, one wait). 12 transfers, still
- *     two waits. Unbatched the shadow saved 2 of 12 transfers (~18 % of a
- *     4.4 ms call) and paid for itself; batched, both variants cost the same
- *     TWO waits, so the question is only what 2 extra pipelined transfers
- *     cost inside a chunk. Measured by tests/scout_read_bench — see the
- *     numbers in that file's header.
- *
- * The shadowless variant is also, incidentally, immune to every one of the
- * five invalidation points the shadow needs (it re-reads the truth each
- * call), including the firmware fast-retune one that cannot be audited from
- * the host at all. */
-RxEnergy RtlJaguar3Device::scout_energy_locked(bool use_shadow) {
   RxEnergy e;
-  std::vector<devourer::CtrlOp> ops;
-  if (use_shadow) {
-    if (!_scout_primed) {
-      _scout_1d2c = _device.rtw_read<uint32_t>(0x1d2c);
-      _scout_1eb4 = _device.rtw_read<uint32_t>(0x1eb4);
-      _scout_primed = true;
-    }
-    const devourer::jgr3::ResetDwords r =
-        devourer::jgr3::compose_reset(_scout_1d2c, _scout_1eb4);
-    /* Reads first, then the reset: the batch runs in submission order, so the
-     * counters are sampled before they are cleared exactly as in the
-     * unbatched sequence. */
-    ops = {{false, 0x2c08, 0}, {false, 0x2d04, 0}, {false, 0x2d08, 0},
-           {false, 0x2d10, 0}, {false, 0x2d20, 0}, {false, 0x2d0c, 0},
-           {true, 0x1d2c, r.d1d2c_off}, {true, 0x1eb4, r.d1eb4_on},
-           {true, 0x1eb4, r.d1eb4_off}, {true, 0x1d2c, r.d1d2c_on}};
-    e.valid_fa = _device.ctrl_batch(ops);
-  } else {
-    ops = {{false, 0x2c08, 0}, {false, 0x2d04, 0}, {false, 0x2d08, 0},
-           {false, 0x2d10, 0}, {false, 0x2d20, 0}, {false, 0x2d0c, 0},
-           {false, 0x1d2c, 0}, {false, 0x1eb4, 0}};
-    bool ok = _device.ctrl_batch(ops);
-    const devourer::jgr3::ResetDwords r =
-        devourer::jgr3::compose_reset(ops[6].value, ops[7].value);
-    std::vector<devourer::CtrlOp> wr = {
-        {true, 0x1d2c, r.d1d2c_off}, {true, 0x1eb4, r.d1eb4_on},
-        {true, 0x1eb4, r.d1eb4_off}, {true, 0x1d2c, r.d1d2c_on}};
-    ok = _device.ctrl_batch(wr) && ok;
-    e.valid_fa = ok;
-  }
-  e.cca_ofdm = (ops[0].value >> 16) & 0xffff;
-  e.fa_ofdm = devourer::jgr3::fa_ofdm_sum(ops[1].value, ops[2].value,
-                                          ops[3].value, ops[4].value,
-                                          ops[5].value);
+  /* Reads first, then the reset: the batch runs in submission order, so the
+   * counters are sampled before they are cleared, and 0x1d2c/0x1eb4 are read
+   * before the dwords composed from them are written back. */
+  std::vector<devourer::CtrlOp> rd = {
+      {false, 0x2c08, 0}, {false, 0x2d04, 0}, {false, 0x2d08, 0},
+      {false, 0x2d10, 0}, {false, 0x2d20, 0}, {false, 0x2d0c, 0},
+      {false, 0x1d2c, 0}, {false, 0x1eb4, 0}};
+  bool ok = _device.ctrl_batch(rd);
+  const devourer::jgr3::ResetDwords r =
+      devourer::jgr3::compose_reset(rd[6].value, rd[7].value);
+  std::vector<devourer::CtrlOp> wr = {
+      {true, 0x1d2c, r.d1d2c_off}, {true, 0x1eb4, r.d1eb4_on},
+      {true, 0x1eb4, r.d1eb4_off}, {true, 0x1d2c, r.d1d2c_on}};
+  ok = _device.ctrl_batch(wr) && ok;
+  e.valid_fa = ok;
+  e.cca_ofdm = (rd[0].value >> 16) & 0xffff;
+  e.fa_ofdm = devourer::jgr3::fa_ofdm_sum(rd[1].value, rd[2].value,
+                                          rd[3].value, rd[4].value,
+                                          rd[5].value);
   return e;
 }
 
@@ -1831,21 +1769,6 @@ devourer::LaResult RtlJaguar3Device::la_capture(const devourer::LaParams &p) {
   /* Serialize against the coex runtime tick like every register-touching
    * entry point. */
   std::lock_guard<std::mutex> lk(_reg_mu);
-  /* Invalidate BEFORE the risky call, not after: LaCapture::setup_bb
-   * touches 0x1eb4[23] (kJ3RptUpdate) on the JGR3 dialect, and
-   * LaCapture::restore() (LaCapture.cpp) always runs on every reachable
-   * RETURN of run() that touched a register (the only path that skips it
-   * is the top-of-function _wedged early return, before snapshot() —
-   * nothing touched yet) and writes back the exact pre-capture dword
-   * under this same _reg_mu — so a normal return leaves the live register
-   * byte-identical to its pre-capture state, making this invalidation
-   * belt-and-braces against a future LaCapture change silently breaking
-   * that invariant. But a THROW out of run() (same shape as InitWrite's
-   * ACK-responder throw above) unwinds past restore() entirely, and an
-   * invalidation placed after the call would unwind past it too — so it
-   * goes before, at the cost of one re-prime on the ordinary case where
-   * run() doesn't touch anything requiring it. */
-  _scout_primed = false;
   return _la->run(p);
 }
 

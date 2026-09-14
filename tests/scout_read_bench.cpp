@@ -162,9 +162,11 @@
 // --- GROUND STATION (RK3566 aarch64, 8822EU, the deployment target) ---
 //                      unbatched (med)    batched (med)      change
 //   scout, 10 ops      2829 us            588 us             -2.24 ms, 4.8x
-//                      (2497..3055)       (501..748)
-//   scout shadowless   3372 us            603 us
-//     12 ops           (3002..3748)       (571..648)
+//   (shadowed form,    (2497..3055)       (501..748)
+//    since deleted)
+//   scout, 12 ops      3372 us            603 us             -2.77 ms, 5.6x
+//   (SHIPPING form,    (3002..3748)       (571..648)
+//    no shadow)
 //   GetRxEnergy(false) 6612 us            7444 us   <- NOT batched; unchanged
 //     24 ops, control  (5623..7592)       (6953..8368)  within run-to-run noise
 //
@@ -189,14 +191,18 @@
 // FOLLOW-UP LEVER, measured but NOT taken here: because the surviving term is
 // per-wait and kAsyncWriteDepth is 8, the 10-op scout is two chunks and pays
 // ~290 us twice. A pool of >= 10 would make it ONE wait: ~290 + ~100 = ~390
-// us, another ~34% off. kAsyncWriteDepth was tuned for the ~14k-write
-// bring-up pipeline and was deliberately left alone in this task; raising it
-// is the obvious next measurement.
+// us, another ~34% off — and the shipping 12-op scout is the same two chunks,
+// so it would go ~600 -> ~390 us too. NOTE the 8 is a FLOOR, not an optimum:
+// the InitWrite source comment it came from says "depth >= 8". It was left
+// alone here as a SCOPE decision, not a disagreement — it sits on InitWrite's
+// proven ~14k-write bring-up pipeline and would need bring-up-time validation
+// on hardware before it could ship. That is the obvious next measurement.
 //
 // --- PC BENCH HOST (x86 xHCI, 8822EU on bus 5-1) ---
-//   scout 10 ops: 3750 us batched, 3750 us unbatched. Shadowless 12 ops: 4500
-//   both ways. Full read 24 ops: 9000 both ways. Per-run medians were those
-//   exact values in every one of 9 runs per function per mode.
+//   scout 10 ops (shadowed, since deleted): 3750 us batched, 3750 unbatched.
+//   scout 12 ops (shipping, shadowless): 4500 both ways. Full read 24 ops:
+//   9000 both ways. Per-run medians were those exact values in every one of
+//   9 runs per function per mode.
 // Every number is EXACTLY 375.0 us x transfer count in BOTH modes: this host
 // overlaps nothing, so the batch buys precisely zero. The same is true of the
 // pre-existing bring-up write pipeline here (init.timing j3init.total 4736 ms
@@ -209,21 +215,25 @@
 // judged. It remains a useful correctness rig (see the corruption story
 // below, which it could not have caught).
 //
-// --- P10: IS THE CACHED 0x1d2c/0x1eb4 SHADOW STILL WORTH IT? ---
-// On the GS, batched, the shadowless variant's penalty depends on which
-// statistic you use, and the honest answer is that it straddles the 5%
-// decision rule:
-//   per-run medians (mean 588 -> 603):  +2.4%   } within 5%
+// --- P10, SETTLED: THE CACHED 0x1d2c/0x1eb4 SHADOW WAS DELETED ---
+// The scout used to cache the two reset dwords behind a primed shadow, making
+// the call 10 transfers instead of 12. Measured head to head on the GS, both
+// batched, 9 runs each, the shadowless form cost:
+//   per-run medians (mean 588 -> 603):  +2.4%   } inside the 5% rule
 //   median of the per-run medians:      +1.5%   }
-//   per-run minima  (mean 456 -> 488):  +7.1%   } outside 5%
+//   per-run minima  (mean 456 -> 488):  +7.1%   } outside it
 //   median of the per-run minima:       +9.6%   }
-// Individual per-run ratios ranged -16.5% to +24.3% — the difference is at or
-// near this host's measurement resolution, which is itself the finding. In
-// absolute terms the shadow saves 15-45 us on a ~590 us call; unbatched it
-// saved ~550 us on a ~2.8 ms call (+19-23%), which is why it was built.
-// For contrast, on the PC the shadowless penalty is a flat +20.0% in 9 of 9
-// runs with zero variance — because there the 2 extra transfers cost their
-// full 375 us each. If the PC were the target, the shadow would clearly stay.
+// and individual per-run ratios ran -16.5% to +24.3% — shadowless was
+// sometimes FASTER, i.e. the difference is not measurable at this sample
+// size. Unbatched the shadow had saved ~550 us on a 2.8 ms call (+19-23%),
+// which is why it existed; batched it saves 15-45 us on a ~590 us call. Its
+// price was a hand-maintained coherence protocol with FIVE invalidation
+// points, one of them a firmware branch unauditable from the host. Deleted
+// 2026-09-15: the reset dwords are read fresh inside the same batch. The
+// numbers above are kept because they are the evidence for that deletion.
+// (For contrast, on the PC host the shadowless penalty was a flat +20.0% in
+// 9 of 9 runs with zero variance, since there each extra transfer costs its
+// full 375 us. Had the PC been the target, the shadow would have stayed.)
 //
 // --- A SILENT DATA-CORRUPTION BUG THE PC RIG COULD NOT SEE ---
 // The first GS run of the batched path returned fa_ofdm in the tens of
@@ -493,25 +503,11 @@ int main() {
 
   constexpr int kCalls = 200;
   constexpr int kRuns = 3;
-  std::vector<RunResult> scout_runs, full_runs, noshadow_runs;
+  std::vector<RunResult> scout_runs, full_runs;
   for (int run = 1; run <= kRuns; ++run) {
     RunResult rs = bench_run([dev] { return dev->GetRxEnergyScout(); }, kCalls);
     print_run("GetRxEnergyScout", run, kRuns, kCalls, rs);
     scout_runs.push_back(rs);
-    /* P10 A/B: the SAME read with no cached 0x1d2c/0x1eb4 shadow — 12
-     * transfers instead of 10, but (at kAsyncWriteDepth = 8) still two
-     * completion waits, so this measures what the shadow's whole
-     * five-invalidation-point coherence protocol actually buys once the
-     * transfers are batched. Interleaved with the shadowed run inside the
-     * same loop iteration on purpose: the coex tick's ~2 s cadence and any
-     * slow drift in the RF environment then hit both variants alike, which a
-     * back-to-back "all of A, then all of B" layout would not guarantee. */
-    if (j3) {
-      RunResult rn =
-          bench_run([j3] { return j3->DebugScoutShadowless(); }, kCalls);
-      print_run("ScoutShadowless(P10)", run, kRuns, kCalls, rn);
-      noshadow_runs.push_back(rn);
-    }
     RunResult rf = bench_run(
         [dev] { return dev->GetRxEnergy(/*with_nhm=*/false); }, kCalls);
     print_run("GetRxEnergy(false)", run, kRuns, kCalls, rf);
@@ -562,7 +558,7 @@ int main() {
         mean_min, mean_max);
   };
   int implausible = 0;
-  for (const auto *v : {&scout_runs, &noshadow_runs, &full_runs})
+  for (const auto *v : {&scout_runs, &full_runs})
     for (const auto &r : *v)
       implausible += r.n_implausible;
   std::printf("counter plausibility: %s (%d call(s) over the %u bound across "
@@ -572,32 +568,7 @@ int main() {
               implausible, kImplausibleCount);
 
   summarize_runs("GetRxEnergyScout", scout_runs);
-  if (!noshadow_runs.empty())
-    summarize_runs("ScoutShadowless(P10)", noshadow_runs);
   summarize_runs("GetRxEnergy(false)", full_runs);
-
-  /* P10 verdict input: the per-run MEDIAN latency of each variant, and the
-   * shadowless penalty as a percentage. Medians, not minima — the decision
-   * rule is about what a scout dwell typically costs, and the minimum hides
-   * the tail that the ladder actually lives in. Both the best and the worst
-   * run-pair ratio are printed: quoting only the favourable one is exactly
-   * the habit the operator's standing rule forbids. */
-  if (!noshadow_runs.empty()) {
-    double best = 1e9, worst = -1e9;
-    std::printf("P10 shadow A/B (per-run medians, us): ");
-    for (size_t i = 0; i < scout_runs.size() && i < noshadow_runs.size(); ++i) {
-      const double a = scout_runs[i].us.med, b = noshadow_runs[i].us.med;
-      const double pct = (b - a) / a * 100.0;
-      best = std::min(best, pct);
-      worst = std::max(worst, pct);
-      std::printf("[run %zu shadowed %.0f vs shadowless %.0f = %+.1f%%] ",
-                  i + 1, a, b, pct);
-    }
-    std::printf("\nP10 shadowless penalty across runs: %+.1f%% .. %+.1f%% "
-                "(decision rule: within ~5%% => the shadow's coherence "
-                "protocol is no longer paying for itself)\n",
-                best, worst);
-  }
 
   return 0;
 }
