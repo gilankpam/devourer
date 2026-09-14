@@ -7,15 +7,30 @@
 // WiFiDriver::CreateRtlDevice — the doctor demo's open path, trimmed to a
 // single chip with no CLI.
 //
-//   sudo ./build/scout_read_bench                 (DEVOURER_PID/VID pick the
+//   DEVOURER_PID=0xa81a ./build/scout_read_bench  (DEVOURER_VID/PID pick the
 //                                                   adapter; DEVOURER_CHANNEL
 //                                                   picks the bring-up
-//                                                   channel, default 6)
+//                                                   channel, default 6; no
+//                                                   sudo needed when the USB
+//                                                   device node is world-rw
+//                                                   and no kernel driver is
+//                                                   bound)
 //
-// Expected (UNVERIFIED on this host — no Realtek card attached; run on a
-// rig with an 8822C/E and record the numbers): GetRxEnergyScout ~14
-// transfers/call (16 on the first, un-primed call) vs GetRxEnergy(false)
-// ~24, and a proportional latency drop.
+// Measured 2026-09-14 (spare 8822EU, USB bus 5-1, 200 calls each, after
+// InitWrite ch6): GetRxEnergyScout 10.0 xfers/call (6 reads + 4 composed
+// full-dword writes — no first-call prime spike visible at this N), us
+// min/med/mean/max 3553/3750/3763/4444; GetRxEnergy(false) 24.0 xfers/call
+// (8 reads + 8 MASKED writes, each a read-modify-write = 2 transfers), us
+// 8793/9000/9020/9352. Implied per-transfer cost is self-consistent between
+// the two rows (~370-375 us/xfer on this rig's USB path), which is the
+// sanity check that usb_ctrl_xfers() is really moving and not reporting a
+// constant. The transfer-count DIFFERS from the plan's ~14/~24 estimate —
+// the plan under-credited how much the composed-shadow write buys: every
+// phy_set_bb_reg in GetRxEnergy's reset is a masked read-modify-write (2
+// transfers), while the scout's rtw_write32 of a pre-composed dword is a
+// single transfer, so the scout undercuts the full read by more than
+// predicted (10 vs 24, not 14 vs 24) — report the measurement, not the
+// estimate.
 #ifdef _WIN32
 #define NOMINMAX
 #endif
