@@ -193,14 +193,26 @@ public:
    * cca_ofdm; see ScoutEnergyMath.h and the .cpp doc comment. */
   RxEnergy GetRxEnergyScout() override;
   /* Shadows for the composed reset (0x1d2c, 0x1eb4), primed with 2 reads on
-   * first use. Invalidated (forcing a re-prime) at:
-   *   - the end of InitWrite, BOTH exit points (the normal end and the
-   *     early return inside the cw_tone branch) — a re-init rewrites the
-   *     BB;
-   *   - StartContinuousTx and StopContinuousTx — 0x1eb4's packet_count
-   *     field is masked-written outside this shadow (StartContinuousTx),
-   *     and the 0x1d0c[16] BB reset pulse in StopContinuousTx plausibly
-   *     disturbs it too (symmetric invalidation, not a traced hazard);
+   * first use.
+   *
+   * INVALIDATED (forcing a re-prime) at:
+   *   - InitWrite's ENTRY, unconditionally, before anything else runs — a
+   *     re-init rewrites the BB, and setting this at entry (not at each
+   *     exit) covers every exit with one store: the cw_tone early return,
+   *     the ACK-responder throw, and the normal end alike. (This used to
+   *     be two stores at the two normal exits; the throw sits AFTER the
+   *     BB phy_reg table rewrites 0x1D2C/0x1EB4 and skipped both. Moving
+   *     to entry removes the question of which exits are covered.)
+   *   - StartContinuousTx — 0x1eb4's packet_count field (the PMAC packet
+   *     definition) is masked-written outside this shadow, so the cached
+   *     copy goes genuinely stale; a traced hazard, not belt-and-braces.
+   *   - StopContinuousTx — NOT a traced hazard (it touches 0x1d0c/0x1d58/
+   *     0x1a14/0x1a04/0x1e70/0x1d08/0x522, never 0x1d2c/0x1eb4).
+   *     Deliberate belt-and-braces symmetry with StartContinuousTx instead:
+   *     continuous TX is a debug/bench facility, so the 2-read re-prime
+   *     cost on the next scout call is cheap insurance against the
+   *     0x1d0c[16] BB reset pulse turning out to disturb 0x1eb4 in some
+   *     case not currently traced.
    *   - RadioManagementJaguar3's fw fast-retune branch, via the
    *     set_scout_invalidate_hook callback wired in the constructor — the
    *     firmware performs the channel switch inside the chip on H2C 0x1D,
@@ -208,22 +220,56 @@ public:
    *     RF18 it leaves touched (same reasoning as that function's own
    *     _cw_primed=false). Latent today: fastretune_fw defaults to 0
    *     (DeviceConfig.h), so this branch does not fire in production —
-   *     keep it live for when it is enabled;
-   *   - la_capture() — LaCapture::setup_bb touches 0x1eb4[23] on JGR3.
-   *     Belt-and-braces: LaCapture::restore() always runs before run()
-   *     returns and writes the pre-capture dword back exactly, under the
-   *     same _reg_mu, so the register does not actually go stale today —
-   *     this guards against a future LaCapture change breaking that
-   *     invariant silently.
-   * Deliberately NOT invalidated in FastRetune's HOST (software-compose)
-   * path: its whole write set (0x1c90, the RF windows, 0x1830/0x4130/
-   * 0xc30/0x808/0x0, select_agc_tables, apply_rxbb) never touches 0x1d2c or
-   * 0x1eb4, and a scout dwell is always preceded by a retune — invalidating
-   * there would re-prime on every single dwell and defeat the whole point
-   * of caching. (Verified full-body, case-insensitive, against all eight
-   * callees — see the coordinator's ruling.) */
+   *     keep it live for when it is enabled.
+   *   - la_capture(), BEFORE calling LaCapture::run() (not after) —
+   *     LaCapture::setup_bb touches 0x1eb4[23] on JGR3, and a THROW out of
+   *     run() would unwind past an invalidation placed after the call the
+   *     same way it unwinds past LaCapture::restore(). Belt-and-braces on
+   *     the ordinary (non-throwing) case: restore() always runs before a
+   *     normal return and writes the pre-capture dword back exactly under
+   *     this same _reg_mu, so the register does not actually go stale
+   *     there — this guards a future LaCapture change from silently
+   *     breaking that invariant, and the throwing case for free.
+   *
+   * NOT invalidated, with reasons rather than left off an implicitly
+   * exhaustive list:
+   *   - GetRxEnergy (this file, ~30 lines below) and
+   *     PhydmRuntimeJaguar3::fa_statistics_and_reset
+   *     (PhydmRuntimeJaguar3.cpp) — both genuine writers of 0x1d2c/0x1eb4,
+   *     but both are masked writes that touch ONLY the two target bits
+   *     (0x1d2c[31], 0x1eb4[25]) and leave them exactly where
+   *     compose_reset would have left them (bit 31 set, bit 25 clear) —
+   *     the same end-state this shadow already assumes, so priming is
+   *     unaffected either way.
+   *   - the coex runtime thread's periodic (~2 s) firmware H2Cs
+   *     (coex_run_5g, fw_update_wl_phy_info, fw_set_pwr_mode_active,
+   *     fw_coex_query_bt_info — RtlJaguar3Device.cpp's coex_runtime_loop)
+   *     — these never switch the channel and stay in WL-only active mode,
+   *     so the fw fast-retune hook's "the firmware might touch anything"
+   *     reasoning does not apply; probably the right call, not a gap in
+   *     the audit.
+   *   - FastRetune's HOST (software-compose) path — its whole write set
+   *     (0x1c90, the RF windows, 0x1830/0x4130/0xc30/0x808/0x0,
+   *     select_agc_tables, apply_rxbb) never touches 0x1d2c or 0x1eb4, and
+   *     a scout dwell is always preceded by a retune — invalidating there
+   *     would re-prime on every single dwell and defeat the whole point of
+   *     caching. (Verified full-body, case-insensitive, against all eight
+   *     callees.) */
   bool _scout_primed = false;
   uint32_t _scout_1d2c = 0, _scout_1eb4 = 0;
+
+  /* Bench/debug-only raw BB register peek (tests/scout_read_bench.cpp's
+   * on-hardware verification that GetRxEnergyScout's composed reset
+   * actually lands on the chip, not just that ScoutEnergyMath.h's pure
+   * arithmetic is right — a stuck 0x1eb4[25] would otherwise pass every
+   * host test and still hold the OFDM counters in permanent reset).
+   * Serializes on _reg_mu like every other register access here. Not on
+   * IRtlDevice — chip-specific by design, for a caller that already knows
+   * it holds a Jaguar3 (the bench downcasts). */
+  uint32_t DebugPeekBb(uint16_t addr) {
+    std::lock_guard<std::mutex> lk(_reg_mu);
+    return _device.rtw_read<uint32_t>(addr);
+  }
 
   /* Consolidated windowed RX link-quality snapshot (see RxQuality.h) — subsumes
    * GetRxEnergy. Fed per decoded frame in the RX loop via _rxq. On Jaguar3 the

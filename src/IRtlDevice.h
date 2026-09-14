@@ -573,10 +573,18 @@ public:
    * for a caller that dwells on a candidate channel for a few ms and needs
    * one number back per visit. Contract as GetRxEnergy(false) for the fields
    * it fills (valid_fa, fa_ofdm, cca_ofdm; delta since the previous read of
-   * EITHER kind; resets the OFDM counters) — everything else is left invalid.
-   * Jaguar3 overrides with a 6-read + composed-write path (~14 transfers
-   * synchronous, ~6 batched); the default delegates to the full read so any
-   * caller can use it on any chip. */
+   * EITHER kind; resets the OFDM counters) — everything else is left invalid,
+   * INCLUDING valid_cck (see RxEnergy::valid_cck in RxSense.h: the scout
+   * skips the CCK reset, so cca_cck/fa_cck are not comparable to a
+   * GetRxEnergy sample and must not be summed with them un-gated).
+   * Jaguar3 overrides with a 6-read + 4-full-dword-write path — MEASURED
+   * (tests/scout_read_bench.cpp, on an 8822EU, 2026-09-14/15) at 10
+   * transfers/call synchronous (12 on the first, priming call), against 24
+   * for the full GetRxEnergy(false) on the same chip; a batched variant of
+   * the scout path does not exist yet, so no batched figure is claimed here
+   * — a forward estimate would be speculative and this comment would rot
+   * again exactly like the number it replaces. The default delegates to the
+   * full read so any caller can use it on any chip. */
   virtual RxEnergy GetRxEnergyScout() { return GetRxEnergy(false); }
 
   /* Consolidated windowed RX link-quality snapshot (see RxQuality.h) — the

@@ -14,11 +14,30 @@ int main() {
   CHECK(fa_ofdm_sum(0xffff0000, 0xffffffff, 0xffffffff, 0xffffffff, 0x0000ffff) == 8u * 0xffff);
   // Reset dwords: 0x1d2c[31] off, 0x1eb4[25] on, 0x1eb4[25] off, 0x1d2c[31] on,
   // every other bit of the shadow preserved.
-  const ResetDwords r = compose_reset(0x80001234u, 0x00005678u);
-  CHECK(r.d1d2c_off == 0x00001234u);
-  CHECK(r.d1eb4_on == (0x00005678u | (1u << 25)));
-  CHECK(r.d1eb4_off == 0x00005678u);
-  CHECK(r.d1d2c_on == 0x80001234u);
+  //
+  // TWO vectors, opposite polarity on the bits that matter, so a mutant that
+  // forgets to actually flip a bit (e.g. `d1eb4_off = shadow_1eb4;` with no
+  // mask) cannot pass both. Vector 1 starts with 0x1d2c[31]=1 and
+  // 0x1eb4[25]=0 — it pins d1d2c_off (bit cleared) and d1eb4_on (bit set),
+  // but a mutant copying the shadow verbatim into d1eb4_off/d1d2c_on would
+  // ALSO pass vector 1 unnoticed, because those two bits already sit at
+  // their target value in this shadow (a real bug caught in review: on
+  // hardware that mutant latches 0x1eb4[25]=1 forever after the first call,
+  // holding the OFDM FA/CCA counters in permanent reset — fa_ofdm/cca_ofdm
+  // read 0 on every call from the second one on, silently). Vector 2 starts
+  // with the opposite polarity (0x1d2c[31]=0, 0x1eb4[25]=1) so it pins
+  // d1eb4_off and d1d2c_on instead — the mutant fails vector 2. Together the
+  // two vectors pin all four output dwords against a bit-dropped mutant.
+  const ResetDwords r1 = compose_reset(0x80001234u, 0x00005678u);
+  CHECK(r1.d1d2c_off == 0x00001234u);
+  CHECK(r1.d1eb4_on == (0x00005678u | (1u << 25)));
+  CHECK(r1.d1eb4_off == 0x00005678u);
+  CHECK(r1.d1d2c_on == 0x80001234u);
+  const ResetDwords r2 = compose_reset(0x00001234u, 0x02005678u);
+  CHECK(r2.d1d2c_off == 0x00001234u);
+  CHECK(r2.d1eb4_on == 0x02005678u);
+  CHECK(r2.d1eb4_off == 0x00005678u);
+  CHECK(r2.d1d2c_on == 0x80001234u);
   if (fails) return EXIT_FAILURE;
   std::puts("scout_energy_selftest: ok");
   return 0;

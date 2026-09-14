@@ -531,6 +531,7 @@ int main() {
     d.fa_cck = e.fa_cck;
     d.cca_ofdm = e.cca_ofdm;
     d.cca_cck = e.cca_cck;
+    d.valid_cck = e.valid_cck;
     d.valid_igi = e.valid_igi;
     d.igi = e.igi;
     d.valid_nhm = e.valid_nhm;

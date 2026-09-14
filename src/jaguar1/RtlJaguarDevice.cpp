@@ -294,6 +294,8 @@ RxEnergy RtlJaguarDevice::GetRxEnergy(bool with_nhm) {
   e.cca_ofdm = (cca >> 16) & 0xFFFF;
   e.cca_cck = cca & 0xFFFF;
   e.valid_fa = true;
+  e.valid_cck = true; /* real reset-then-read CCK counters, see
+                       * RxSense.h::valid_cck */
   e.igi = static_cast<uint8_t>(_device.rtw_read8(0x0C50) & 0x7F);
   e.valid_igi = true;
 
