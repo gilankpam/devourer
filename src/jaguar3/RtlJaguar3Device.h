@@ -193,16 +193,35 @@ public:
    * cca_ofdm; see ScoutEnergyMath.h and the .cpp doc comment. */
   RxEnergy GetRxEnergyScout() override;
   /* Shadows for the composed reset (0x1d2c, 0x1eb4), primed with 2 reads on
-   * first use. Invalidated (forcing a re-prime) at the end of InitWrite (a
-   * re-init rewrites the BB) and in StartContinuousTx/StopContinuousTx
-   * (0x1eb4's packet_count field at line ~1091 is masked-written outside
-   * this shadow, so the cached copy would go stale and a later composed
-   * write would silently clobber it). Deliberately NOT invalidated in
-   * FastRetune: its whole write set (0x1c90, the RF windows, 0x1830/0x4130/
+   * first use. Invalidated (forcing a re-prime) at:
+   *   - the end of InitWrite, BOTH exit points (the normal end and the
+   *     early return inside the cw_tone branch) — a re-init rewrites the
+   *     BB;
+   *   - StartContinuousTx and StopContinuousTx — 0x1eb4's packet_count
+   *     field is masked-written outside this shadow (StartContinuousTx),
+   *     and the 0x1d0c[16] BB reset pulse in StopContinuousTx plausibly
+   *     disturbs it too (symmetric invalidation, not a traced hazard);
+   *   - RadioManagementJaguar3's fw fast-retune branch, via the
+   *     set_scout_invalidate_hook callback wired in the constructor — the
+   *     firmware performs the channel switch inside the chip on H2C 0x1D,
+   *     so nothing on the host side can prove which registers besides
+   *     RF18 it leaves touched (same reasoning as that function's own
+   *     _cw_primed=false). Latent today: fastretune_fw defaults to 0
+   *     (DeviceConfig.h), so this branch does not fire in production —
+   *     keep it live for when it is enabled;
+   *   - la_capture() — LaCapture::setup_bb touches 0x1eb4[23] on JGR3.
+   *     Belt-and-braces: LaCapture::restore() always runs before run()
+   *     returns and writes the pre-capture dword back exactly, under the
+   *     same _reg_mu, so the register does not actually go stale today —
+   *     this guards against a future LaCapture change breaking that
+   *     invariant silently.
+   * Deliberately NOT invalidated in FastRetune's HOST (software-compose)
+   * path: its whole write set (0x1c90, the RF windows, 0x1830/0x4130/
    * 0xc30/0x808/0x0, select_agc_tables, apply_rxbb) never touches 0x1d2c or
    * 0x1eb4, and a scout dwell is always preceded by a retune — invalidating
    * there would re-prime on every single dwell and defeat the whole point
-   * of caching. */
+   * of caching. (Verified full-body, case-insensitive, against all eight
+   * callees — see the coordinator's ruling.) */
   bool _scout_primed = false;
   uint32_t _scout_1d2c = 0, _scout_1eb4 = 0;
 

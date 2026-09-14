@@ -52,6 +52,10 @@ RtlJaguar3Device::RtlJaguar3Device(RtlAdapter device, Logger_t logger,
    * callers serialize on _reg_mu). */
   _radioManagement.set_h2c_sender(
       [this](uint32_t msg, uint32_t ext) { _hal.send_h2c_raw(msg, ext); });
+  /* GetRxEnergyScout's 0x1d2c/0x1eb4 shadow: RadioManagementJaguar3 has no
+   * handle back here, so it fires this hook instead — see
+   * set_scout_invalidate_hook's doc comment. */
+  _radioManagement.set_scout_invalidate_hook([this] { _scout_primed = false; });
   _logger->info("RtlJaguar3Device constructed ({})",
                 variant == jaguar3::ChipVariant::C8822E ? "8822E/EU" : "8822C/CU");
 }
@@ -1226,10 +1230,18 @@ RxEnergy RtlJaguar3Device::GetRxEnergy(bool with_nhm) {
  * cca_cck, fa_cck, igi/valid_igi, NHM and the noise floor are left
  * invalid/zero: the scout deliberately skips the CCK 0x1a2c reset toggles
  * (they cost 4 more masked writes for a counter this caller never asked
- * for), so a raw cca_cck read here would be a monotonically-accumulating
- * counter next to every other RxEnergy field being a since-last-read delta
- * — silently wrong, worse than absent. 0x1eb4[25] also clears the NHM
- * counters, but the scout never arms an NHM window so that is moot.
+ * for). Which register actually owns clearing 0x2c08's CCK half (the
+ * 0x1a2c toggles, 0x1eb4[25], or both) is UNVERIFIED here — in both
+ * GetRxEnergy and PhydmRuntimeJaguar3::fa_stats() the 0x1a2c toggles and
+ * the 0x1eb4[25] reset always run together, so nothing in this codebase
+ * exercises them independently to tell. Omitting cca_cck is the safe
+ * choice either way: if 0x1a2c alone owns the CCK reset, a raw read here
+ * would be a monotonically-accumulating counter next to every other
+ * RxEnergy field being a since-last-read delta (silently wrong); if
+ * 0x1eb4[25] also clears it, the field would be fine to fill but there is
+ * no way to confirm that from here, so it stays out rather than assert an
+ * unverified mechanism. 0x1eb4[25] also clears the NHM counters, but the
+ * scout never arms an NHM window so that is moot.
  *
  * The OFDM FA/CCA delta is shared with PhydmRuntimeJaguar3::fa_stats() (the
  * coex thread's periodic tick performs the identical 0x1d2c/0x1eb4 reset,
@@ -1747,7 +1759,21 @@ devourer::LaResult RtlJaguar3Device::la_capture(const devourer::LaParams &p) {
   /* Serialize against the coex runtime tick like every register-touching
    * entry point. */
   std::lock_guard<std::mutex> lk(_reg_mu);
-  return _la->run(p);
+  const devourer::LaResult r = _la->run(p);
+  /* LaCapture::setup_bb touches 0x1eb4[23] (kJ3RptUpdate) on the JGR3
+   * dialect. Checked: LaCapture::restore() (LaCapture.cpp) always runs on
+   * every reachable exit of run() that touches a register (the only path
+   * that skips it is the top-of-function _wedged early return, before
+   * snapshot() — nothing touched yet), and restore() writes back the exact
+   * pre-capture dword captured by snapshot(), under the same _reg_mu held
+   * here — so the live register is byte-identical to its pre-capture state
+   * by the time this returns. That makes this invalidation
+   * belt-and-braces, not strictly necessary today: it costs one bool store
+   * against a future LaCapture change (an added early return, a partial
+   * restore) silently breaking that invariant and leaving the scout shadow
+   * wrong with no local signal. */
+  _scout_primed = false;
+  return r;
 }
 
 devourer::TxPowerState RtlJaguar3Device::GetTxPowerState() {

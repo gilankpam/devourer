@@ -709,6 +709,15 @@ bool RadioManagementJaguar3::fast_retune(uint8_t channel,
     prof.mark("fw");
     _fw_sw_pending = central;
     _cw_primed = false; /* the fw rewrites RF18 under the compose cache */
+    /* Same hazard, same reasoning, different cache: GetRxEnergyScout's
+     * 0x1d2c/0x1eb4 shadow on the device layer. A host-side grep of this
+     * function proves nothing about what the firmware touches once this
+     * H2C is sent — it performs the channel switch inside the chip.
+     * Latent today: fastretune_fw defaults to 0 (DeviceConfig.h), so this
+     * branch is not reached in production; keep the call live for when
+     * it is enabled — do not delete it as dead code. */
+    if (_invalidate_scout)
+      _invalidate_scout();
     if (band_change) {
       _last_sco = 0xffffffff;
       _last_dfir = 0xffffffff;
