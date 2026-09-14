@@ -92,6 +92,22 @@ public:
   void write_batch_begin() { _transport->write_batch_begin(); }
   void write_batch_end() { _transport->write_batch_end(); }
   void flush_writes() { _transport->flush_writes(); }
+  /* Batched EP0 register transfers — see IRtlTransport::ctrl_batch for the
+   * ordering / in-place-read / failure contract and the USB event-pump
+   * hazard. The caller owns serialization (RtlJaguar3Device's _reg_mu). */
+  bool ctrl_batch(std::vector<devourer::CtrlOp> &ops) {
+    /* debug.log_writes parity with rtw_write: a batched write is still a
+     * write, and tests/decode_wseq.py's golden diff must not develop a hole
+     * where the cached hop path used to emit wreg events. */
+    if (_log_writes)
+      for (const devourer::CtrlOp &op : ops)
+        if (op.write)
+          devourer::Ev(_logger->events(), "debug.wreg")
+              .hexf("addr", op.addr, 4)
+              .f("width", 4)
+              .hexf("val", (unsigned long long)op.value, 8);
+    return _transport->ctrl_batch(ops);
+  }
 
   /* Kernel-style async RX: keep n_urbs concurrent bulk-IN transfers in flight
    * (USB) or reap the RX buffer-descriptor ring (PCIe), invoking

@@ -1023,6 +1023,15 @@ add_executable(ScoutEnergySelftest tests/scout_energy_selftest.cpp)
 target_link_libraries(ScoutEnergySelftest PRIVATE devourer)
 add_test(NAME scout_energy_math COMMAND ScoutEnergySelftest)
 
+# Headless guard for the batched-EP0 contract (IRtlTransport::ctrl_batch):
+# submission order, each read's value landing in its OWN op, failure reported
+# without aborting the rest of the batch. Pinned against a fake transport, so
+# it guards every implementation (the synchronous default AND UsbTransport's
+# pipelined one) without a bus.
+add_executable(CtrlBatchSelftest tests/ctrl_batch_selftest.cpp)
+target_link_libraries(CtrlBatchSelftest PRIVATE devourer)
+add_test(NAME ctrl_batch_semantics COMMAND CtrlBatchSelftest)
+
 # Headless guard for the adapter-health classifier + EFUSE-stability probe
 # loop (src/AdapterHealth.h) — the verdict mapping behind examples/doctor,
 # with cases encoding the verdicts measured on a real dying unit vs its

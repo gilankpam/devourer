@@ -37,7 +37,8 @@ public:
                std::shared_ptr<devourer::UsbDeviceLock> usb_lock = nullptr,
                bool rx_zerocopy = false, RxMode rx_mode = RxMode::Async,
                int pool_spare = 0, int ring_ms = 0,
-               PoolExhaust pool_exhaust = PoolExhaust::Backpressure);
+               PoolExhaust pool_exhaust = PoolExhaust::Backpressure,
+               bool ctrl_batch_enabled = true);
   ~UsbTransport() override;
 
   bool is_usb() const override { return true; }
@@ -83,6 +84,11 @@ public:
   void write_batch_begin() override;
   void write_batch_end() override;
   void flush_writes() override;
+  /* Batched EP0 register transfers. See IRtlTransport::ctrl_batch for the
+   * contract; the implementation notes (chunking at kAsyncWriteDepth, the
+   * cross-thread event-pump hazard, why the read payload is copied inside the
+   * wait loop) are on the definition in UsbTransport.cpp. */
+  bool ctrl_batch(std::vector<CtrlOp> &ops) override;
 
   bool tx_async(uint8_t ep, uint8_t *buf, size_t len,
                 unsigned timeout_ms) override;
@@ -104,14 +110,23 @@ private:
   /* Register transfers are 1/2/4 bytes; async_write/async_read refuse a
    * larger payload rather than overrun the inline setup buffer. */
   static constexpr size_t kAsyncMaxPayload = 4;
+  /* CROSS-THREAD as of the ctrl_batch work (2026-09-14). Before it, the slot
+   * pool was only ever driven by the single-threaded bring-up write batch, so
+   * plain fields were safe. A runtime ctrl_batch pumps libusb events from the
+   * CALLING thread while the RX bulk pump pumps the SAME context on its own
+   * thread, and libusb lets either thread reap either thread's completions —
+   * so async_write_cb can now run on a thread that is not the submitter.
+   * `done` is the handshake (release on the callback side, acquire on the
+   * waiter's) and publishes `status`/`actual`/the payload bytes written
+   * before it. */
   struct AsyncWrite {
     libusb_transfer *t;
     uint8_t buf[LIBUSB_CONTROL_SETUP_SIZE + kAsyncMaxPayload];
     UsbTransport *self;
-    bool done;
+    std::atomic<bool> done;
     /* Submitted and not yet reaped: libusb owns `t` and `buf` while set, so
      * the slot must not be reused, freed, or handed back to the free list. */
-    bool inflight;
+    std::atomic<bool> inflight;
     int status;
     int actual;
   };
@@ -127,14 +142,47 @@ private:
    * Returns false on failure (data untouched). */
   bool async_read(uint16_t wvalue, uint16_t windex, void *data, size_t n);
   AsyncWrite *async_take_slot();
+  /* Non-blocking take: a free slot, or nullptr if the pool is momentarily
+   * empty. ctrl_batch sizes each chunk by what this yields, which is what
+   * makes it impossible for a chunk to cannibalise its own in-flight slots —
+   * see the definition of ctrl_batch. */
+  AsyncWrite *async_try_take_slot();
+  /* Allocate the async slot pool on first use. Extracted from
+   * write_batch_begin so ctrl_batch can arm the pool at runtime on a session
+   * that never ran a bring-up write batch (and so there is exactly ONE copy
+   * of the allocation). Idempotent; never shrinks the pool. */
+  void ensure_async_slots();
+  /* Hand a slot back to the free list (mutex-guarded: the completion callback
+   * does the same from whichever thread reaped it). */
+  void async_release_slot(AsyncWrite *w);
   bool async_wait_progress(); /* one event-loop turn; false on timeout/error */
   static void LIBUSB_CALL async_write_cb(libusb_transfer *t);
   bool _batch = false;
+  /* Guards _aw_free only. Held for the push/pop, never across a libusb call:
+   * async_write_cb pushes from the reaping thread (see AsyncWrite above), and
+   * an unguarded vector push racing a pop corrupts the pool outright. */
+  std::mutex _aw_mu;
   std::vector<AsyncWrite *> _aw_free;
+  /* Allocated once, never resized after: iterated without _aw_mu. */
   std::vector<AsyncWrite *> _aw_all;
-  int _aw_inflight = 0;
-  uint64_t _aw_completed = 0;
-  int _aw_errors = 0;
+  std::atomic<int> _aw_inflight{0};
+  std::atomic<uint64_t> _aw_completed{0};
+  std::atomic<int> _aw_errors{0};
+  /* libusb "completed" flag for handle_events_timeout_completed: set by
+   * async_write_cb after it bumps _aw_completed, so a waiter blocked in
+   * libusb's event wait is woken by OUR completion even when another thread
+   * owns the event lock. Without it a completion reaped by the RX thread
+   * between the waiter's check and its pump costs a full 250 ms timeout —
+   * exactly the latency this feature exists to remove. Plain int by libusb's
+   * documented contract (it reads it under its own lock). */
+  int _aw_wait_flag = 0;
+  /* Held for the whole of ctrl_batch and across the _batch flip in
+   * write_batch_begin/end, so a bring-up write batch and a runtime control
+   * batch can never interleave over the same slot pool. */
+  std::mutex _batch_mu;
+  /* DeviceConfig::usb.ctrl_batch — false makes ctrl_batch fall back to the
+   * synchronous default (the A/B knob, DEVOURER_CTRL_BATCH=0). */
+  bool _cfg_ctrl_batch = true;
   /* Set when a drain gave up with transfers still submitted: the destructor
    * then leaks those slots instead of freeing a transfer libusb still owns. */
   bool _aw_abandoned = false;

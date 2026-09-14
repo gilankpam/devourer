@@ -529,6 +529,28 @@ struct DeviceConfig {
      * host/dongle/channel worked on one run, deaf on the next; the heap
      * path was 100% reliable). Opt in with =1 until root-caused. */
     bool rx_zerocopy = false;
+    /* env: DEVOURER_CTRL_BATCH — batch a group of EP0 register accesses
+     * (IRtlTransport::ctrl_batch): submit up to kAsyncWriteDepth back to back
+     * and pay one completion wait per chunk instead of one host round trip per
+     * register. Used by the Jaguar3 channel-scout energy read and the cached
+     * FastRetune hop. DEFAULT ON; =0 falls the transport back to the
+     * synchronous default, which is the A/B knob for measuring what the batch
+     * actually buys (and the escape hatch on a host whose event pump
+     * misbehaves).
+     *
+     * MEASURED 2026-09-15, and the two hosts disagree completely:
+     *   - GROUND STATION (RK3566, the deployment target): the scout read goes
+     *     from a 2829 us median to 588 us — 4.8x, -2.24 ms per call. Batching
+     *     removes 92-98% of the per-transfer cost there, because on that host
+     *     that cost is host turnaround, not wire time (~290 us per completion
+     *     WAIT plus only ~7-16 us per op).
+     *   - x86 xHCI bench host: exactly ZERO change — 375.0 us per transfer
+     *     either way, and the pre-existing bring-up write pipeline is no
+     *     better there either. That host overlaps nothing on EP0.
+     * Default ON for the target; =0 to A/B it. Numbers, the cost model and
+     * the follow-up lever (kAsyncWriteDepth >= 10 would make the scout one
+     * wait instead of two) are in tests/scout_read_bench.cpp's header. */
+    bool ctrl_batch = true;
   } usb;
 
   /* ---- PCIe (DEVOURER_PCIE builds; see src/PcieTransport.h) ------------ */

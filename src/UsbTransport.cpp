@@ -314,11 +314,12 @@ UsbTransport::UsbTransport(libusb_device_handle *dev_handle, Logger_t logger,
                            libusb_context *ctx,
                            std::shared_ptr<devourer::UsbDeviceLock> usb_lock,
                            bool rx_zerocopy, RxMode rx_mode, int pool_spare,
-                           int ring_ms, PoolExhaust pool_exhaust)
+                           int ring_ms, PoolExhaust pool_exhaust,
+                           bool ctrl_batch_enabled)
     : _dev_handle{dev_handle}, _ctx{ctx}, _logger{std::move(logger)},
-      _rx_zerocopy{rx_zerocopy}, _rx_mode{rx_mode}, _pool_spare{pool_spare},
-      _ring_ms{ring_ms}, _pool_exhaust{pool_exhaust},
-      _usb_lock{std::move(usb_lock)} {
+      _cfg_ctrl_batch{ctrl_batch_enabled}, _rx_zerocopy{rx_zerocopy},
+      _rx_mode{rx_mode}, _pool_spare{pool_spare}, _ring_ms{ring_ms},
+      _pool_exhaust{pool_exhaust}, _usb_lock{std::move(usb_lock)} {
   libusb_device_descriptor desc{};
   if (libusb_get_device_descriptor(libusb_get_device(_dev_handle), &desc) ==
       LIBUSB_SUCCESS) {
@@ -344,7 +345,7 @@ UsbTransport::~UsbTransport() {
      * loop / yanked device), leaking the slot is the lesser evil: a callback
      * that somehow fires later touches leaked memory, whereas freeing here
      * hands libusb a dangling transfer it is still holding. */
-    if (w->inflight) {
+    if (w->inflight.load(std::memory_order_acquire)) {
       ++leaked;
       continue;
     }
@@ -373,64 +374,115 @@ UsbTransport::~UsbTransport() {
  * Submission order == completion order on EP0, so a pending queue of writes
  * followed by a read behaves exactly like the synchronous sequence; the win
  * is that the host does not sit through a full URB round trip per write. */
+/* Slot-pool allocation, shared by the bring-up write batch and the runtime
+ * ctrl_batch (P8: there is one copy of this, not two). Idempotent. */
+void UsbTransport::ensure_async_slots() {
+  if (!_aw_all.empty())
+    return;
+  std::lock_guard<std::mutex> lk(_aw_mu);
+  for (int i = 0; i < kAsyncWriteDepth; ++i) {
+    auto *w = new AsyncWrite{};
+    w->t = libusb_alloc_transfer(0);
+    w->self = this;
+    w->done.store(false, std::memory_order_relaxed);
+    w->inflight.store(false, std::memory_order_relaxed);
+    _aw_all.push_back(w);
+    _aw_free.push_back(w);
+  }
+}
+
+void UsbTransport::async_release_slot(AsyncWrite *w) {
+  std::lock_guard<std::mutex> lk(_aw_mu);
+  _aw_free.push_back(w);
+}
+
 void UsbTransport::write_batch_begin() {
+  std::lock_guard<std::mutex> lk(_batch_mu);
   if (_batch)
     return;
   /* A session that already failed to reap its transfers has a short pool and
    * a suspect event loop; stay synchronous rather than pipeline into it. */
   if (_aw_abandoned)
     return;
-  if (_aw_all.empty()) {
-    for (int i = 0; i < kAsyncWriteDepth; ++i) {
-      auto *w = new AsyncWrite{};
-      w->t = libusb_alloc_transfer(0);
-      w->self = this;
-      _aw_all.push_back(w);
-      _aw_free.push_back(w);
-    }
-  }
-  _aw_errors = 0;
+  ensure_async_slots();
+  _aw_errors.store(0, std::memory_order_relaxed);
   _batch = true;
 }
 
 void UsbTransport::write_batch_end() {
+  std::lock_guard<std::mutex> lk(_batch_mu);
   flush_writes();
-  if (_batch && _aw_errors)
+  const int errs = _aw_errors.load(std::memory_order_relaxed);
+  if (_batch && errs)
     _logger->error("USB: {} pipelined register write(s) failed in this batch",
-                   _aw_errors);
+                   errs);
   _batch = false;
 }
 
 void LIBUSB_CALL UsbTransport::async_write_cb(libusb_transfer *t) {
   auto *w = static_cast<AsyncWrite *>(t->user_data);
   UsbTransport *self = w->self;
-  self->_aw_inflight--;
-  self->_aw_completed++;
-  w->inflight = false;
-  w->done = true;
+  /* May run on a thread that did not submit this transfer: libusb lets
+   * whichever thread is pumping the context reap any completion, and since
+   * ctrl_batch pumps from the caller's thread while the RX loop pumps from
+   * its own, both are live reapers. Hence the atomics. */
   w->status = t->status;
   w->actual = t->actual_length;
+  w->inflight.store(false, std::memory_order_relaxed);
   if (t->status != LIBUSB_TRANSFER_COMPLETED ||
       t->actual_length != t->length - LIBUSB_CONTROL_SETUP_SIZE)
-    self->_aw_errors++;
-  /* The slot goes back on the free list here; a reader that is waiting on
-   * this very slot copies its data out before it submits anything else
-   * (single-threaded by contract), so the buffer is still intact. */
-  self->_aw_free.push_back(w);
+    self->_aw_errors.fetch_add(1, std::memory_order_relaxed);
+  self->_aw_inflight.fetch_sub(1, std::memory_order_relaxed);
+  self->_aw_completed.fetch_add(1, std::memory_order_release);
+  /* `done` publishes status/actual/the payload to the waiter (acquire on the
+   * other side), and MUST be set before the slot goes back on the free list:
+   * a waiter keyed on `done` copies its read payload out of `buf` the instant
+   * it sees the flag, and only then can anything else claim the slot. */
+  w->done.store(true, std::memory_order_release);
+  /* The slot goes back on the free list here. ctrl_batch never re-submits a
+   * slot inside the chunk it is waiting on, so the buffer stays intact until
+   * its own waiter has copied from it. */
+  self->async_release_slot(w);
+  /* Wake a waiter blocked inside libusb's event wait (see _aw_wait_flag). */
+  self->_aw_wait_flag = 1;
+}
+
+UsbTransport::AsyncWrite *UsbTransport::async_try_take_slot() {
+  AsyncWrite *w = nullptr;
+  {
+    std::lock_guard<std::mutex> lk(_aw_mu);
+    if (_aw_free.empty())
+      return nullptr;
+    w = _aw_free.back();
+    _aw_free.pop_back();
+  }
+  w->done.store(false, std::memory_order_relaxed);
+  w->inflight.store(false, std::memory_order_relaxed);
+  w->status = -1;
+  w->actual = 0;
+  return w;
 }
 
 UsbTransport::AsyncWrite *UsbTransport::async_take_slot() {
-  while (_aw_free.empty()) {
+  AsyncWrite *w = nullptr;
+  for (;;) {
+    {
+      std::lock_guard<std::mutex> lk(_aw_mu);
+      if (!_aw_free.empty()) {
+        w = _aw_free.back();
+        _aw_free.pop_back();
+        break;
+      }
+    }
     if (!async_wait_progress()) {
       flush_writes(); /* recovers the pool on a stuck queue */
+      std::lock_guard<std::mutex> lk(_aw_mu);
       if (_aw_free.empty())
-        return nullptr;
+        return nullptr; /* pool unrecoverable — callers MUST check (P9) */
     }
   }
-  AsyncWrite *w = _aw_free.back();
-  _aw_free.pop_back();
-  w->done = false;
-  w->inflight = false;
+  w->done.store(false, std::memory_order_relaxed);
+  w->inflight.store(false, std::memory_order_relaxed);
   w->status = -1;
   w->actual = 0;
   return w;
@@ -447,22 +499,29 @@ bool UsbTransport::async_read(uint16_t wvalue, uint16_t windex, void *data,
                             static_cast<uint16_t>(n));
   libusb_fill_control_transfer(w->t, _dev_handle, w->buf, async_write_cb, w,
                                USB_TIMEOUT);
+  /* inflight/_aw_inflight are raised BEFORE the submit: once submitted, the
+   * callback can fire on another thread immediately and decrement, and a
+   * post-submit increment would then transiently read -1 and let a concurrent
+   * flush_writes() exit while a transfer is still out. */
+  w->inflight.store(true, std::memory_order_relaxed);
+  _aw_inflight.fetch_add(1, std::memory_order_relaxed);
   const int rc = libusb_submit_transfer(w->t);
   if (rc != 0) {
-    _aw_free.push_back(w);
-    _aw_errors++;
+    w->inflight.store(false, std::memory_order_relaxed);
+    _aw_inflight.fetch_sub(1, std::memory_order_relaxed);
+    async_release_slot(w);
+    _aw_errors.fetch_add(1, std::memory_order_relaxed);
     _logger->error("USB: pipelined read submit failed ({})", rc);
     return false;
   }
-  w->inflight = true;
-  _aw_inflight++;
-  while (!w->done) {
+  while (!w->done.load(std::memory_order_acquire)) {
     if (!async_wait_progress()) {
       flush_writes(); /* cancels + recovers; w->done is set by the cancel */
       break;
     }
   }
-  if (!w->done || w->status != LIBUSB_TRANSFER_COMPLETED ||
+  if (!w->done.load(std::memory_order_acquire) ||
+      w->status != LIBUSB_TRANSFER_COMPLETED ||
       w->actual != static_cast<int>(n))
     return false;
   std::memcpy(data, w->buf + LIBUSB_CONTROL_SETUP_SIZE, n);
@@ -470,46 +529,60 @@ bool UsbTransport::async_read(uint16_t wvalue, uint16_t windex, void *data,
 }
 
 bool UsbTransport::async_wait_progress() {
-  const uint64_t before = _aw_completed;
-  for (int turns = 0; turns < 8 && _aw_completed == before; ++turns) {
+  const uint64_t before = _aw_completed.load(std::memory_order_acquire);
+  for (int turns = 0;
+       turns < 8 && _aw_completed.load(std::memory_order_acquire) == before;
+       ++turns) {
+    /* Arm the wakeup flag, then RE-CHECK before blocking: a completion that
+     * landed between the check above and this store would otherwise be
+     * clobbered by the store and cost a full 250 ms timeout. The callback
+     * bumps _aw_completed before it sets the flag, so the re-check catches
+     * exactly that window. */
+    _aw_wait_flag = 0;
+    if (_aw_completed.load(std::memory_order_acquire) != before)
+      break;
     struct timeval tv {0, 250 * 1000};
-    const int rc = libusb_handle_events_timeout_completed(_ctx, &tv, nullptr);
+    const int rc =
+        libusb_handle_events_timeout_completed(_ctx, &tv, &_aw_wait_flag);
     if (rc < 0) {
       _logger->error("USB: event loop error {} while draining pipelined writes",
                      rc);
       return false;
     }
   }
-  return _aw_completed != before;
+  return _aw_completed.load(std::memory_order_acquire) != before;
 }
 
 void UsbTransport::flush_writes() {
-  while (_aw_inflight > 0) {
+  while (_aw_inflight.load(std::memory_order_acquire) > 0) {
     if (async_wait_progress())
       continue;
     /* Stuck queue (~2 s without a completion): cancel what is still submitted
      * so the caller's next synchronous transfer is not queued behind it. */
     _logger->error("USB: pipelined write drain timed out ({} in flight)",
-                   _aw_inflight);
+                   _aw_inflight.load(std::memory_order_relaxed));
     for (auto *w : _aw_all)
-      if (w->inflight)
+      if (w->inflight.load(std::memory_order_acquire))
         libusb_cancel_transfer(w->t);
     /* A cancellation still completes through the callback, which is what
      * clears `inflight` and returns the slot. Keep pumping for it: the count
      * must never be zeroed by hand, or a late callback decrements it below
      * zero (silently disabling every later drain), pushes its slot onto the
      * free list a second time, and races the destructor's free. */
-    for (int i = 0; i < kFlushCancelTurns && _aw_inflight > 0; ++i)
+    for (int i = 0;
+         i < kFlushCancelTurns && _aw_inflight.load(std::memory_order_acquire) > 0;
+         ++i)
       async_wait_progress();
-    if (_aw_inflight > 0) {
+    const int stuck = _aw_inflight.load(std::memory_order_acquire);
+    if (stuck > 0) {
       /* The event loop itself is gone (a yanked device reports the error
        * immediately, so the turns above cost nothing). Leave the slots
        * submitted and off the free list; the destructor leaks them. */
-      _aw_errors += _aw_inflight;
+      _aw_errors.fetch_add(stuck, std::memory_order_relaxed);
       _aw_abandoned = true;
       _logger->error("USB: {} pipelined transfer(s) could not be reaped; "
                      "their slots are retired for this session",
-                     _aw_inflight);
+                     stuck);
     }
     return;
   }
@@ -527,16 +600,190 @@ bool UsbTransport::async_write(uint16_t wvalue, uint16_t windex,
   std::memcpy(w->buf + LIBUSB_CONTROL_SETUP_SIZE, data, n);
   libusb_fill_control_transfer(w->t, _dev_handle, w->buf, async_write_cb, w,
                                USB_TIMEOUT);
+  w->inflight.store(true, std::memory_order_relaxed); /* before submit — see
+                                                         async_read */
+  _aw_inflight.fetch_add(1, std::memory_order_relaxed);
   const int rc = libusb_submit_transfer(w->t);
   if (rc != 0) {
-    _aw_free.push_back(w);
-    _aw_errors++;
+    w->inflight.store(false, std::memory_order_relaxed);
+    _aw_inflight.fetch_sub(1, std::memory_order_relaxed);
+    async_release_slot(w);
+    _aw_errors.fetch_add(1, std::memory_order_relaxed);
     _logger->error("USB: pipelined write submit failed ({})", rc);
     return false;
   }
-  w->inflight = true;
-  _aw_inflight++;
   return true;
+}
+
+/* ---- batched control transfers ------------------------------------------
+ * The interface contract is on IRtlTransport::ctrl_batch; this is how it is
+ * kept on USB, and what the brief's sketch got wrong.
+ *
+ * ONE WAIT PER CHUNK, NOT ONE PER BATCH. The async slot pool is
+ * kAsyncWriteDepth = 8 deep, a constant tuned against the ~14k-write bring-up
+ * pipeline and deliberately NOT raised for this feature. So a batch is cut
+ * into chunks of at most 8 ops, and each chunk pays its own completion wait:
+ * the 10-op scout read is TWO chunks and TWO waits, not one. The win is still
+ * real (8 host round trips overlap instead of serializing), but quote the
+ * real number.
+ *
+ * THE READ PAYLOAD IS COPIED INSIDE THE WAIT LOOP, right after that op's own
+ * `done` is observed — not in a second pass after every wait. Two reasons,
+ * either one sufficient:
+ *   1. async_write_cb pushes the slot back onto the free list the instant it
+ *      completes. A deferred copy pass would read buffers the pool already
+ *      considers reusable. (Nothing in THIS function re-submits a slot inside
+ *      the chunk it is waiting on, so copying at `done` is safe — copying
+ *      later is not, once anything else can take from the pool.)
+ *   2. Ops are paired with their slots explicitly (`Pending{idx, w}`), so a
+ *      mid-chunk submit failure cannot slide a cursor and write one op's
+ *      register value into another op's `value` — a wrong number rather than
+ *      an error. tests/ctrl_batch_selftest.cpp case 2 pins that contract.
+ *
+ * async_take_slot() CAN RETURN NULL (an unrecoverable pool); that op fails and
+ * the batch reports false. Never dereferenced blind.
+ *
+ * THREADING. _batch_mu is held for the whole call, so a bring-up write batch
+ * (write_batch_begin/end take the same mutex) can never interleave with this
+ * over the shared slot pool; if one is somehow already open, or the pool was
+ * abandoned, or the config knob is off, fall back to the synchronous default.
+ * The deeper hazard is the event pump: this function pumps
+ * libusb_handle_events_timeout_completed on the caller's thread while the RX
+ * bulk loop pumps the same context on its own thread. libusb permits that,
+ * but EITHER thread may reap EITHER thread's completions — so our control
+ * transfers can complete on the RX thread, and RX URBs can complete on ours
+ * (their callbacks then run here, on the scout's thread, inside this call).
+ * The wait therefore keys on the per-slot `done` flag, which async_write_cb
+ * sets regardless of who reaped it; it never assumes "I pumped, so mine
+ * finished". The RX-callback-on-our-thread direction is benign for us (it is
+ * the RX path's own reentrancy, which it already tolerates from the TX
+ * reaper) but it does mean a ctrl_batch call can absorb RX processing time —
+ * one more reason the per-call latency numbers are quoted as distributions. */
+bool UsbTransport::ctrl_batch(std::vector<CtrlOp> &ops) {
+  std::lock_guard<std::mutex> lk(_batch_mu);
+  if (ops.empty())
+    return true;
+  if (_batch || _aw_abandoned || !_cfg_ctrl_batch)
+    return IRtlTransport::ctrl_batch(ops);
+  ensure_async_slots();
+
+  struct Pending {
+    size_t idx;    /* index into `ops` — never a separate cursor */
+    AsyncWrite *w; /* the slot THAT op was submitted on */
+  };
+  std::vector<Pending> used;
+  std::vector<AsyncWrite *> slots;
+  used.reserve(kAsyncWriteDepth);
+  slots.reserve(kAsyncWriteDepth);
+
+  bool ok = true;
+  for (size_t base = 0; base < ops.size();) {
+    /* ---- ACQUIRE PHASE, and it is load-bearing ----
+     * Every slot this chunk will use is taken BEFORE anything is submitted,
+     * and the chunk is sized by how many were actually free — not by
+     * kAsyncWriteDepth. Taking slots mid-submit is what broke the first
+     * version of this function on the ground station (RK3566, 2026-09-15),
+     * and the failure was silent data corruption, not an error:
+     *   async_write_cb sets `done` and only THEN pushes the slot back on the
+     *   free list, and on a host where another thread also pumps the event
+     *   loop (the Jaguar3 coex thread's synchronous transfers do), the waiter
+     *   can observe `done` and return from a call while the reaping thread
+     *   has not yet released those slots. The NEXT call then starts with 6-7
+     *   slots free instead of 8, runs dry partway through submitting an 8-op
+     *   chunk, waits for "progress" — and the progress it gets is one of ITS
+     *   OWN just-completed reads, whose slot it then re-fills with a later
+     *   write, overwriting the read payload before the wait loop copies it.
+     *   Observed on the GS as GetRxEnergyScout returning 0x40000000 /
+     *   0x33800002 (the reset write dwords) as fa/cca counter values, giving
+     *   fa_ofdm in the tens of thousands. It never reproduced on the x86 bench
+     *   host, where EP0 transfers do not overlap at all and each completes
+     *   before the next slot is taken.
+     * With the acquire phase, nothing of this chunk is in flight while slots
+     * are being taken, so a slot handed back can only belong to an older
+     * call — the self-cannibalisation is structurally impossible rather than
+     * merely unlikely. A short pool just makes a smaller chunk. */
+    const size_t want =
+        std::min(ops.size() - base, static_cast<size_t>(kAsyncWriteDepth));
+    slots.clear();
+    while (slots.size() < want) {
+      AsyncWrite *w = async_try_take_slot();
+      if (!w)
+        break; /* momentarily short — this chunk is just smaller */
+      slots.push_back(w);
+    }
+    if (slots.empty()) {
+      /* Nothing free at all: block for one (this also recovers a stuck pool),
+       * and make a chunk of exactly that one op. Nothing of ours is in flight
+       * here either, so the same guarantee holds. */
+      AsyncWrite *w = async_take_slot();
+      if (!w) {
+        /* P9: async_take_slot CAN return null when the pool is unrecoverable.
+         * Never dereferenced — and the remaining ops are still executed, just
+         * synchronously: the contract says a failure reports false without
+         * abandoning the rest of the group, and a half-issued hop is worse
+         * than a slow one. */
+        _logger->error("USB: ctrl_batch has no usable transfer slot at reg "
+                       "{:04x}; running the remaining {} op(s) synchronously",
+                       ops[base].addr, ops.size() - base);
+        std::vector<CtrlOp> rest(ops.begin() + base, ops.end());
+        IRtlTransport::ctrl_batch(rest);
+        for (size_t i = 0; i < rest.size(); ++i)
+          ops[base + i] = rest[i];
+        return false;
+      }
+      slots.push_back(w);
+    }
+    const size_t n = slots.size();
+    used.clear();
+    for (size_t i = 0; i < n; ++i) {
+      CtrlOp &op = ops[base + i];
+      AsyncWrite *w = slots[i];
+      libusb_fill_control_setup(
+          w->buf, op.write ? REALTEK_USB_VENQT_WRITE : REALTEK_USB_VENQT_READ,
+          5, op.addr, 0, 4);
+      if (op.write)
+        std::memcpy(w->buf + LIBUSB_CONTROL_SETUP_SIZE, &op.value, 4);
+      libusb_fill_control_transfer(w->t, _dev_handle, w->buf, async_write_cb, w,
+                                   USB_TIMEOUT);
+      /* Raise inflight BEFORE submitting: the completion may fire on the RX
+       * thread before this thread gets another instruction in. */
+      w->inflight.store(true, std::memory_order_relaxed);
+      _aw_inflight.fetch_add(1, std::memory_order_relaxed);
+      usb_ctrl_xfers().fetch_add(1, std::memory_order_relaxed);
+      const int rc = libusb_submit_transfer(w->t);
+      if (rc != 0) {
+        w->inflight.store(false, std::memory_order_relaxed);
+        _aw_inflight.fetch_sub(1, std::memory_order_relaxed);
+        _aw_errors.fetch_add(1, std::memory_order_relaxed);
+        async_release_slot(w);
+        _logger->error("USB: ctrl_batch submit failed ({}) for reg {:04x}", rc,
+                       op.addr);
+        ok = false;
+        continue; /* the REST of the batch still runs — see the contract */
+      }
+      used.push_back(Pending{base + i, w});
+    }
+    for (const Pending &p : used) {
+      AsyncWrite *const w = p.w;
+      while (!w->done.load(std::memory_order_acquire)) {
+        if (!async_wait_progress()) {
+          flush_writes(); /* cancels + recovers; the cancel sets done */
+          ok = false;
+          break;
+        }
+      }
+      if (!w->done.load(std::memory_order_acquire) ||
+          w->status != LIBUSB_TRANSFER_COMPLETED || w->actual != 4) {
+        ok = false;
+        continue;
+      }
+      /* Copy HERE, at this op's own completion, into this op's own element. */
+      if (!ops[p.idx].write)
+        std::memcpy(&ops[p.idx].value, w->buf + LIBUSB_CONTROL_SETUP_SIZE, 4);
+    }
+    base += n;
+  }
+  return ok;
 }
 
 bool UsbTransport::write_bytes(uint16_t reg_num, const uint8_t *ptr, size_t n) {

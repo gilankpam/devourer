@@ -775,17 +775,48 @@ bool RadioManagementJaguar3::fast_retune(uint8_t channel,
    * in RF 0x1a) and a fast hop must end in the full path's state; per-variant
    * order matches the full path (8822c: RXBB then RF18; 8822e: RF18 then
    * RF 0x1a). */
-  _device.rtw_write32(0x1c90, _cw_1c90 & ~(1u << 8)); /* rstb_3wire(false) */
-  if (is_c && !_rxbb_asserted)
+  /* Every write from here to the BB reset goes into ONE ctrl_batch: they are
+   * already composed full dwords with no read between them, so the host pays
+   * a completion wait per chunk (kAsyncWriteDepth = 8) instead of a full EP0
+   * round trip per register. `issue()` flushes what has accumulated whenever
+   * the sequence has to hand control to a helper that writes registers
+   * itself (apply_rxbb, select_agc_tables) — order across the whole hop is
+   * preserved exactly, and in the steady state (RXBB already asserted, AGC
+   * bucket unchanged) neither helper fires and the whole hop is a single
+   * 9-to-11-op batch = two chunks, two waits.
+   *
+   * HopProf caveat: the "bracket" and "consts" marks now measure COMPOSITION
+   * only — the wire time for everything they cover lands in the "bbrst"
+   * segment, where the batch is actually issued. The total (prime -> end) is
+   * unaffected and is the number to read. */
+  std::vector<devourer::CtrlOp> ops;
+  ops.reserve(11);
+  auto issue = [&]() {
+    if (ops.empty())
+      return true;
+    const bool ok = _device.ctrl_batch(ops);
+    ops.clear();
+    return ok;
+  };
+  auto wr = [&](uint16_t addr, uint32_t v) {
+    ops.push_back(devourer::CtrlOp{true, addr, v});
+  };
+
+  wr(0x1c90, _cw_1c90 & ~(1u << 8)); /* rstb_3wire(false) */
+  if (is_c && !_rxbb_asserted) {
+    issue();
     apply_rxbb(bwmode);
-  _device.rtw_write32(static_cast<uint16_t>(0x3c00 + (0x18 << 2)), win_a);
-  _device.rtw_write32(static_cast<uint16_t>(0x4c00 + (0x18 << 2)), win_b);
-  if (!is_c && !_rxbb_asserted)
+  }
+  wr(static_cast<uint16_t>(0x3c00 + (0x18 << 2)), win_a);
+  wr(static_cast<uint16_t>(0x4c00 + (0x18 << 2)), win_b);
+  if (!is_c && !_rxbb_asserted) {
+    issue();
     apply_rxbb(bwmode);
+  }
   _rxbb_asserted = true;
-  _device.rtw_write32(0x1c90, _cw_1c90 | (1u << 8)); /* rstb_3wire(true) */
-  _device.rtw_write32(0x1830, _cw_1830 | (1u << 29)); /* force anapar (A) */
-  _device.rtw_write32(0x4130, _cw_4130 | (1u << 29)); /* force anapar (B) */
+  wr(0x1c90, _cw_1c90 | (1u << 8));  /* rstb_3wire(true) */
+  wr(0x1830, _cw_1830 | (1u << 29)); /* force anapar (A) */
+  wr(0x4130, _cw_4130 | (1u << 29)); /* force anapar (B) */
   _cw_1c90 |= (1u << 8);
   _cw_1830 |= (1u << 29);
   _cw_4130 |= (1u << 29);
@@ -803,6 +834,7 @@ bool RadioManagementJaguar3::fast_retune(uint8_t channel,
                                         : 3) |
                       (bw20 ? 0x10 : 0);
   if (agc_key != _last_agc_key) {
+    issue(); /* select_agc_tables writes registers itself — keep hop order */
     select_agc_tables(central, bwmode);
     _last_agc_key = agc_key;
   }
@@ -810,7 +842,7 @@ bool RadioManagementJaguar3::fast_retune(uint8_t channel,
   const uint32_t sco = sco_for(central);
   if (sco != _last_sco) {
     _cw_c30 = (_cw_c30 & ~0xfffu) | sco;
-    _device.rtw_write32(0xc30, _cw_c30);
+    wr(0xc30, _cw_c30);
     _last_sco = sco;
   }
 
@@ -831,7 +863,7 @@ bool RadioManagementJaguar3::fast_retune(uint8_t channel,
   if (dfir != _last_dfir) {
     /* Both nibbles composed into one dword write. */
     _cw_808 = (_cw_808 & ~0x700070u) | (dfir_msb << 20) | (dfir_lsb << 4);
-    _device.rtw_write32(0x808, _cw_808);
+    wr(0x808, _cw_808);
     _last_dfir = dfir;
   }
 
@@ -840,10 +872,11 @@ bool RadioManagementJaguar3::fast_retune(uint8_t channel,
   /* BB reset every hop (the kernel runs it after every switch_channel; the RX
    * engine must relatch on the new channel) — three composed writes from the
    * primed dword. */
-  _device.rtw_write32(0x0, _cw_r0 | (1u << 16));
-  _device.rtw_write32(0x0, _cw_r0 & ~(1u << 16));
-  _device.rtw_write32(0x0, _cw_r0 | (1u << 16));
+  wr(0x0, _cw_r0 | (1u << 16));
+  wr(0x0, _cw_r0 & ~(1u << 16));
+  wr(0x0, _cw_r0 | (1u << 16));
   _cw_r0 |= (1u << 16);
+  issue(); /* the one place the accumulated hop actually hits the wire */
   prof.mark("bbrst");
 
   _last_channel = channel;

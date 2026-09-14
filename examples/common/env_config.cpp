@@ -262,6 +262,9 @@ devourer::DeviceConfig devourer_config_from_env() {
     cfg.usb.lock_dir = e;
   if (env_str("DEVOURER_RX_ZEROCOPY")) /* default false; =1 opts in to DMA */
     cfg.usb.rx_zerocopy = env_flag("DEVOURER_RX_ZEROCOPY");
+  /* default TRUE, so this reads the variable only to turn it OFF (=0) */
+  if (env_str("DEVOURER_CTRL_BATCH"))
+    cfg.usb.ctrl_batch = env_flag("DEVOURER_CTRL_BATCH");
 
   return cfg;
 }

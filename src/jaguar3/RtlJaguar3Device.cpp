@@ -1280,22 +1280,67 @@ RxEnergy RtlJaguar3Device::GetRxEnergy(bool with_nhm) {
  * Under _reg_mu like every register access here. */
 RxEnergy RtlJaguar3Device::GetRxEnergyScout() {
   std::lock_guard<std::mutex> lk(_reg_mu);
+  return scout_energy_locked(/*use_shadow=*/true);
+}
+
+/* The body of GetRxEnergyScout, parameterised on the one thing that is still
+ * an open design question (P10, mabur 2026-09-14): whether the cached
+ * 0x1d2c/0x1eb4 shadow is worth its coherence protocol now that the transfers
+ * are batched.
+ *
+ *   use_shadow = true  (production): 10 ops in ONE ctrl_batch — 6 reads, then
+ *     the 4 reset writes composed from the shadow. At kAsyncWriteDepth = 8
+ *     that is two chunks and TWO completion waits, not one.
+ *   use_shadow = false (bench only, DebugScoutShadowless): no shadow at all —
+ *     batch #1 is 8 reads (the 6 counters PLUS 0x1d2c and 0x1eb4, one chunk,
+ *     one wait), then the reset is composed from what was just read and
+ *     written as batch #2 (4 ops, one chunk, one wait). 12 transfers, still
+ *     two waits. Unbatched the shadow saved 2 of 12 transfers (~18 % of a
+ *     4.4 ms call) and paid for itself; batched, both variants cost the same
+ *     TWO waits, so the question is only what 2 extra pipelined transfers
+ *     cost inside a chunk. Measured by tests/scout_read_bench — see the
+ *     numbers in that file's header.
+ *
+ * The shadowless variant is also, incidentally, immune to every one of the
+ * five invalidation points the shadow needs (it re-reads the truth each
+ * call), including the firmware fast-retune one that cannot be audited from
+ * the host at all. */
+RxEnergy RtlJaguar3Device::scout_energy_locked(bool use_shadow) {
   RxEnergy e;
-  auto rd = [this](uint16_t addr) { return _device.rtw_read<uint32_t>(addr); };
-  if (!_scout_primed) {
-    _scout_1d2c = rd(0x1d2c);
-    _scout_1eb4 = rd(0x1eb4);
-    _scout_primed = true;
+  std::vector<devourer::CtrlOp> ops;
+  if (use_shadow) {
+    if (!_scout_primed) {
+      _scout_1d2c = _device.rtw_read<uint32_t>(0x1d2c);
+      _scout_1eb4 = _device.rtw_read<uint32_t>(0x1eb4);
+      _scout_primed = true;
+    }
+    const devourer::jgr3::ResetDwords r =
+        devourer::jgr3::compose_reset(_scout_1d2c, _scout_1eb4);
+    /* Reads first, then the reset: the batch runs in submission order, so the
+     * counters are sampled before they are cleared exactly as in the
+     * unbatched sequence. */
+    ops = {{false, 0x2c08, 0}, {false, 0x2d04, 0}, {false, 0x2d08, 0},
+           {false, 0x2d10, 0}, {false, 0x2d20, 0}, {false, 0x2d0c, 0},
+           {true, 0x1d2c, r.d1d2c_off}, {true, 0x1eb4, r.d1eb4_on},
+           {true, 0x1eb4, r.d1eb4_off}, {true, 0x1d2c, r.d1d2c_on}};
+    e.valid_fa = _device.ctrl_batch(ops);
+  } else {
+    ops = {{false, 0x2c08, 0}, {false, 0x2d04, 0}, {false, 0x2d08, 0},
+           {false, 0x2d10, 0}, {false, 0x2d20, 0}, {false, 0x2d0c, 0},
+           {false, 0x1d2c, 0}, {false, 0x1eb4, 0}};
+    bool ok = _device.ctrl_batch(ops);
+    const devourer::jgr3::ResetDwords r =
+        devourer::jgr3::compose_reset(ops[6].value, ops[7].value);
+    std::vector<devourer::CtrlOp> wr = {
+        {true, 0x1d2c, r.d1d2c_off}, {true, 0x1eb4, r.d1eb4_on},
+        {true, 0x1eb4, r.d1eb4_off}, {true, 0x1d2c, r.d1d2c_on}};
+    ok = _device.ctrl_batch(wr) && ok;
+    e.valid_fa = ok;
   }
-  const uint32_t cca = rd(0x2c08);
-  e.cca_ofdm = (cca >> 16) & 0xffff;
-  e.fa_ofdm = devourer::jgr3::fa_ofdm_sum(rd(0x2d04), rd(0x2d08), rd(0x2d10), rd(0x2d20), rd(0x2d0c));
-  e.valid_fa = true;
-  const devourer::jgr3::ResetDwords r = devourer::jgr3::compose_reset(_scout_1d2c, _scout_1eb4);
-  _device.rtw_write32(0x1d2c, r.d1d2c_off);
-  _device.rtw_write32(0x1eb4, r.d1eb4_on);
-  _device.rtw_write32(0x1eb4, r.d1eb4_off);
-  _device.rtw_write32(0x1d2c, r.d1d2c_on);
+  e.cca_ofdm = (ops[0].value >> 16) & 0xffff;
+  e.fa_ofdm = devourer::jgr3::fa_ofdm_sum(ops[1].value, ops[2].value,
+                                          ops[3].value, ops[4].value,
+                                          ops[5].value);
   return e;
 }
 

@@ -147,6 +147,102 @@
 // RF-quiet enough that NEITHER function saw much to count — an operator
 // wanting a harder behavioral exercise of the counters should re-run this
 // next to an active AP or with a CW tone armed on a second adapter.
+//
+// =======================================================================
+// MEASURED 2026-09-15, TASK A2 — BATCHED EP0 TRANSFERS (ctrl_batch)
+// =======================================================================
+// Two hosts, and they disagree completely. Both are reported because the
+// favourable one alone would be a lie about what this feature does.
+//
+// Method on both: 3 process invocations x 3 internal runs x 200 calls per
+// function per mode, DEVOURER_CTRL_BATCH=1 and =0 alternated invocation by
+// invocation (never all of A then all of B). Statistics are over the 9
+// per-run medians and the 9 per-run minima; single best cases are not quoted.
+//
+// --- GROUND STATION (RK3566 aarch64, 8822EU, the deployment target) ---
+//                      unbatched (med)    batched (med)      change
+//   scout, 10 ops      2829 us            588 us             -2.24 ms, 4.8x
+//                      (2497..3055)       (501..748)
+//   scout shadowless   3372 us            603 us
+//     12 ops           (3002..3748)       (571..648)
+//   GetRxEnergy(false) 6612 us            7444 us   <- NOT batched; unchanged
+//     24 ops, control  (5623..7592)       (6953..8368)  within run-to-run noise
+//
+// The full read is the control: it never calls ctrl_batch, and it does not
+// move (its two spreads overlap heavily). Only the paths that were converted
+// changed.
+//
+// DECOMPOSITION — what batching actually removes. Fitting both the 10-op and
+// 12-op variants in both modes:
+//   cost ~= 290 us x (number of completion waits) + 7..16 us x (number of ops)
+// which reproduces every measurement on this host:
+//   unbatched 10 ops = 10 waits -> 2900+~100  (measured 2829)
+//   batched   10 ops =  2 waits ->  580+~100  (measured  588)
+//   batched   12 ops =  2 waits ->  580+~130  (measured  603)
+//   unbatched 24 ops = 24 waits -> 6960+~250  (measured 6612..7444)
+// So on the GS the ~264-290 us that a synchronous register access costs is
+// almost entirely HOST TURNAROUND (the wait for a completion), and only
+// ~7-16 us of it is irreducible wire time. Batching removes 92-98% of the
+// per-transfer cost; what is left is a per-WAIT cost that is essentially the
+// same ~290 us as one synchronous transfer.
+//
+// FOLLOW-UP LEVER, measured but NOT taken here: because the surviving term is
+// per-wait and kAsyncWriteDepth is 8, the 10-op scout is two chunks and pays
+// ~290 us twice. A pool of >= 10 would make it ONE wait: ~290 + ~100 = ~390
+// us, another ~34% off. kAsyncWriteDepth was tuned for the ~14k-write
+// bring-up pipeline and was deliberately left alone in this task; raising it
+// is the obvious next measurement.
+//
+// --- PC BENCH HOST (x86 xHCI, 8822EU on bus 5-1) ---
+//   scout 10 ops: 3750 us batched, 3750 us unbatched. Shadowless 12 ops: 4500
+//   both ways. Full read 24 ops: 9000 both ways. Per-run medians were those
+//   exact values in every one of 9 runs per function per mode.
+// Every number is EXACTLY 375.0 us x transfer count in BOTH modes: this host
+// overlaps nothing, so the batch buys precisely zero. The same is true of the
+// pre-existing bring-up write pipeline here (init.timing j3init.total 4736 ms
+// / 12556 xfers = 377 us/xfer) — which is the control that says "this host
+// does not reward pipelining", not "ctrl_batch is broken". 375 us is 3 USB
+// high-speed microframes, consistent with this host's xHCI putting each
+// SETUP/DATA/STATUS stage in its own microframe and starting no EP0 TD before
+// the previous one retires.
+// Net: the PC is the pessimistic host and is NOT where this feature should be
+// judged. It remains a useful correctness rig (see the corruption story
+// below, which it could not have caught).
+//
+// --- P10: IS THE CACHED 0x1d2c/0x1eb4 SHADOW STILL WORTH IT? ---
+// On the GS, batched, the shadowless variant's penalty depends on which
+// statistic you use, and the honest answer is that it straddles the 5%
+// decision rule:
+//   per-run medians (mean 588 -> 603):  +2.4%   } within 5%
+//   median of the per-run medians:      +1.5%   }
+//   per-run minima  (mean 456 -> 488):  +7.1%   } outside 5%
+//   median of the per-run minima:       +9.6%   }
+// Individual per-run ratios ranged -16.5% to +24.3% — the difference is at or
+// near this host's measurement resolution, which is itself the finding. In
+// absolute terms the shadow saves 15-45 us on a ~590 us call; unbatched it
+// saved ~550 us on a ~2.8 ms call (+19-23%), which is why it was built.
+// For contrast, on the PC the shadowless penalty is a flat +20.0% in 9 of 9
+// runs with zero variance — because there the 2 extra transfers cost their
+// full 375 us each. If the PC were the target, the shadow would clearly stay.
+//
+// --- A SILENT DATA-CORRUPTION BUG THE PC RIG COULD NOT SEE ---
+// The first GS run of the batched path returned fa_ofdm in the tens of
+// thousands and cca_ofdm values of 16384/49152/12672/13184 — which are the
+// high halves of 0x40000000 / 0xC0000000 / 0x31800002 / 0x33800002, i.e. the
+// scout's own reset WRITE dwords showing up as counter READ values. Cause:
+// async_write_cb sets a slot's `done` and only then returns it to the free
+// pool, so a waiter can finish a call while the reaping thread has not yet
+// released those slots; the next call then started an 8-op chunk with 6-7
+// slots free, ran dry mid-submit, waited for "progress", and was handed one
+// of ITS OWN just-completed reads — whose buffer it refilled with a later
+// write before the wait loop copied the read out. Fixed by the acquire phase
+// in UsbTransport::ctrl_batch (all of a chunk's slots taken BEFORE anything
+// is submitted, chunk sized by what was actually free). It never reproduced
+// on the PC host, where EP0 transfers do not overlap at all and each one
+// completes before the next slot is taken — which is precisely why the
+// kImplausibleCount tripwire above now exists: the old bench would have
+// printed "fa_ofdm 0..61826" and an operator would have read it as a busy
+// channel.
 #ifdef _WIN32
 #define NOMINMAX
 #endif
@@ -161,6 +257,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <memory>
 #include <thread>
@@ -198,7 +295,21 @@ struct RunResult {
   Stats us{};
   uint32_t fa_min = std::numeric_limits<uint32_t>::max(), fa_max = 0;
   uint32_t cca_min = std::numeric_limits<uint32_t>::max(), cca_max = 0;
+  /* Calls whose fa_ofdm/cca_ofdm are physically impossible for the window
+   * they cover — the tripwire for READ PAYLOAD CORRUPTION, added after the
+   * batched path's first GS run (2026-09-15) returned the reset WRITE dwords
+   * (0x40000000 / 0x33800002) as counter values because a chunk had recycled
+   * one of its own in-flight slots (see UsbTransport::ctrl_batch's acquire
+   * phase). These are 16-bit BB counters sampled over a sub-millisecond to
+   * few-millisecond window; a few hundred events is a busy channel, tens of
+   * thousands is not a channel, it is memory. A bench that only printed
+   * min..max would have shown "fa_ofdm 0..61826" and been read as "busy
+   * channel" — so this is counted and shouted about, not just printed. */
+  int n_implausible = 0;
 };
+
+/* Above this, a counter value is not a reading. See RunResult::n_implausible. */
+constexpr uint32_t kImplausibleCount = 4096;
 
 /* Runs `n` calls of `fn`, bracketing usb_ctrl_xfers() and the clock around
  * EACH INDIVIDUAL call (see the file header for why this replaced a single
@@ -218,6 +329,8 @@ RunResult bench_run(Fn fn, int n) {
                 .count();
     xfers[i] = devourer::usb_ctrl_xfers().load() - x0;
     if (e.valid_fa) {
+      if (e.fa_ofdm > kImplausibleCount || e.cca_ofdm > kImplausibleCount)
+        ++r.n_implausible;
       r.fa_min = std::min(r.fa_min, e.fa_ofdm);
       r.fa_max = std::max(r.fa_max, e.fa_ofdm);
       r.cca_min = std::min(r.cca_min, e.cca_ofdm);
@@ -251,6 +364,12 @@ void print_run(const char *label, int run_idx, int runs, int n,
       r.xfer_mean, (unsigned long long)r.xfer_max,
       (unsigned long long)r.contam_excess, r.n_contam, r.us.min, r.us.med,
       r.us.mean, r.us.max, r.fa_min, r.fa_max, r.cca_min, r.cca_max);
+  if (r.n_implausible)
+    std::fprintf(stderr,
+                 "** %s run %d/%d: %d/%d calls returned an IMPOSSIBLE counter "
+                 "value (>%u) — this is read-payload corruption, not a busy "
+                 "channel; every latency number in this run is suspect **\n",
+                 label, run_idx, runs, r.n_implausible, n, kImplausibleCount);
   /* NOT a per-run "fa_max==0 => stuck" warning here on purpose: a quiet
    * bench channel legitimately produces all-zero fa_ofdm across a whole
    * run of ~4-9 ms windows for BOTH functions (measured 2026-09-15 — see
@@ -309,6 +428,17 @@ int main() {
   session.adopt_lock(lock);
 
   devourer::DeviceConfig cfg;
+  /* A/B knob for the batched-EP0 path (DeviceConfig::usb.ctrl_batch): =0 runs
+   * the scout's register group through the synchronous per-op default, which
+   * is the pre-batch behaviour and therefore the honest control for every
+   * latency number this bench prints. The library itself reads no environment
+   * (global constraint); this is the demo/bench side doing the mapping, same
+   * as examples/common/env_config.cpp. */
+  if (const char *e = std::getenv("DEVOURER_CTRL_BATCH"))
+    cfg.usb.ctrl_batch = (std::strcmp(e, "0") != 0);
+  std::printf("ctrl_batch: %s (DEVOURER_CTRL_BATCH=0 to compare against the "
+              "synchronous per-op path)\n",
+              cfg.usb.ctrl_batch ? "ON" : "OFF");
   WiFiDriver driver(logger);
   std::unique_ptr<IRtlDevice> owned = driver.CreateRtlDevice(handle, ctx, lock, cfg);
   if (!owned) {
@@ -363,11 +493,25 @@ int main() {
 
   constexpr int kCalls = 200;
   constexpr int kRuns = 3;
-  std::vector<RunResult> scout_runs, full_runs;
+  std::vector<RunResult> scout_runs, full_runs, noshadow_runs;
   for (int run = 1; run <= kRuns; ++run) {
     RunResult rs = bench_run([dev] { return dev->GetRxEnergyScout(); }, kCalls);
     print_run("GetRxEnergyScout", run, kRuns, kCalls, rs);
     scout_runs.push_back(rs);
+    /* P10 A/B: the SAME read with no cached 0x1d2c/0x1eb4 shadow — 12
+     * transfers instead of 10, but (at kAsyncWriteDepth = 8) still two
+     * completion waits, so this measures what the shadow's whole
+     * five-invalidation-point coherence protocol actually buys once the
+     * transfers are batched. Interleaved with the shadowed run inside the
+     * same loop iteration on purpose: the coex tick's ~2 s cadence and any
+     * slow drift in the RF environment then hit both variants alike, which a
+     * back-to-back "all of A, then all of B" layout would not guarantee. */
+    if (j3) {
+      RunResult rn =
+          bench_run([j3] { return j3->DebugScoutShadowless(); }, kCalls);
+      print_run("ScoutShadowless(P10)", run, kRuns, kCalls, rn);
+      noshadow_runs.push_back(rn);
+    }
     RunResult rf = bench_run(
         [dev] { return dev->GetRxEnergy(/*with_nhm=*/false); }, kCalls);
     print_run("GetRxEnergy(false)", run, kRuns, kCalls, rf);
@@ -417,8 +561,43 @@ int main() {
         floor_min == floor_max ? " (stable)" : " (NOT stable — see per-run lines)",
         mean_min, mean_max);
   };
+  int implausible = 0;
+  for (const auto *v : {&scout_runs, &noshadow_runs, &full_runs})
+    for (const auto &r : *v)
+      implausible += r.n_implausible;
+  std::printf("counter plausibility: %s (%d call(s) over the %u bound across "
+              "every run)\n",
+              implausible ? "** FAILED — read payloads were corrupted **"
+                          : "ok",
+              implausible, kImplausibleCount);
+
   summarize_runs("GetRxEnergyScout", scout_runs);
+  if (!noshadow_runs.empty())
+    summarize_runs("ScoutShadowless(P10)", noshadow_runs);
   summarize_runs("GetRxEnergy(false)", full_runs);
+
+  /* P10 verdict input: the per-run MEDIAN latency of each variant, and the
+   * shadowless penalty as a percentage. Medians, not minima — the decision
+   * rule is about what a scout dwell typically costs, and the minimum hides
+   * the tail that the ladder actually lives in. Both the best and the worst
+   * run-pair ratio are printed: quoting only the favourable one is exactly
+   * the habit the operator's standing rule forbids. */
+  if (!noshadow_runs.empty()) {
+    double best = 1e9, worst = -1e9;
+    std::printf("P10 shadow A/B (per-run medians, us): ");
+    for (size_t i = 0; i < scout_runs.size() && i < noshadow_runs.size(); ++i) {
+      const double a = scout_runs[i].us.med, b = noshadow_runs[i].us.med;
+      const double pct = (b - a) / a * 100.0;
+      best = std::min(best, pct);
+      worst = std::max(worst, pct);
+      std::printf("[run %zu shadowed %.0f vs shadowless %.0f = %+.1f%%] ",
+                  i + 1, a, b, pct);
+    }
+    std::printf("\nP10 shadowless penalty across runs: %+.1f%% .. %+.1f%% "
+                "(decision rule: within ~5%% => the shadow's coherence "
+                "protocol is no longer paying for itself)\n",
+                best, worst);
+  }
 
   return 0;
 }

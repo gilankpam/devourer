@@ -39,6 +39,18 @@ struct UsbLinkInfo {
   std::vector<uint8_t> bulk_out_eps; /* descriptor order */
 };
 
+/* ---- batched control transfers (mabur in-flight hop, 2026-09-14) ---------
+ * One register access in a group submitted to IRtlTransport::ctrl_batch.
+ * `value` is the payload for a write and the RESULT slot for a read (filled
+ * in place, in this op's own element — see the contract on ctrl_batch).
+ * Namespace scope, not nested in IRtlTransport: the selftest, RtlAdapter's
+ * forwarder and every call site name it `devourer::CtrlOp`. */
+struct CtrlOp {
+  bool write;
+  uint16_t addr;
+  uint32_t value;
+};
+
 class IRtlTransport {
 public:
   virtual ~IRtlTransport() = default;
@@ -81,6 +93,58 @@ public:
   virtual void write_batch_begin() {}
   virtual void write_batch_end() {}
   virtual void flush_writes() {}
+
+  /* ---- batched control transfers (mabur in-flight hop, 2026-09-14) ----
+   * A group of EP0 register reads/writes submitted back to back and waited
+   * for in as few completion waits as the transport's slot pool allows: on
+   * USB the per-transfer host turnaround is paid roughly once per CHUNK
+   * instead of once per op. (Not "once per batch": UsbTransport's async slot
+   * pool is 8 deep — kAsyncWriteDepth, tuned for the ~14k-write bring-up
+   * pipeline and deliberately not raised for this — so a 10-op batch is two
+   * chunks and two waits. Size a latency-critical group with that in mind:
+   * on the RK3566 ground station the per-WAIT cost is ~290 us and the
+   * per-op cost inside a chunk is only ~7-16 us, so the wait count is the
+   * thing to minimise.)
+   * The win is strongly host-dependent: 4.8x on that ground station (2829 ->
+   * 588 us for the 10-op scout read), but exactly ZERO on an x86 xHCI bench
+   * host, where the per-transfer cost is wire time rather than host
+   * turnaround and nothing overlaps. See DeviceConfig::Usb::ctrl_batch and
+   * tests/scout_read_bench.cpp's header before quoting a benefit.
+   *
+   * CONTRACT, owed by every implementation:
+   *   - ops execute in submission order, so a read after a write to the same
+   *     address in one batch sees that write (on USB this is EP0's in-order
+   *     completion, the property the pipelined write batch already rests on);
+   *   - each read's value lands in ITS OWN op's `value`;
+   *   - a write op's `value` is an input and comes back untouched;
+   *   - returns false if ANY op failed, and a failure does NOT abort the rest
+   *     of the batch (a half-issued hop leaves a 3-wire bracket open or a BB
+   *     reset asserted — finishing and reporting beats bailing out).
+   * tests/ctrl_batch_selftest.cpp pins all four against a fake transport.
+   *
+   * Serialized by the CALLER (RtlJaguar3Device holds _reg_mu for the whole
+   * group; the transport additionally takes its own mutex so a bring-up
+   * write_batch_* and a runtime ctrl_batch can never interleave over the same
+   * slot pool). Default: synchronous, in order — correct on PCIe and on any
+   * transport that has nothing to pipeline.
+   *
+   * HAZARD, USB: the implementation pumps libusb events from the CALLING
+   * thread while the RX bulk pump may be doing the same on its own thread.
+   * libusb permits that, but either thread may reap either thread's
+   * completions, so RX callbacks can run on the scout's thread and vice
+   * versa. The wait loop must therefore key on the per-slot `done` flag the
+   * completion callback sets — never on "I pumped, therefore mine finished".
+   * See UsbTransport::ctrl_batch. */
+  virtual bool ctrl_batch(std::vector<CtrlOp> &ops) {
+    bool ok = true;
+    for (CtrlOp &op : ops) {
+      if (op.write)
+        ok = write32(op.addr, op.value) && ok;
+      else
+        op.value = read32(op.addr);
+    }
+    return ok;
+  }
 
   /* ---- frame plane ---- */
   /* Fire-and-forget data TX (the send_packet hot path). `ep` is the USB

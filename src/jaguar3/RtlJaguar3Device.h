@@ -192,6 +192,22 @@ public:
    * reset never pays a read-modify-write. Fills only valid_fa/fa_ofdm/
    * cca_ofdm; see ScoutEnergyMath.h and the .cpp doc comment. */
   RxEnergy GetRxEnergyScout() override;
+  /* Shared body of GetRxEnergyScout, parameterised on whether the composed
+   * reset comes from the cached 0x1d2c/0x1eb4 shadow (production) or from two
+   * extra reads folded into the same batch (the P10 A/B). Caller holds
+   * _reg_mu. See the .cpp for what the two variants cost. */
+  RxEnergy scout_energy_locked(bool use_shadow);
+  /* Bench/debug-only: the SHADOWLESS scout read (12 transfers, no cached
+   * 0x1d2c/0x1eb4, no invalidation protocol), so tests/scout_read_bench can
+   * measure it head-to-head against the production shadowed path on the same
+   * hardware in the same run. Exists to settle whether the shadow still earns
+   * its five hand-maintained invalidation points now that the transfers are
+   * batched (mabur 2026-09-14 ruling P10); delete it with the loser. Not on
+   * IRtlDevice — chip-specific, like DebugPeekBb, and the bench downcasts. */
+  RxEnergy DebugScoutShadowless() {
+    std::lock_guard<std::mutex> lk(_reg_mu);
+    return scout_energy_locked(/*use_shadow=*/false);
+  }
   /* Shadows for the composed reset (0x1d2c, 0x1eb4), primed with 2 reads on
    * first use.
    *
