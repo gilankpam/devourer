@@ -192,8 +192,13 @@ private:
    * synchronous default (the A/B knob, DEVOURER_CTRL_BATCH=0). */
   bool _cfg_ctrl_batch = true;
   /* Set when a drain gave up with transfers still submitted: the destructor
-   * then leaks those slots instead of freeing a transfer libusb still owns. */
-  bool _aw_abandoned = false;
+   * then leaks those slots instead of freeing a transfer libusb still owns.
+   * ATOMIC because flush_writes() can set it from whichever thread reaped
+   * (or failed to reap) the queue, while ctrl_batch re-reads it between
+   * chunks — the pool is dead from that point and every further chunk would
+   * otherwise submit into it and pay a ~2 s drain EACH, with the caller's
+   * _reg_mu held the whole time. */
+  std::atomic<bool> _aw_abandoned{false};
   void discover_endpoints(); /* was InitDvObj */
   const char *speed_str() const;
   static void transfer_callback(struct libusb_transfer *transfer);

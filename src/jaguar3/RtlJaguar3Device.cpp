@@ -1213,9 +1213,12 @@ RxEnergy RtlJaguar3Device::GetRxEnergy(bool with_nhm) {
 }
 
 /* Minimal frame-free OFDM FA + CCA read for the in-session channel scout
- * (mabur 2026-09-14 spec §6). ONE batched group of 12 EP0 transfers: 8 reads
- * (0x2c08, the five OFDM FA words, and 0x1d2c/0x1eb4) followed by the 4-write
- * OFDM counter reset composed in memory from the two dwords just read.
+ * (mabur 2026-09-14 spec §6). 12 EP0 transfers in TWO batched groups: 8 reads
+ * (0x2c08, the five OFDM FA words, and 0x1d2c/0x1eb4), then the 4-write OFDM
+ * counter reset composed in memory from the two dwords just read — the writes
+ * depend on those reads, so they cannot ride the same group. At
+ * kAsyncWriteDepth = 8 that is two completion waits (see the follow-up note
+ * at that constant).
  * Composed full-dword writes, never phy_set_bb_reg — masked BB writes on JGR3
  * have the double-shift gotcha (jaguar3/CLAUDE.md) and cost a read-modify-
  * write each. Batched: see IRtlTransport::ctrl_batch.
@@ -1227,6 +1230,15 @@ RxEnergy RtlJaguar3Device::GetRxEnergy(bool with_nhm) {
  * its five hand-maintained invalidation points — one of them a firmware
  * branch that cannot be audited from the host at all — were deleted rather
  * than maintained. tests/scout_read_bench.cpp's header carries the numbers.
+ *
+ * ONE HARDWARE-BEHAVIOUR CHANGE batching introduces, recorded so a future
+ * oddity has a documented suspect: pipelining narrows the 0x1eb4[25]
+ * counter-reset pulse (and, on the hop path, the 0x0[16] BB-reset pulse) from
+ * the ~290-375 us a synchronous register write took to the ~7-16 us of one
+ * pipelined transfer. Accepted: that is still far wider than the vendor
+ * kernel gives these pulses over PCIe MMIO, and the on-air readings after the
+ * change are consistent (counters reset every call, real activity captured,
+ * no upward drift over a 200-call run).
  *
  * Fills ONLY valid_fa/fa_ofdm/cca_ofdm — cca_cck, fa_cck, igi/valid_igi, NHM
  * and the noise floor are left invalid/zero, and valid_cck is left at its

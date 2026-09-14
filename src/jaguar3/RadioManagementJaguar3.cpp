@@ -792,16 +792,46 @@ bool RadioManagementJaguar3::fast_retune(uint8_t channel,
   auto wr = [&](uint16_t addr, uint32_t v) {
     ops.push_back(devourer::CtrlOp{true, addr, v});
   };
+  /* A FAILED BATCH MUST NOT BE SWALLOWED HERE, even though the unbatched code
+   * this replaced ignored every rtw_write32 return. That parity argument is
+   * about kind, not severity, and severity is what decides it: a per-register
+   * write failed one register at a time, whereas ctrl_batch fails WHOLESALE —
+   * a dead pool takes all 9-11 hop writes at once. Carrying on would leave
+   * _cw_1c90/_cw_1830/_cw_4130/_cw_r0 and the _last_sco/_last_dfir/
+   * _last_agc_key bucket keys all asserting values the chip never received,
+   * and because the next hop only writes a bucket when its key MOVED, it
+   * would then skip re-writing them — the radio can sit on a wrong or
+   * half-applied channel config indefinitely. On a hop path in a video link
+   * that is link loss.
+   *
+   * Note _cw_primed = false alone (the idiom the fw branch uses) is NOT
+   * enough: re-priming re-reads the dwords but does not touch the bucket
+   * keys, so a stale _last_sco/_last_dfir would still gate out the very write
+   * that failed. invalidate_fast_caches() clears both, and returning false
+   * makes RtlJaguar3Device::FastRetune fall back to the full
+   * set_channel_bwmode, which rewrites the whole configuration from scratch
+   * (and sets _last_channel itself) — the only repair that is sound after a
+   * partially applied hop. */
+  auto hop_failed = [&]() {
+    _logger->error("Jaguar3: fast retune to ch {} could not reach the chip — "
+                   "dropping the fast-path caches and resyncing via the full "
+                   "channel set",
+                   channel);
+    invalidate_fast_caches();
+    return false;
+  };
 
   wr(0x1c90, _cw_1c90 & ~(1u << 8)); /* rstb_3wire(false) */
   if (is_c && !_rxbb_asserted) {
-    issue();
+    if (!issue())
+      return hop_failed();
     apply_rxbb(bwmode);
   }
   wr(static_cast<uint16_t>(0x3c00 + (0x18 << 2)), win_a);
   wr(static_cast<uint16_t>(0x4c00 + (0x18 << 2)), win_b);
   if (!is_c && !_rxbb_asserted) {
-    issue();
+    if (!issue())
+      return hop_failed();
     apply_rxbb(bwmode);
   }
   _rxbb_asserted = true;
@@ -825,7 +855,10 @@ bool RadioManagementJaguar3::fast_retune(uint8_t channel,
                                         : 3) |
                       (bw20 ? 0x10 : 0);
   if (agc_key != _last_agc_key) {
-    issue(); /* select_agc_tables writes registers itself — keep hop order */
+    /* select_agc_tables writes registers itself — flush first to keep hop
+     * order. */
+    if (!issue())
+      return hop_failed();
     select_agc_tables(central, bwmode);
     _last_agc_key = agc_key;
   }
@@ -867,7 +900,8 @@ bool RadioManagementJaguar3::fast_retune(uint8_t channel,
   wr(0x0, _cw_r0 & ~(1u << 16));
   wr(0x0, _cw_r0 | (1u << 16));
   _cw_r0 |= (1u << 16);
-  issue(); /* the one place the accumulated hop actually hits the wire */
+  if (!issue()) /* the one place the accumulated hop actually hits the wire */
+    return hop_failed();
   prof.mark("bbrst");
 
   _last_channel = channel;

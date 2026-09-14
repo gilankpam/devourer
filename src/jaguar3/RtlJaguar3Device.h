@@ -187,8 +187,10 @@ public:
    * recipe; NoiseFloorMath.h) — this generation has no idle-noise report. */
   RxEnergy GetRxEnergy(bool with_nhm) override;
 
-  /* Frame-free scout read (see IRtlDevice::GetRxEnergyScout) — one batched
-   * group of 8 reads + a 4-write composed reset, 12 EP0 transfers. The two
+  /* Frame-free scout read (see IRtlDevice::GetRxEnergyScout) — 8 reads then
+   * a 4-write composed reset, 12 EP0 transfers in TWO batched groups (the
+   * writes are composed from two of the reads, so they cannot share a
+   * group; at kAsyncWriteDepth = 8 that is two completion waits). The two
    * reset dwords (0x1d2c/0x1eb4) are read fresh inside the same batch every
    * call: an earlier revision cached them behind a primed shadow, but once
    * the group was batched the two reads it saved were inside run-to-run

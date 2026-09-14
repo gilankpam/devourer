@@ -402,7 +402,7 @@ void UsbTransport::write_batch_begin() {
     return;
   /* A session that already failed to reap its transfers has a short pool and
    * a suspect event loop; stay synchronous rather than pipeline into it. */
-  if (_aw_abandoned)
+  if (_aw_abandoned.load(std::memory_order_acquire))
     return;
   ensure_async_slots();
   _aw_errors.store(0, std::memory_order_relaxed);
@@ -412,10 +412,17 @@ void UsbTransport::write_batch_begin() {
 void UsbTransport::write_batch_end() {
   std::lock_guard<std::mutex> lk(_batch_mu);
   flush_writes();
+  /* _aw_errors belongs to THIS batch: write_batch_begin zeroes it, and a
+   * runtime ctrl_batch cannot overlap a bring-up batch (it falls back to the
+   * synchronous path while _batch is set, and both take _batch_mu), so
+   * nothing else can have contributed between the two. ctrl_batch reports its
+   * own failures through its return value and its own log lines rather than
+   * adding to this counter. "transfer", not "write": async_read lands here
+   * too. */
   const int errs = _aw_errors.load(std::memory_order_relaxed);
   if (_batch && errs)
-    _logger->error("USB: {} pipelined register write(s) failed in this batch",
-                   errs);
+    _logger->error("USB: {} pipelined register transfer(s) failed in this "
+                   "batch", errs);
   _batch = false;
 }
 
@@ -579,7 +586,7 @@ void UsbTransport::flush_writes() {
        * immediately, so the turns above cost nothing). Leave the slots
        * submitted and off the free list; the destructor leaks them. */
       _aw_errors.fetch_add(stuck, std::memory_order_relaxed);
-      _aw_abandoned = true;
+      _aw_abandoned.store(true, std::memory_order_release);
       _logger->error("USB: {} pipelined transfer(s) could not be reaped; "
                      "their slots are retired for this session",
                      stuck);
@@ -638,21 +645,38 @@ bool UsbTransport::async_write(uint16_t wvalue, uint16_t windex,
  *   2. Ops are paired with their slots explicitly (`Pending{idx, w}`), so a
  *      mid-chunk submit failure cannot slide a cursor and write one op's
  *      register value into another op's `value` — a wrong number rather than
- *      an error. tests/ctrl_batch_selftest.cpp case 2 pins that contract.
+ *      an error. NOTHING IN THE HEADLESS SUITE GUARDS THIS FUNCTION:
+ *      tests/ctrl_batch_selftest.cpp pins the CONTRACT against a fake
+ *      transport (it includes RtlTransport.h only and never reaches this
+ *      code), so it exercises the synchronous default, not this. A green
+ *      ctest is NOT evidence that a change here is safe. The guard for this
+ *      code is on-hardware: tests/scout_read_bench.cpp's counter-plausibility
+ *      tripwire, which is what would catch a mis-paired read.
  *
  * async_take_slot() CAN RETURN NULL (an unrecoverable pool); that op fails and
  * the batch reports false. Never dereferenced blind.
  *
- * THREADING. _batch_mu is held for the whole call, so a bring-up write batch
- * (write_batch_begin/end take the same mutex) can never interleave with this
- * over the shared slot pool; if one is somehow already open, or the pool was
+ * THREADING. _batch_mu is held for the whole call and across the _batch flip
+ * in write_batch_begin/end, so this cannot start while a bring-up write batch
+ * is being opened or closed; if one is already open, or the pool was
  * abandoned, or the config knob is off, fall back to the synchronous default.
+ * BE PRECISE ABOUT WHAT THAT MUTEX BUYS, THOUGH: it is NOT what makes a
+ * concurrent bring-up safe. The fallback runs the base ctrl_batch, which
+ * calls read32/write32 -> ctrl_read/ctrl_write, and those re-enter
+ * async_read/async_write when _batch is set — taking slots from the very same
+ * pool the bring-up thread is using, outside _batch_mu. That is safe TODAY
+ * only because of the pre-existing single-threaded-bring-up contract on
+ * write_batch_begin (IRtlTransport). Anyone making bring-up concurrent must
+ * fix that; this mutex does not cover them.
  * The deeper hazard is the event pump: this function pumps
  * libusb_handle_events_timeout_completed on the caller's thread while the RX
  * bulk loop pumps the same context on its own thread. libusb permits that,
  * but EITHER thread may reap EITHER thread's completions — so our control
  * transfers can complete on the RX thread, and RX URBs can complete on ours
- * (their callbacks then run here, on the scout's thread, inside this call).
+ * (their callbacks then run here, inside this call). And "ours" is not only
+ * the scout's thread: the cached FastRetune hop batches through here too, and
+ * RtlJaguar3Device::FastRetune is called from the TX path, so a SENDER thread
+ * pumps libusb here as well.
  * The wait therefore keys on the per-slot `done` flag, which async_write_cb
  * sets regardless of who reaped it; it never assumes "I pumped, so mine
  * finished". The RX-callback-on-our-thread direction is benign for us (it is
@@ -663,9 +687,20 @@ bool UsbTransport::ctrl_batch(std::vector<CtrlOp> &ops) {
   std::lock_guard<std::mutex> lk(_batch_mu);
   if (ops.empty())
     return true;
-  if (_batch || _aw_abandoned || !_cfg_ctrl_batch)
+  if (_batch || _aw_abandoned.load(std::memory_order_acquire) ||
+      !_cfg_ctrl_batch)
     return IRtlTransport::ctrl_batch(ops);
   ensure_async_slots();
+
+  /* Run ops[from..] synchronously and report the combined result. Used
+   * whenever the async pool stops being usable partway through a batch. */
+  auto finish_synchronously = [&](size_t from, bool ok_so_far) {
+    std::vector<CtrlOp> rest(ops.begin() + from, ops.end());
+    const bool rok = IRtlTransport::ctrl_batch(rest);
+    for (size_t i = 0; i < rest.size(); ++i)
+      ops[from + i] = rest[i];
+    return rok && ok_so_far;
+  };
 
   struct Pending {
     size_t idx;    /* index into `ops` — never a separate cursor */
@@ -678,6 +713,14 @@ bool UsbTransport::ctrl_batch(std::vector<CtrlOp> &ops) {
 
   bool ok = true;
   for (size_t base = 0; base < ops.size();) {
+    /* The pool can die mid-batch: a drain that times out inside this very
+     * call latches _aw_abandoned and retires its slots. Re-check EVERY chunk
+     * — submitting into a dead pool costs up to ~2 s of drain per chunk, and
+     * the caller (RtlJaguar3Device) is holding _reg_mu throughout, so every
+     * register access on the device freezes for as long as it takes. */
+    if (_aw_abandoned.load(std::memory_order_acquire))
+      return finish_synchronously(base, ok);
+
     /* ---- ACQUIRE PHASE, and it is load-bearing ----
      * Every slot this chunk will use is taken BEFORE anything is submitted,
      * and the chunk is sized by how many were actually free — not by
@@ -725,10 +768,7 @@ bool UsbTransport::ctrl_batch(std::vector<CtrlOp> &ops) {
         _logger->error("USB: ctrl_batch has no usable transfer slot at reg "
                        "{:04x}; running the remaining {} op(s) synchronously",
                        ops[base].addr, ops.size() - base);
-        std::vector<CtrlOp> rest(ops.begin() + base, ops.end());
-        IRtlTransport::ctrl_batch(rest);
-        for (size_t i = 0; i < rest.size(); ++i)
-          ops[base + i] = rest[i];
+        finish_synchronously(base, ok);
         return false;
       }
       slots.push_back(w);
@@ -749,18 +789,21 @@ bool UsbTransport::ctrl_batch(std::vector<CtrlOp> &ops) {
        * thread before this thread gets another instruction in. */
       w->inflight.store(true, std::memory_order_relaxed);
       _aw_inflight.fetch_add(1, std::memory_order_relaxed);
-      usb_ctrl_xfers().fetch_add(1, std::memory_order_relaxed);
       const int rc = libusb_submit_transfer(w->t);
       if (rc != 0) {
         w->inflight.store(false, std::memory_order_relaxed);
         _aw_inflight.fetch_sub(1, std::memory_order_relaxed);
-        _aw_errors.fetch_add(1, std::memory_order_relaxed);
         async_release_slot(w);
         _logger->error("USB: ctrl_batch submit failed ({}) for reg {:04x}", rc,
                        op.addr);
         ok = false;
         continue; /* the REST of the batch still runs — see the contract */
       }
+      /* Counted only once the transfer is actually on the bus. A submit that
+       * failed put nothing on the wire, and scout_read_bench divides latency
+       * by this count to derive a per-transfer cost — over-reporting it would
+       * corrupt exactly the runs where something went wrong. */
+      usb_ctrl_xfers().fetch_add(1, std::memory_order_relaxed);
       used.push_back(Pending{base + i, w});
     }
     for (const Pending &p : used) {

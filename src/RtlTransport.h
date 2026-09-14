@@ -105,8 +105,8 @@ public:
    * on the RK3566 ground station the per-WAIT cost is ~290 us and the
    * per-op cost inside a chunk is only ~7-16 us, so the wait count is the
    * thing to minimise.)
-   * The win is strongly host-dependent: 4.8x on that ground station (2829 ->
-   * 588 us for the 10-op scout read), but exactly ZERO on an x86 xHCI bench
+   * The win is strongly host-dependent: 5.6x on that ground station (3372 ->
+   * 603 us for the 12-op scout read), but exactly ZERO on an x86 xHCI bench
    * host, where the per-transfer cost is wire time rather than host
    * turnaround and nothing overlaps. See DeviceConfig::Usb::ctrl_batch and
    * tests/scout_read_bench.cpp's header before quoting a benefit.

@@ -577,14 +577,15 @@ public:
    * INCLUDING valid_cck (see RxEnergy::valid_cck in RxSense.h: the scout
    * skips the CCK reset, so cca_cck/fa_cck are not comparable to a
    * GetRxEnergy sample and must not be summed with them un-gated).
-   * Jaguar3 overrides with an 8-read + 4-full-dword-write path issued as one
-   * batched EP0 group — MEASURED (tests/scout_read_bench.cpp, 8822EU,
-   * 2026-09-15) at 12 transfers/call against 24 for the full
-   * GetRxEnergy(false) on the same chip, and at 588 us median on the RK3566
-   * ground station against 2829 us for the same path unbatched (4.8x; the
-   * x86 bench host shows no batching win at all — see that file's header
-   * before quoting either number). The default delegates to the full read so
-   * any caller can use it on any chip. */
+   * Jaguar3 overrides with an 8-read + 4-full-dword-write path issued as TWO
+   * batched EP0 groups (the reset writes are composed from two of the reads,
+   * so they cannot ride the same group) — MEASURED
+   * (tests/scout_read_bench.cpp, 8822EU, 2026-09-15) at 12 transfers/call
+   * against 24 for the full GetRxEnergy(false) on the same chip, and at
+   * 603 us median on the RK3566 ground station against 3372 us for the same
+   * path unbatched (5.6x; the x86 bench host shows no batching win at all —
+   * see that file's header before quoting either number). The default
+   * delegates to the full read so any caller can use it on any chip. */
   virtual RxEnergy GetRxEnergyScout() { return GetRxEnergy(false); }
 
   /* Consolidated windowed RX link-quality snapshot (see RxQuality.h) — the
