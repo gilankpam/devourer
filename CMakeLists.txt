@@ -584,6 +584,15 @@ endif()
 add_executable(reglat tests/reglat.cpp)
 target_link_libraries(reglat PUBLIC devourer PRIVATE PkgConfig::libusb)
 
+# scout_read_bench — USB transfer-count + latency bench for
+# IRtlDevice::GetRxEnergyScout() vs the full GetRxEnergy(false) (Jaguar3
+# channel-scout, mabur 2026-09-14 spec §6). Needs a live Jaguar3 card and an
+# InitWrite bring-up, so it uses DeviceSession/WiFiDriver like the doctor
+# demo, not reglat's bare RtlAdapter path — see its header.
+add_executable(scout_read_bench tests/scout_read_bench.cpp)
+target_include_directories(scout_read_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/examples/common)
+target_link_libraries(scout_read_bench PUBLIC devourer PRIVATE PkgConfig::libusb)
+
 add_executable(rxdemo
     examples/rx/main.cpp
     examples/common/env_config.cpp
@@ -1007,6 +1016,12 @@ add_executable(LinkHealthSelftest
 target_link_libraries(LinkHealthSelftest PRIVATE devourer)
 
 add_test(NAME link_health_classify COMMAND LinkHealthSelftest)
+
+# Headless guard for the scout energy read's register arithmetic
+# (src/jaguar3/ScoutEnergyMath.h): FA vendor sum + reset dword composition.
+add_executable(ScoutEnergySelftest tests/scout_energy_selftest.cpp)
+target_link_libraries(ScoutEnergySelftest PRIVATE devourer)
+add_test(NAME scout_energy_math COMMAND ScoutEnergySelftest)
 
 # Headless guard for the adapter-health classifier + EFUSE-stability probe
 # loop (src/AdapterHealth.h) — the verdict mapping behind examples/doctor,

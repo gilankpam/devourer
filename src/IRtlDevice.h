@@ -569,6 +569,16 @@ public:
    * sampling faster than a few times a second. */
   virtual RxEnergy GetRxEnergy(bool with_nhm) { (void)with_nhm; return {}; }
 
+  /* Scout read: the cheapest frame-free OFDM FA + CCA delta the chip offers,
+   * for a caller that dwells on a candidate channel for a few ms and needs
+   * one number back per visit. Contract as GetRxEnergy(false) for the fields
+   * it fills (valid_fa, fa_ofdm, cca_ofdm; delta since the previous read of
+   * EITHER kind; resets the OFDM counters) — everything else is left invalid.
+   * Jaguar3 overrides with a 6-read + composed-write path (~14 transfers
+   * synchronous, ~6 batched); the default delegates to the full read so any
+   * caller can use it on any chip. */
+  virtual RxEnergy GetRxEnergyScout() { return GetRxEnergy(false); }
+
   /* Consolidated windowed RX link-quality snapshot (see RxQuality.h) — the
    * runtime feed a closed-loop adaptive-link controller reads instead of
    * scraping the demo's stdout. Fuses the per-frame RSSI/SNR/EVM aggregate the

@@ -187,6 +187,25 @@ public:
    * recipe; NoiseFloorMath.h) — this generation has no idle-noise report. */
   RxEnergy GetRxEnergy(bool with_nhm) override;
 
+  /* Frame-free scout read (see IRtlDevice::GetRxEnergyScout) — 6 reads + a
+   * composed 4-write reset, using cached shadows of 0x1d2c/0x1eb4 so the
+   * reset never pays a read-modify-write. Fills only valid_fa/fa_ofdm/
+   * cca_ofdm; see ScoutEnergyMath.h and the .cpp doc comment. */
+  RxEnergy GetRxEnergyScout() override;
+  /* Shadows for the composed reset (0x1d2c, 0x1eb4), primed with 2 reads on
+   * first use. Invalidated (forcing a re-prime) at the end of InitWrite (a
+   * re-init rewrites the BB) and in StartContinuousTx/StopContinuousTx
+   * (0x1eb4's packet_count field at line ~1091 is masked-written outside
+   * this shadow, so the cached copy would go stale and a later composed
+   * write would silently clobber it). Deliberately NOT invalidated in
+   * FastRetune: its whole write set (0x1c90, the RF windows, 0x1830/0x4130/
+   * 0xc30/0x808/0x0, select_agc_tables, apply_rxbb) never touches 0x1d2c or
+   * 0x1eb4, and a scout dwell is always preceded by a retune — invalidating
+   * there would re-prime on every single dwell and defeat the whole point
+   * of caching. */
+  bool _scout_primed = false;
+  uint32_t _scout_1d2c = 0, _scout_1eb4 = 0;
+
   /* Consolidated windowed RX link-quality snapshot (see RxQuality.h) — subsumes
    * GetRxEnergy. Fed per decoded frame in the RX loop via _rxq. On Jaguar3 the
    * always-on noise floor is the passive rssi-snr estimate; the absolute

@@ -24,6 +24,7 @@
 #include "RateDefinitions.h" /* MGN_* rate enum (shared across the family) */
 #include "SignalStop.h" /* g_devourer_should_stop — set by demo signal handlers */
 #include "ToneMask.h"   /* DEVOURER_RX_CSI_MASK / DEVOURER_RX_NBI knobs */
+#include "jaguar3/ScoutEnergyMath.h" /* GetRxEnergyScout's FA sum + reset composer */
 
 extern "C" {
 #include "ieee80211_radiotap.h" /* MRateToHwRate + radiotap iterator */
@@ -804,6 +805,7 @@ void RtlJaguar3Device::InitWrite(SelectedChannel channel) {
       _device.rtw_write<uint32_t>(0x0064, v64 & ~0x02040000u);
     }
     _logger->info("Jaguar3: CW tone hold (minimal bring-up, no coex thread)");
+    _scout_primed = false; /* re-init rewrites the BB; re-prime on next scout */
     return;
   }
 
@@ -964,6 +966,7 @@ void RtlJaguar3Device::InitWrite(SelectedChannel channel) {
   timer.stage("coex_thread_ampdu");
   timer.total();
   _logger->info("Jaguar3: ready for TX (monitor inject)");
+  _scout_primed = false; /* re-init rewrites the BB; re-prime on next scout */
 }
 
 /* MP single-tone (CW carrier), Jaguar3 (rtl8822c / rtl8822e) path A. Ported from
@@ -1104,6 +1107,9 @@ void RtlJaguar3Device::StartContinuousTx(const devourer::TxMode &mode) {
   _device.phy_set_bb_reg(0x1e70, 0xf, 0x4);        /* TX OFDM on */
 
   _cont_active = true;
+  /* 0x1eb4's packet_count field (above, masked write) dirties the low 20
+   * bits of the cached scout shadow outside its knowledge — re-prime. */
+  _scout_primed = false;
   _logger->info("Modulated continuous TX armed @ ch{} (Jaguar3 PMAC 6M HW "
                 "100%%-duty carrier; idle-hold, StopContinuousTx to end)",
                 _channel.Channel);
@@ -1129,6 +1135,9 @@ void RtlJaguar3Device::StopContinuousTx() {
   _device.phy_set_bb_reg(0x1a04, 0xf0000000, _cont_ccktx); /* restore CCK Tx */
 
   _cont_active = false;
+  /* Symmetric with StartContinuousTx: the 0x1d0c[16] BB reset pulse above
+   * plausibly disturbs 0x1eb4 outside the cached shadow too — re-prime. */
+  _scout_primed = false;
   _logger->info("Modulated continuous TX stopped — chip restored");
 }
 
@@ -1206,6 +1215,48 @@ RxEnergy RtlJaguar3Device::GetRxEnergy(bool with_nhm) {
   _device.phy_set_bb_reg(0x1eb4, 1u << 25, 0x0);
   _device.phy_set_bb_reg(0x1d2c, 1u << 31, 0x1);
 
+  return e;
+}
+
+/* Minimal frame-free OFDM FA + CCA read for the in-session channel scout
+ * (mabur 2026-09-14 spec §6). 6 reads (0x2c08 + the five FA words) and the
+ * 4-write OFDM counter reset composed from cached shadows of 0x1d2c/0x1eb4
+ * (primed with 2 reads once, invalidated on the paths documented at the
+ * shadow fields' declaration). Fills ONLY valid_fa/fa_ofdm/cca_ofdm —
+ * cca_cck, fa_cck, igi/valid_igi, NHM and the noise floor are left
+ * invalid/zero: the scout deliberately skips the CCK 0x1a2c reset toggles
+ * (they cost 4 more masked writes for a counter this caller never asked
+ * for), so a raw cca_cck read here would be a monotonically-accumulating
+ * counter next to every other RxEnergy field being a since-last-read delta
+ * — silently wrong, worse than absent. 0x1eb4[25] also clears the NHM
+ * counters, but the scout never arms an NHM window so that is moot.
+ *
+ * The OFDM FA/CCA delta is shared with PhydmRuntimeJaguar3::fa_stats() (the
+ * coex thread's periodic tick performs the identical 0x1d2c/0x1eb4 reset,
+ * consuming whatever accumulated since the last reset from either source) —
+ * pre-existing sharing (GetRxEnergy has it too), not something this path
+ * can fix; a caller reading a suspiciously-small delta right after a coex
+ * tick is seeing that, not a scout bug.
+ *
+ * Under _reg_mu like every register access here. */
+RxEnergy RtlJaguar3Device::GetRxEnergyScout() {
+  std::lock_guard<std::mutex> lk(_reg_mu);
+  RxEnergy e;
+  auto rd = [this](uint16_t addr) { return _device.rtw_read<uint32_t>(addr); };
+  if (!_scout_primed) {
+    _scout_1d2c = rd(0x1d2c);
+    _scout_1eb4 = rd(0x1eb4);
+    _scout_primed = true;
+  }
+  const uint32_t cca = rd(0x2c08);
+  e.cca_ofdm = (cca >> 16) & 0xffff;
+  e.fa_ofdm = devourer::jgr3::fa_ofdm_sum(rd(0x2d04), rd(0x2d08), rd(0x2d10), rd(0x2d20), rd(0x2d0c));
+  e.valid_fa = true;
+  const devourer::jgr3::ResetDwords r = devourer::jgr3::compose_reset(_scout_1d2c, _scout_1eb4);
+  _device.rtw_write32(0x1d2c, r.d1d2c_off);
+  _device.rtw_write32(0x1eb4, r.d1eb4_on);
+  _device.rtw_write32(0x1eb4, r.d1eb4_off);
+  _device.rtw_write32(0x1d2c, r.d1d2c_on);
   return e;
 }
 
