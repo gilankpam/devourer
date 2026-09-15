@@ -103,7 +103,10 @@ inline void emit_sense(EventSink &sink, const TxSenseSample &s,
    * emitting its cca_cck/fa_cck as plain zeros would be indistinguishable
    * from a genuinely quiet CCK band — and folding them into the rates below
    * would understate occupancy by however much CCK energy went uncounted.
-   * The rates therefore sum only the halves that are real. */
+   * The rates therefore sum only the halves that are real, and gate on
+   * valid_fa alone — the same admission test score_sample and chanmig's
+   * EvidenceStore apply. Emitting a rate the scorer would have ignored is
+   * how a log reader ends up investigating why the two disagree. */
   ev.f("valid_fa", s.valid_fa);
   if (s.valid_fa) {
     ev.f("cca_ofdm", (unsigned long long)s.cca_ofdm)
@@ -114,12 +117,11 @@ inline void emit_sense(EventSink &sink, const TxSenseSample &s,
     ev.f("cca_cck", (unsigned long long)s.cca_cck)
         .f("fa_cck", (unsigned long long)s.fa_cck);
   }
-  if (s.valid_fa || s.valid_cck) {
+  if (s.valid_fa) {
     const double ms = s.window_us ? s.window_us / 1000.0 : 1.0;
-    const unsigned long long cca = (s.valid_fa ? s.cca_ofdm : 0u) +
-                                   (s.valid_cck ? s.cca_cck : 0u);
-    const unsigned long long fa =
-        (s.valid_fa ? s.fa_ofdm : 0u) + (s.valid_cck ? s.fa_cck : 0u);
+    const unsigned long long cca =
+        s.cca_ofdm + (s.valid_cck ? s.cca_cck : 0u);
+    const unsigned long long fa = s.fa_ofdm + (s.valid_cck ? s.fa_cck : 0u);
     ev.f("cca_rate", cca / ms).f("fa_rate", fa / ms);
   }
   ev.f("valid_igi", s.valid_igi);
