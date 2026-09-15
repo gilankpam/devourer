@@ -1,17 +1,35 @@
+/* Headless guard for the Jaguar3 scout energy read's register arithmetic
+ * (src/jaguar3/ScoutEnergyMath.h): the vendor OFDM false-alarm sum and the
+ * full-dword composition of the BB counter reset. Pure math; no hardware.
+ * Guards the copy BOTH paths actually run — GetRxEnergyScout and the full
+ * GetRxEnergy share fa_ofdm_sum — rather than a shadow of it. The failure
+ * this exists for is silent: a dropped bit in compose_reset holds the OFDM
+ * counters in permanent reset, which reads on air as a perfectly quiet
+ * channel. */
+#include "jaguar3/ScoutEnergyMath.h"
+
 #include <cstdio>
 #include <cstdlib>
-#include "jaguar3/ScoutEnergyMath.h"
+
 static int fails = 0;
-#define CHECK(c) do { if (!(c)) { std::fprintf(stderr, "FAIL %s:%d %s\n", __FILE__, __LINE__, #c); ++fails; } } while (0)
+#define CHECK(c)                                                               \
+  do {                                                                         \
+    if (!(c)) {                                                                \
+      std::fprintf(stderr, "FAIL %s:%d %s\n", __FILE__, __LINE__, #c);         \
+      ++fails;                                                                 \
+    }                                                                          \
+  } while (0)
+
 int main() {
   using namespace devourer::jgr3;
   // Vendor sum: parity(2d04 hi) + rate-illegal(2d08 lo) + crc8(2d08 hi) +
   // mcs(2d10 lo) + fast-fsync(2d20 lo) + sb-search(2d20 hi) + mcs-vht(2d10 hi)
   // + crc8-vhta(2d0c lo). Same formula as GetRxEnergy.
-  CHECK(fa_ofdm_sum(0x00010000, 0x00030002, 0x00070004, 0x00060005, 0x00000008) ==
-        1 + 2 + 3 + 4 + 5 + 6 + 7 + 8);
+  CHECK(fa_ofdm_sum(0x00010000, 0x00030002, 0x00070004, 0x00060005,
+                    0x00000008) == 1 + 2 + 3 + 4 + 5 + 6 + 7 + 8);
   CHECK(fa_ofdm_sum(0, 0, 0, 0, 0) == 0);
-  CHECK(fa_ofdm_sum(0xffff0000, 0xffffffff, 0xffffffff, 0xffffffff, 0x0000ffff) == 8u * 0xffff);
+  CHECK(fa_ofdm_sum(0xffff0000, 0xffffffff, 0xffffffff, 0xffffffff,
+                    0x0000ffff) == 8u * 0xffff);
   // Reset dwords: 0x1d2c[31] off, 0x1eb4[25] on, 0x1eb4[25] off, 0x1d2c[31] on,
   // every other bit of the shadow preserved.
   //

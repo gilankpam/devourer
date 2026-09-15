@@ -63,7 +63,9 @@ waited on their own completion), bulk transfers and `flush_writes` wait.
 the coex thread starts): 1.30 → 0.65 s warm, 2.04 → ~0.7 s cold, one
 drone-side unit. **`Init` (RX-only) opens no batch yet** — not measured on a
 ground-station card.
-Batches are single-threaded by contract. The ms-scale settle delays
+`write_batch_begin/end` batches are single-threaded by contract (that is the
+bring-up scope only — the runtime `ctrl_batch` path below is a different,
+explicitly cross-thread animal). The ms-scale settle delays
 (`write_bb` 0xfc–0xfe, `rf_writer` 0xffe, `Halrf8822e::delay_ms`, the efuse
 power-cut) flush first.
 
@@ -71,6 +73,49 @@ The RF radio-table load is write-only: bits [31:20] of the direct window
 (`0x3c00`/`0x4c00 + addr*4`) read back 0 for all 1540 entries, cold and
 warm (one 8812EU unit), so the vendor's `MASK20BITS` read-modify-write
 preserved nothing at the price of a synchronous read per entry.
+
+## Runtime batched EP0 (`ctrl_batch`) — the scout read and the cached hop
+
+The same slot pool, driven at runtime instead of during bring-up.
+`IRtlTransport::ctrl_batch` (contract + the USB hazards are doc-commented at
+the declaration in `src/RtlTransport.h` and at the definition in
+`src/UsbTransport.cpp` — read those, not a copy here) submits a group of EP0
+reads/writes back to back and pays one completion wait per chunk. Two Jaguar3
+callers, both holding `_reg_mu` across the whole group:
+
+- **`GetRxEnergyScout()`** — the cheapest frame-free OFDM FA + CCA delta the
+  chip offers, for a caller dwelling a few ms per candidate channel. 8 reads
+  then a 4-write reset composed in memory from two of them (`ScoutEnergyMath.h`
+  — composed full dwords, never `phy_set_bb_reg`, which on this generation
+  costs a read-modify-write *and* hits the double-shift gotcha). Two groups,
+  because the writes depend on the reads. It deliberately skips the CCK reset
+  toggles, so `fa_cck`/`cca_cck` come back 0 with **no reset behind that 0** —
+  hence `RxEnergy::valid_cck`, which every consumer folding the CCK half into
+  an occupancy estimate must gate on. Skipping a reset is not free either: the
+  OFDM counters keep accumulating, so the *next* sample's rate is inflated
+  (bounded by the coex tick's own reset).
+- **`RadioManagementJaguar3::fast_retune`** — the 9–11 composed hop writes go
+  in one `ctrl_batch`, flushed early only where a helper (`apply_rxbb`,
+  `select_agc_tables`) writes registers itself. A failed batch is **not**
+  swallowed the way the per-register writes it replaced were: it fails
+  wholesale, so the fast-path caches are dropped (`invalidate_fast_caches`)
+  and the hop resyncs through the full `set_channel_bwmode`.
+
+Measured (`tests/scout_read_bench.cpp`, spare 8822EU, 2026-09-15), and the two
+hosts disagree completely: on the RK3566 ground station the 12-op scout read
+goes 3372 → 603 µs (5.6×), while on an x86 xHCI bench host batching buys
+**exactly nothing** — 375 µs/transfer either way, because there the per-transfer
+cost is wire time, not host turnaround. Both figures are **floors**: the bench
+runs with no RX loop, so nothing was reaping RX URBs on the context a real
+caller's event pump must also service. `DEVOURER_CTRL_BATCH=0`
+(`DeviceConfig::usb.ctrl_batch`, default on) is the A/B knob.
+
+Two costs recorded on that bench file and the `ctrl_batch` definition rather
+than fixed here: `tx_async`/`tx_sync` open with `flush_writes()`, which was a
+runtime no-op before this and now blocks a send landing mid-group; and an RX
+`on_data` callback can be reaped on the batching thread, so nothing reachable
+from it may take `_reg_mu` (`cfo_tick()` does — latent only because
+`DEVOURER_CFO_TRACK` defaults off).
 
 ## TX power
 

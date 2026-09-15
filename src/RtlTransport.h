@@ -125,6 +125,15 @@ public:
    *     reset asserted — finishing and reporting beats bailing out).
    * tests/ctrl_batch_selftest.cpp pins all four against a fake transport.
    *
+   * The last clause is weaker than it reads on the DEFAULT below, and a
+   * caller doing read-then-compose-then-write must know it: read32 has no
+   * failure return, so a failed READ here cannot come back as false. On USB
+   * it leaves by exception instead (ctrl_read throws — this codebase's house
+   * idiom for a dead register bus); on a transport whose read32 returns
+   * garbage it would be silent. UsbTransport's own ctrl_batch does report a
+   * failed read as false. See RtlJaguar3Device::GetRxEnergyScout, which is
+   * the caller this actually bites.
+   *
    * Serialized by the CALLER (RtlJaguar3Device holds _reg_mu for the whole
    * group; the transport additionally takes its own mutex so a bring-up
    * write_batch_* and a runtime ctrl_batch can never interleave over the same
