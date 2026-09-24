@@ -828,6 +828,15 @@ target_include_directories(NoiseFloorMathSelftest PRIVATE
 
 add_test(NAME noise_floor_math COMMAND NoiseFloorMathSelftest)
 
+# Headless guard for src/BulkOutTimeout.h: a multi-packet bulk-OUT is never
+# given a timeout (a cancel mid-transfer lets another sender's queued bytes
+# splice into the packet and wedges the Realtek TXDMA). Pure, header-only.
+add_executable(BulkOutTimeoutSelftest tests/bulk_out_timeout_selftest.cpp)
+target_include_directories(BulkOutTimeoutSelftest PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src)
+
+add_test(NAME bulk_out_timeout COMMAND BulkOutTimeoutSelftest)
+
 # Headless round-trip guard for the 802.11ax HE TX radiotap path
 # (src/RadiotapBuilder.cpp build_he + the shared Radiotap.c field-23 size entry
 # + src/ieee80211_radiotap.h HE masks): parse an HE spec -> build -> iterate ->

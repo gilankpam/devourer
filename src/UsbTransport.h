@@ -229,6 +229,9 @@ private:
   libusb_context *_ctx = nullptr;
   Logger_t _logger;
   UsbLinkInfo _info;
+  /* Smallest bulk-OUT wMaxPacketSize (0 = unknown), set by
+   * discover_endpoints; see tx_sync / src/BulkOutTimeout.h. */
+  unsigned _bulk_out_mps = 0;
 
   /* Set by transfer_callback when an async TX bulk-OUT completes non-OK
    * (TIMED_OUT / stall). Consumed at the top of the next tx_async on the TX

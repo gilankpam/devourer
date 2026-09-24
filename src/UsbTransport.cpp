@@ -13,6 +13,7 @@
 #include <utility>
 #include <vector>
 
+#include "BulkOutTimeout.h"
 #include "Event.h"
 #include "UsbDeviceLock.h"
 #include "UsbOpen.h"
@@ -1259,6 +1260,11 @@ void UsbTransport::discover_endpoints() {
 
       if (is_bulk && !(endPointAddr & LIBUSB_ENDPOINT_IN)) {
         _info.bulk_out_eps.push_back(endPointAddr);
+        /* Smallest bulk-OUT packet size: what tx_sync's never-cancel rule
+         * (src/BulkOutTimeout.h) measures a transfer against. */
+        const unsigned mps = endpoint->wMaxPacketSize & 0x7ff;
+        if (mps && (_bulk_out_mps == 0 || mps < _bulk_out_mps))
+          _bulk_out_mps = mps;
       }
       /* First bulk IN endpoint wins. 8812AU/8814AU expose 0x81; 8821AU's
        * descriptor offers a different IN endpoint, so libusb's
@@ -1562,8 +1568,12 @@ int UsbTransport::tx_sync(uint8_t ep, uint8_t *packet, size_t length,
    * data toggle bit corrupts the chip's state machine. */
   int actual = 0;
   _tx_submitted.fetch_add(1, std::memory_order_relaxed);
-  int rc = libusb_bulk_transfer(_dev_handle, ep, packet,
-                                static_cast<int>(length), &actual, timeout_ms);
+  /* Never cancel a multi-packet transfer (src/BulkOutTimeout.h): a cancel
+   * mid-transfer lets another sender's queued bytes splice into the packet
+   * and wedges the TXDMA. Single-packet transfers keep `timeout_ms`. */
+  int rc = libusb_bulk_transfer(
+      _dev_handle, ep, packet, static_cast<int>(length), &actual,
+      devourer::bulk_out_timeout_ms(length, _bulk_out_mps, timeout_ms));
   if (rc != LIBUSB_SUCCESS) {
     _tx_failed.fetch_add(1, std::memory_order_relaxed);
     _tx_last_rc.store(rc, std::memory_order_relaxed);
