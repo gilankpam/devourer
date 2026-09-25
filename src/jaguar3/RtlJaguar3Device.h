@@ -199,6 +199,9 @@ public:
    * comment. */
   RxEnergy GetRxEnergyScout() override;
 
+  bool ArmNhmBusy(uint16_t period_4us) override;
+  NhmBusy ReadNhmBusy() override;
+
   /* Bench/debug-only raw BB register peek (tests/scout_read_bench.cpp's
    * on-hardware verification that GetRxEnergyScout's composed reset
    * actually lands on the chip, not just that ScoutEnergyMath.h's pure
@@ -315,6 +318,11 @@ private:
   std::atomic<bool> _txpwr_sat_high{false};
   /* Bring-up completion: gates the live apply (+ _reg_mu use) in the setters. */
   bool _brought_up = false;
+  /* Busy-NHM recipe cache (ArmNhmBusy): the composed 0x1e40/0x1e60 dwords
+   * once the recipe is programmed. Cleared by anything else that programs
+   * NHM (GetRxEnergy with_nhm) and by a full channel set / InitWrite. */
+  bool _nhm_busy_ready = false;
+  uint32_t _nhm_busy_1e40 = 0, _nhm_busy_1e60 = 0;
   /* Rolling per-frame RX link-quality aggregate (GetRxQuality). */
   devourer::RxQualityAccumulator _rxq;
   devourer::RxPathActivityAccumulator _rxpaths;

@@ -24,6 +24,7 @@
 #include "RateDefinitions.h" /* MGN_* rate enum (shared across the family) */
 #include "SignalStop.h" /* g_devourer_should_stop — set by demo signal handlers */
 #include "ToneMask.h"   /* DEVOURER_RX_CSI_MASK / DEVOURER_RX_NBI knobs */
+#include "jaguar3/NhmBusyMath.h" /* ArmNhmBusy/ReadNhmBusy's register program composer */
 #include "jaguar3/ScoutEnergyMath.h" /* GetRxEnergyScout's FA sum + reset composer */
 
 extern "C" {
@@ -68,6 +69,7 @@ struct WriteBatchScope {
 
 void RtlJaguar3Device::Init(Action_ParsedRadioPacket packetProcessor,
                             SelectedChannel channel) {
+  _nhm_busy_ready = false;
   _channel = channel;
   _rx_wanted = true;
   /* No WriteBatchScope here (yet): the pipelined bring-up is validated on
@@ -734,6 +736,7 @@ void RtlJaguar3Device::Stop() {
 }
 
 void RtlJaguar3Device::InitWrite(SelectedChannel channel) {
+  _nhm_busy_ready = false;
   _channel = channel;
   /* Concurrent TX+RX intent (DEVOURER_TX_WITH_RX / a later StartRxLoop on this
    * bring-up): enable the RX path at the same point in the sequence Init does
@@ -1171,6 +1174,8 @@ RxEnergy RtlJaguar3Device::GetRxEnergy(bool with_nhm) {
     _device.phy_set_bb_reg(a, m, v);
   };
   if (with_nhm)
+    _nhm_busy_ready = false; /* the IGI-relative / absolute-floor windows below reprogram NHM */
+  if (with_nhm)
     devourer::read_nhm(devourer::nhm_regs_jgr3(), e.igi, rd, set_bb, e);
 
   /* DEVOURER_RX_NOISE_FLOOR — active/frame-free absolute floor. Jaguar3 has no
@@ -1344,6 +1349,67 @@ RxEnergy RtlJaguar3Device::GetRxEnergyScout() {
   return e;
 }
 
+/* Busy-airtime NHM (IRtlDevice::ArmNhmBusy). First call: read the three
+ * registers the recipe shares bits with, compose full dwords
+ * (NhmBusyMath.h), write thresholds + cfg + period, pulse the trigger --
+ * one read batch, one write batch. Later calls: period + trigger pulse
+ * only, composed from the cached dwords (nothing else writes them while
+ * the cache is live; see the invalidations in GetRxEnergy/SetMonitorChannel/
+ * InitWrite). A failed read never composes a write (scout-read rule). */
+bool RtlJaguar3Device::ArmNhmBusy(uint16_t period_4us) {
+  std::lock_guard<std::mutex> lk(_reg_mu);
+  if (!_brought_up) return false;
+  if (!_nhm_busy_ready) {
+    std::vector<devourer::CtrlOp> rd = {
+        {false, 0x1e40, 0}, {false, 0x1e5c, 0}, {false, 0x1e60, 0}};
+    if (!_device.ctrl_batch(rd)) return false;
+    uint8_t th[11];
+    devourer::nf::nhm_abs_thresholds(th);
+    const devourer::jgr3::NhmProgram p = devourer::jgr3::compose_nhm_program(
+        rd[0].value, rd[1].value, rd[2].value, th, devourer::jgr3::kNhmBusyCfg,
+        period_4us);
+    std::vector<devourer::CtrlOp> wr = {
+        {true, 0x1e44, p.w1e44},
+        {true, 0x1e48, p.w1e48},
+        {true, 0x1e5c, p.w1e5c},
+        {true, 0x1e40, p.w1e40},
+        {true, 0x1e60, devourer::jgr3::nhm_trigger_low(p.w1e60)},
+        {true, 0x1e60, devourer::jgr3::nhm_trigger_high(p.w1e60)}};
+    if (!_device.ctrl_batch(wr)) return false;
+    _nhm_busy_1e40 = p.w1e40;
+    _nhm_busy_1e60 = p.w1e60;
+    _nhm_busy_ready = true;
+    return true;
+  }
+  const uint32_t w40 = devourer::jgr3::nhm_with_period(_nhm_busy_1e40, period_4us);
+  std::vector<devourer::CtrlOp> wr = {
+      {true, 0x1e40, w40},
+      {true, 0x1e60, devourer::jgr3::nhm_trigger_low(_nhm_busy_1e60)},
+      {true, 0x1e60, devourer::jgr3::nhm_trigger_high(_nhm_busy_1e60)}};
+  if (!_device.ctrl_batch(wr)) {
+    _nhm_busy_ready = false;  /* unknown register state: reprogram next time */
+    return false;
+  }
+  _nhm_busy_1e40 = w40;
+  return true;
+}
+
+NhmBusy RtlJaguar3Device::ReadNhmBusy() {
+  std::lock_guard<std::mutex> lk(_reg_mu);
+  NhmBusy out;
+  if (!_brought_up || !_nhm_busy_ready) return out;
+  std::vector<devourer::CtrlOp> rd = {
+      {false, 0x2d4c, 0}, {false, 0x2d40, 0}, {false, 0x2d44, 0}, {false, 0x2d48, 0}};
+  if (!_device.ctrl_batch(rd)) return out;
+  const devourer::jgr3::NhmResult r = devourer::jgr3::parse_nhm_result(
+      rd[0].value, rd[1].value, rd[2].value, rd[3].value);
+  out.valid = r.ready;
+  for (int i = 0; i < 12; ++i) out.buckets[i] = r.buckets[i];
+  out.duration = r.duration;
+  out.period = static_cast<uint16_t>(_nhm_busy_1e40 >> 16);
+  return out;
+}
+
 /* Disable / restore the MAC carrier-sense gate that defers TX. Two 0x520 bits:
  * BIT_DIS_CCA 0x520[14] (primary carrier-sense of a decodable preamble) and
  * BIT_DIS_EDCCA 0x520[15] (energy detect), plus BIT_EDCCA_MSK_COUNTDOWN
@@ -1397,6 +1463,7 @@ void RtlJaguar3Device::SetMonitorChannel(SelectedChannel channel) {
   std::lock_guard<std::mutex> lk(_reg_mu);
   const bool ch_changed = channel.Channel != _channel.Channel;
   _channel = channel;
+  _nhm_busy_ready = false;
   _radioManagement.set_channel_bwmode(channel.Channel, channel.ChannelOffset,
                                       channel.ChannelWidth);
   /* Runtime TX-power knobs in use: re-fold them against the NEW channel

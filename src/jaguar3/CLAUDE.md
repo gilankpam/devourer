@@ -150,3 +150,15 @@ at BB-table load, so the descriptor field alone is inert until programmed
 On-air-validated on 8822CU + 8822EU, sticky across
 `SetMonitorChannel`/`FastRetune`; the E compresses deep cuts (≈−6 dB floor,
 same TSSI reshape as its offset slope).
+
+## Busy-airtime NHM (ArmNhmBusy / ReadNhmBusy)
+
+Non-blocking NHM window for a caller that wants airtime, not a floor:
+cfg 0x3 (inc_cca ON so 802.11 frames count, inc_tx OFF), thresholds from
+`nf::kNhmAbsThDbm`, composed as full dwords in `NhmBusyMath.h`. Arm at the
+start of a window, read at the end; not-ready reads come back invalid, never
+block. `NhmBusy.period` is the LAST arm's period on this device — a caller
+compares it with its own to detect that someone else (a scout dwell) re-armed
+in between. The recipe cache is cleared by `GetRxEnergy(with_nhm)` (its
+IGI-relative and absolute-floor windows reprogram NHM), `SetMonitorChannel`
+and `InitWrite`. `read_nhm`/`read_nhm_absolute` are NOT built on this path.

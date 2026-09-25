@@ -591,6 +591,15 @@ public:
    * can use it on any chip. */
   virtual RxEnergy GetRxEnergyScout() { return GetRxEnergy(false); }
 
+  /* Busy-airtime NHM window, split so no call ever sleeps: ArmNhmBusy
+   * programs the recipe (first call, or after anything else reprogrammed
+   * NHM) and pulses the trigger for a `period_4us` window; ReadNhmBusy
+   * returns the finished window, or valid=false if it has not finished.
+   * Arm again for the next window. Defaults: unsupported (false / invalid).
+   * Control-plane threading contract as GetRxEnergy. */
+  virtual bool ArmNhmBusy(uint16_t period_4us) { (void)period_4us; return false; }
+  virtual NhmBusy ReadNhmBusy() { return {}; }
+
   /* Consolidated windowed RX link-quality snapshot (see RxQuality.h) — the
    * runtime feed a closed-loop adaptive-link controller reads instead of
    * scraping the demo's stdout. Fuses the per-frame RSSI/SNR/EVM aggregate the

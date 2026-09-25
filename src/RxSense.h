@@ -86,4 +86,18 @@ struct RxEnergy {
   int8_t abs_noise_floor_dbm = 0;
 };
 
+/* One busy-airtime NHM window (IRtlDevice::ArmNhmBusy / ReadNhmBusy):
+ * 12 buckets over devourer's absolute dBm table (nf::kNhmAbsThDbm), counted
+ * with CCA-busy samples INCLUDED and our own TX EXCLUDED, so the upper
+ * buckets' share is the fraction of the window the air carried energy above
+ * that level. `period` is the period of the most recent arm on this device
+ * (4 us units) -- a caller that armed a different period knows the result
+ * is someone else's window. */
+struct NhmBusy {
+  bool valid = false;
+  uint8_t buckets[12] = {};
+  uint16_t duration = 0;
+  uint16_t period = 0;
+};
+
 #endif /* RX_SENSE_H */
