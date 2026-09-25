@@ -116,9 +116,10 @@ void test_jgr3_fill_tiers() {
     rx_pkt_attrib a{};
     std::vector<uint8_t> p = jgr3_page(1);
     expect("jgr3 null buffer -> None",
-           jaguar3::parse_phy_sts_jgr3(nullptr, 32, a) == PhyStsFill::None);
+           jaguar3::parse_phy_sts_jgr3(nullptr, 32, 0, a) == PhyStsFill::None);
     expect("jgr3 27-byte report -> None",
-           jaguar3::parse_phy_sts_jgr3(p.data(), 27, a) == PhyStsFill::None);
+           jaguar3::parse_phy_sts_jgr3(p.data(), 27, 0, a) ==
+               PhyStsFill::None);
     expect("jgr3 rejected report leaves the attrib untouched",
            a.rssi[0] == 0 && a.snr[0] == 0 && a.cfo_tail == 0);
   }
@@ -129,7 +130,8 @@ void test_jgr3_fill_tiers() {
     std::vector<uint8_t> p = jgr3_page(0);
     p[1] = 88;
     expect("jgr3 page 0 (CCK) -> Power",
-           jaguar3::parse_phy_sts_jgr3(p.data(), 32, a) == PhyStsFill::Power);
+           jaguar3::parse_phy_sts_jgr3(p.data(), 32, 0, a) ==
+               PhyStsFill::Power);
     expect("jgr3 page 0 fills path-A rssi", a.rssi[0] == 88);
     expect("jgr3 page 0 leaves snr/evm/cfo unset",
            a.snr[0] == 0 && a.evm[0] == 0 && a.cfo_tail == 0);
@@ -140,7 +142,8 @@ void test_jgr3_fill_tiers() {
     a.data_rate = 12; /* HT -> bandwidth read from ht_rxsc */
     std::vector<uint8_t> p = jgr3_page(1);
     expect("jgr3 page 1 (OFDM type1) -> Full",
-           jaguar3::parse_phy_sts_jgr3(p.data(), 32, a) == PhyStsFill::Full);
+           jaguar3::parse_phy_sts_jgr3(p.data(), 32, 0, a) ==
+               PhyStsFill::Full);
     expect("jgr3 page 1 fills per-path rssi",
            a.rssi[0] == 90 && a.rssi[3] == 93);
     expect("jgr3 page 1 fills per-stream snr/evm",
@@ -157,11 +160,75 @@ void test_jgr3_fill_tiers() {
     rx_pkt_attrib a{};
     std::vector<uint8_t> p = jgr3_page(5);
     expect("jgr3 page 5 (other OFDM page) -> Power",
-           jaguar3::parse_phy_sts_jgr3(p.data(), 32, a) == PhyStsFill::Power);
+           jaguar3::parse_phy_sts_jgr3(p.data(), 32, 0, a) ==
+               PhyStsFill::Power);
     expect("jgr3 page 5 fills per-path rssi from the common header",
            a.rssi[0] == 90 && a.rssi[3] == 93);
     expect("jgr3 page 5 leaves snr/evm/cfo unset",
            a.snr[0] == 0 && a.evm[0] == 0 && a.cfo_tail == 0);
+  }
+}
+
+/* phydm_rxsc_2_bw: rxsc 0 means "the packet occupied the receiver's full
+ * configured bandwidth" — this is the HT40-reported-as-20 bug. These cases
+ * pin the sentinel resolution against `configured_bw`, separately from the
+ * ordinary rxsc>=9/13 thresholds already covered above (page 1's bw==0 with
+ * ht_rxsc==1 and configured_bw==0). */
+void test_jgr3_rxsc_full_bw_sentinel() {
+  /* HT frame (data_rate 0x0F = MCS15), ht_rxsc 0 ("full configured
+   * bandwidth"): bw follows the tuned width, both ways. */
+  {
+    rx_pkt_attrib a{};
+    a.data_rate = 0x0F;
+    std::vector<uint8_t> p = jgr3_page(1);
+    p[5] = 0x00; /* l_rxsc=0, ht_rxsc=0 */
+    expect("jgr3 HT rxsc=0, configured 40 MHz -> bw 1 (was misread as 20)",
+           jaguar3::parse_phy_sts_jgr3(p.data(), 32, 1, a) == PhyStsFill::Full &&
+               a.bw == 1);
+  }
+  {
+    rx_pkt_attrib a{};
+    a.data_rate = 0x0F;
+    std::vector<uint8_t> p = jgr3_page(1);
+    p[5] = 0x00; /* l_rxsc=0, ht_rxsc=0 */
+    expect("jgr3 HT rxsc=0, configured 20 MHz -> bw 0",
+           jaguar3::parse_phy_sts_jgr3(p.data(), 32, 0, a) == PhyStsFill::Full &&
+               a.bw == 0);
+  }
+  /* ht_rxsc 1: a real 20 MHz sub-channel report on a 40-tuned card. Not the
+   * full-band sentinel, so it must stay 20 regardless of configured_bw. */
+  {
+    rx_pkt_attrib a{};
+    a.data_rate = 0x0F;
+    std::vector<uint8_t> p = jgr3_page(1);
+    p[5] = 0x10; /* l_rxsc=0, ht_rxsc=1 */
+    expect("jgr3 HT ht_rxsc=1, configured 40 MHz -> bw 0 (sub-channel, not "
+           "full-band)",
+           jaguar3::parse_phy_sts_jgr3(p.data(), 32, 1, a) == PhyStsFill::Full &&
+               a.bw == 0);
+  }
+  /* ht_rxsc 9: ordinary 40 MHz threshold, unaffected by configured_bw. */
+  {
+    rx_pkt_attrib a{};
+    a.data_rate = 0x0F;
+    std::vector<uint8_t> p = jgr3_page(1);
+    p[5] = 0x90; /* l_rxsc=0, ht_rxsc=9 */
+    expect("jgr3 HT ht_rxsc=9 -> bw 1 regardless of configured_bw",
+           jaguar3::parse_phy_sts_jgr3(p.data(), 32, 0, a) == PhyStsFill::Full &&
+               a.bw == 1);
+  }
+  /* Legacy OFDM rate (data_rate in 4..11), l_rxsc 0: the full-band sentinel
+   * only applies to HT/VHT (data_rate >= 12) — legacy stays 20 MHz even on a
+   * 40 MHz-tuned card. */
+  {
+    rx_pkt_attrib a{};
+    a.data_rate = 8; /* legacy OFDM */
+    std::vector<uint8_t> p = jgr3_page(1);
+    p[5] = 0x00; /* l_rxsc=0, ht_rxsc=0 */
+    expect("jgr3 legacy OFDM rxsc=0, configured 40 MHz -> bw 0 (legacy "
+           "never full-band)",
+           jaguar3::parse_phy_sts_jgr3(p.data(), 32, 1, a) == PhyStsFill::Full &&
+               a.bw == 0);
   }
 }
 
@@ -203,6 +270,7 @@ void test_jgr2_fill_tiers() {
 int main() {
   test_physt_bit_decoded();
   test_jgr3_fill_tiers();
+  test_jgr3_rxsc_full_bw_sentinel();
   test_jgr2_fill_tiers();
   if (g_fail == 0)
     std::printf("rx_physt_selftest: all checks passed\n");
