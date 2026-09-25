@@ -201,6 +201,7 @@ public:
 
   bool ArmNhmBusy(uint16_t period_4us) override;
   NhmBusy ReadNhmBusy() override;
+  int ReadTunedCentral() override;
 
   /* Bench/debug-only raw BB register peek (tests/scout_read_bench.cpp's
    * on-hardware verification that GetRxEnergyScout's composed reset

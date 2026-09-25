@@ -1398,6 +1398,15 @@ bool RtlJaguar3Device::ArmNhmBusy(uint16_t period_4us) {
   return true;
 }
 
+int RtlJaguar3Device::ReadTunedCentral() {
+  std::lock_guard<std::mutex> lk(_reg_mu);
+  if (!_brought_up) return -1;
+  /* Path-A RF18 through the direct RF window (the same mirror
+   * fw_switch_confirm reads): [7:0] = central channel. */
+  const uint32_t w = _device.rtw_read32(static_cast<uint16_t>(0x3c00 + (0x18 << 2)));
+  return static_cast<int>(w & 0xffu);
+}
+
 NhmBusy RtlJaguar3Device::ReadNhmBusy() {
   std::lock_guard<std::mutex> lk(_reg_mu);
   NhmBusy out;

@@ -600,6 +600,13 @@ public:
   virtual bool ArmNhmBusy(uint16_t period_4us) { (void)period_4us; return false; }
   virtual NhmBusy ReadNhmBusy() { return {}; }
 
+  /* The RF synthesizer's programmed channel (RF18[7:0] on path A, the CENTRAL
+   * channel: the pair centre at 40 MHz), read back from the chip — what the
+   * radio is actually tuned to, independent of any host-side channel state.
+   * -1 = unsupported / read failed. One register read under the control-plane
+   * lock. */
+  virtual int ReadTunedCentral() { return -1; }
+
   /* Consolidated windowed RX link-quality snapshot (see RxQuality.h) — the
    * runtime feed a closed-loop adaptive-link controller reads instead of
    * scraping the demo's stdout. Fuses the per-frame RSSI/SNR/EVM aggregate the
