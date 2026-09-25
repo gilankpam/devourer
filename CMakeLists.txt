@@ -1032,6 +1032,11 @@ add_executable(ScoutEnergySelftest tests/scout_energy_selftest.cpp)
 target_link_libraries(ScoutEnergySelftest PRIVATE devourer)
 add_test(NAME scout_energy_math COMMAND ScoutEnergySelftest)
 
+# Headless guard for the busy-NHM register composers (src/jaguar3/NhmBusyMath.h).
+add_executable(NhmBusySelftest tests/nhm_busy_selftest.cpp)
+target_link_libraries(NhmBusySelftest PRIVATE devourer)
+add_test(NAME nhm_busy_math COMMAND NhmBusySelftest)
+
 # Headless guard for the batched-EP0 CONTRACT (IRtlTransport::ctrl_batch):
 # submission order, each read's value landing in its OWN op, failure reported
 # without aborting the rest of the batch. Pinned against a fake transport, so
