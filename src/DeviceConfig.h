@@ -214,9 +214,12 @@ struct DeviceConfig {
      * jam: `rc=-7 got 1536/4439`, then nothing). The cost: a frame the chip
      * NAKs indefinitely blocks its sender indefinitely, and Stop() cannot
      * interrupt it. Firmware download and reserved-page writes are never
-     * affected. Synchronous-TX generations only (Jaguar2/3, RTL8733B,
-     * Kestrel); Jaguar1 sends asynchronously and ignores it. Default off:
-     * every send uses its finite timeout. See src/BulkOutTimeout.h. */
+     * affected. Jaguar2, Jaguar3 and Kestrel data sends only. The RTL8733B
+     * keeps every send bounded: its send path holds the device register lock
+     * across the transfer, so an unbounded one would also stall retunes and
+     * Stop(). Jaguar1 sends asynchronously and the MT7612U has its own TX
+     * path, so both ignore it. Default off: every send uses its finite
+     * timeout. See src/BulkOutTimeout.h. */
     bool no_cancel_multipkt = false;
     /* env: DEVOURER_TX_LEGACY_8812_DESC — 8814A: keep the legacy 8812-style
      * TX-descriptor bits instead of the 8814-native layout. */
