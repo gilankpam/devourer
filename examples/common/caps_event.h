@@ -1,9 +1,9 @@
 /* Shared `adapter.caps` machine-event emitter for the demos.
  *
- * One place that serializes IRtlDevice::GetAdapterCaps() (src/AdapterCaps.h) to
+ * One place that serializes IRadio::GetAdapterCaps() (src/AdapterCaps.h) to
  * the JSONL event plane so rxdemo / txdemo / doctor / txpower all emit the same
  * schema — a dependent app or test script consumes one event instead of calling
- * the C++ API. Emit it right after CreateRtlDevice (the caps are static and
+ * the C++ API. Emit it right after CreateRadio (the caps are static and
  * resolved at construction — no bring-up needed). Mirrors the txpwr.caps
  * emission in examples/txpower/main.cpp: booleans as 0/1, chip_id as a hex
  * string, bandwidths + frequency spans as arrays (absent band -> null). */
@@ -12,11 +12,11 @@
 
 #include "AdapterCaps.h"
 #include "Event.h"
-#include "IRtlDevice.h"
+#include "IRadio.h"
 
 namespace devourer {
 
-inline void emit_adapter_caps(EventSink &sink, IRtlDevice *dev) {
+inline void emit_adapter_caps(EventSink &sink, IRadio *dev) {
   const AdapterCaps c = dev->GetAdapterCaps();
 
   /* Supported channel widths as an MHz int array (kBw* -> MHz). */
@@ -87,6 +87,7 @@ inline void emit_adapter_caps(EventSink &sink, IRtlDevice *dev) {
       .f("per_chain_rssi", c.per_chain_rssi ? 1 : 0)
       .f("hw_rx_tsf", c.hw_rx_timestamp ? 1 : 0)
       .f("hw_beacon_txtsf", c.hw_beacon_txtsf ? 1 : 0)
+      .f("tsf_write", c.tsf_write_ok ? 1 : 0)
       .f("xtal_cap_max", c.xtal_cap_max)
       .f("xtal_cap_default", c.xtal_cap_default);
 }

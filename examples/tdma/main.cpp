@@ -20,6 +20,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <memory>
 #include <string>
 #include <thread>
@@ -102,7 +103,7 @@ static libusb_device_handle* open_device(
 }
 
 // --- TX role ----------------------------------------------------------------
-static void run_tx(IRtlDevice* dev, const tdma::Config& c) {
+static void run_tx(IRadio* dev, const tdma::Config& c) {
   dev->InitWrite(SelectedChannel{c.channel, 0, CHANNEL_WIDTH_20});
   std::this_thread::sleep_for(std::chrono::seconds(2));
   const auto rt_crit = devourer::build_stream_radiotap(c.crit_rate);
@@ -124,13 +125,31 @@ static void run_tx(IRtlDevice* dev, const tdma::Config& c) {
     if (w != cur_w) { dev->FastSetBandwidth(w); cur_w = w; }
 
     if (a.phase == tdma::Phase::NB && a.burst != last_marker_burst) {
-      last_marker_burst = a.burst;
       // Stamp the marker with the TX's hardware TSF (works TX-side — no RX
       // flood starving the control read); the TSF-sync RX uses it for drift.
-      uint64_t tx_tsf = dev->ReadTsf();
-      auto f = tdma::build_frame(rt_marker, tdma::Class::Marker, seq[0]++,
-                                 (uint32_t)a.burst, tx_tsf);
-      dev->send_packet(f.data(), f.size());
+      // A failed read throws (IRadio contract): skip this burst's marker
+      // rather than hand the drift fit a wrong stamp, and leave the burst
+      // unmarked so the next pass through it tries again.
+      uint64_t tx_tsf = 0;
+      bool stamped = true;
+      try {
+        tx_tsf = dev->ReadTsf();
+      } catch (const std::exception &e) {
+        static bool warned = false;
+        stamped = false;
+        if (!warned) {
+          warned = true;
+          fprintf(stderr, "tdma: TSF read failed (%s), marker skipped "
+                          "(said once; markers keep being skipped while it fails)\n",
+                  e.what());
+        }
+      }
+      if (stamped) {
+        auto f = tdma::build_frame(rt_marker, tdma::Class::Marker, seq[0]++,
+                                   (uint32_t)a.burst, tx_tsf);
+        dev->send_packet(f.data(), f.size());
+        last_marker_burst = a.burst;
+      }
     }
     tdma::Class cls =
         a.phase == tdma::Phase::NB ? tdma::Class::Critical : tdma::Class::Bulk;
@@ -225,7 +244,7 @@ static ChannelWidth_t desired_width(const tdma::Config& c) {
   return pos < c.sched.nb_ms ? c.sched.nb_w : c.sched.wide_w;
 }
 
-static void run_rx(IRtlDevice* dev, const tdma::Config& c) {
+static void run_rx(IRadio* dev, const tdma::Config& c) {
   // Bring RX up: rx-camp at its band; rx-sync wide (the control loop corrects).
   ChannelWidth_t start_w = c.role == tdma::Role::RxCamp ? c.camp_w : CHANNEL_WIDTH_20;
   g_rx_mhz.store(tdma::mhz_of(start_w));
@@ -320,12 +339,12 @@ int main() {
 
   WiFiDriver wifi(logger);
   auto owned_device =
-      wifi.CreateRtlDevice(handle, ctx, lock, devourer_config_from_env());
+      wifi.CreateRadio(handle, ctx, lock, devourer_config_from_env());
   if (!owned_device) { logger->error("no driver for this chip"); return 1; }
   // The session owns the device from here: it is what guarantees the device
   // (and its in-flight TX) dies before libusb does.
   session.adopt_device(std::move(owned_device));
-  IRtlDevice* const dev = session.device();
+  IRadio* const dev = session.device();
 
   if (c.role == tdma::Role::Tx) run_tx(dev, c);
   else run_rx(dev, c);

@@ -24,6 +24,7 @@
 #include "FrameParserJaguar3.h"
 #include "NhmReader.h"       /* frame-free NHM power histogram (shared) */
 #include "RateDefinitions.h" /* MGN_* rate enum (shared across the family) */
+#include "RtlTsf.h"          /* REG_TSFTR read/write shared with Jaguar1/2 */
 #include "SignalStop.h" /* g_devourer_should_stop — set by demo signal handlers */
 #include "ToneMask.h"   /* DEVOURER_RX_CSI_MASK / DEVOURER_RX_NBI knobs */
 #include "jaguar3/NhmBusyMath.h" /* ArmNhmBusy/ReadNhmBusy's register program composer */
@@ -59,19 +60,37 @@ RtlJaguar3Device::RtlJaguar3Device(RtlAdapter device, Logger_t logger,
                 variant == jaguar3::ChipVariant::C8822E ? "8822E/EU" : "8822C/CU");
 }
 
-/* Pipelined register writes for the whole bring-up (IRtlTransport::
+/* Pipelined register writes for the whole bring-up (ITransport::
  * write_batch_begin): ends on scope exit so a throw never leaves the
  * transport in batch mode for the threads that start afterwards. */
 struct WriteBatchScope {
   RtlAdapter &dev;
+  bool open = true;
   explicit WriteBatchScope(RtlAdapter &d) : dev(d) { dev.write_batch_begin(); }
-  void end() { dev.write_batch_end(); }
-  ~WriteBatchScope() { dev.write_batch_end(); }
+  /* Closes once: after end() the destructor is a no-op, so it never touches
+   * the transport again once the coex thread (which shares it) is running.
+   * Returns whether every queued write completed; the destructor's close
+   * (unwinding) drops that result, an explicit end() must act on it. */
+  bool end() {
+    bool ok = true;
+    if (open)
+      ok = dev.write_batch_end();
+    open = false;
+    return ok;
+  }
+  ~WriteBatchScope() { end(); }
 };
 
 void RtlJaguar3Device::Init(Action_ParsedRadioPacket packetProcessor,
                             SelectedChannel channel) {
   _nhm_busy_ready = false;
+  /* A window armed before a (re-)bring-up describes a chip state that no
+   * longer exists; leaving it armed would make the next unrelated
+   * GetChannelBusy() take the armed branch and report a stale period. */
+  {
+    std::lock_guard<std::mutex> ccx(busy_window_mutex());
+    busy_window_reset();
+  }
   _channel = channel;
   _rx_bw_code.store(channel_width_to_bw_code(channel.ChannelWidth),
                     std::memory_order_relaxed);
@@ -262,7 +281,9 @@ void RtlJaguar3Device::StartRxLoop(Action_ParsedRadioPacket packetProcessor) {
         next += std::chrono::seconds(2);
         try {
           std::lock_guard<std::mutex> lk(_reg_mu);
-          _phydm.tick(_channel.Channel, !_cca_disabled);
+          /* edcca_track follows the EDCCA gate alone — see the housekeeping
+           * tick below for why the all-or-nothing flag is the wrong input. */
+          _phydm.tick(_channel.Channel, !_cca_edcca_disabled);
         } catch (...) {
           break; /* chip gone — the RX loop will wind down too */
         }
@@ -499,9 +520,13 @@ void RtlJaguar3Device::coex_runtime_loop() {
       _hal.coex_run_5g();
       _hal.pwr_track(); /* thermal TX-power compensation (sustains upper 5 GHz) */
       /* phydm dynamic mechanisms (vendor watchdog parity): FA/CCA window
-       * statistics -> DIG -> CCK-PD -> EDCCA. EDCCA tracking is owned by
-       * SetCcaMode when the EDCCA-disable knob is active. */
-      _phydm.tick(_channel.Channel, !_cca_disabled);
+       * statistics -> DIG -> CCK-PD -> EDCCA. EDCCA tracking is owned by the
+       * EDCCA gate: keyed on the all-or-nothing flag instead, the watchdog
+       * would keep running PhydmRuntimeJaguar3::edcca() and rewriting the BB
+       * thresholds at 0x84c every ~2 s in the EDCCA-off/primary-on arm,
+       * undoing the disable the caller asked for. Jaguar1 does the same
+       * thing via SetEdccaTrack(!edcca_disabled) at the end of apply_cca. */
+      _phydm.tick(_channel.Channel, !_cca_edcca_disabled);
       _hal.fw_update_wl_phy_info();
       _hal.fw_set_pwr_mode_active();
       _hal.fw_coex_query_bt_info();
@@ -749,9 +774,31 @@ void RtlJaguar3Device::apply_replay_wseq() {
                 _cfg.debug.replay_wseq);
 }
 
-/* Clean shutdown — see IRtlDevice::Stop. Best-effort: a chip that already
+/* Clean shutdown — see IRadio::Stop. Best-effort: a chip that already
  * dropped off the bus will make the de-init writes fail, which is fine. */
 void RtlJaguar3Device::Stop() {
+  /* The armed window dies with the session. Nothing else forgets it:
+   * with_ccx gates on _brought_up, which Stop() does not clear, so a window
+   * armed before a Stop stays visible afterwards and the next retune's note
+   * hands the caller a spoil reason earned by a session that no longer
+   * exists. Measured on an RTL8812CU with this reset removed: an
+   * arm/Stop/retune/read sequence reports spoil=retuned; with it, none.
+   * Scoped, and deliberately NOT under _reg_mu: Stop() joins the coex thread
+   * below, that thread takes _reg_mu, and holding it across the join would
+   * deadlock. Taking the CCX lock alone is safe here because the coex loop
+   * never takes it.
+   *
+   * What this does NOT close: no lock spans this Stop(), so a concurrent
+   * ArmChannelBusy can still land after the reset and during teardown, and
+   * with_ccx gates on _brought_up, which nothing here clears — so an arm
+   * issued AFTER a Stop still succeeds against a torn-down chip.
+   * ArmChannelBusy is single-control-thread by contract (IRadio.h); closing
+   * the rest means clearing _brought_up, which gates other paths. The
+   * contract and this residual are both at IRadio::ArmChannelBusy. */
+  {
+    std::lock_guard<std::mutex> ccx(busy_window_mutex());
+    busy_window_reset();
+  }
   _coex_stop = true;
   if (_coex_thread.joinable())
     _coex_thread.join();
@@ -764,6 +811,13 @@ void RtlJaguar3Device::Stop() {
 
 void RtlJaguar3Device::InitWrite(SelectedChannel channel) {
   _nhm_busy_ready = false;
+  /* A window armed before a (re-)bring-up describes a chip state that no
+   * longer exists; leaving it armed would make the next unrelated
+   * GetChannelBusy() take the armed branch and report a stale period. */
+  {
+    std::lock_guard<std::mutex> ccx(busy_window_mutex());
+    busy_window_reset();
+  }
   _channel = channel;
   _rx_bw_code.store(channel_width_to_bw_code(channel.ChannelWidth),
                     std::memory_order_relaxed);
@@ -775,7 +829,39 @@ void RtlJaguar3Device::InitWrite(SelectedChannel channel) {
    * race the running TX). */
   const bool want_rx = _cfg.rx.enable_with_tx;
   _rx_wanted = want_rx;
-  InitTimer timer(_logger, "j3init");
+  /* A second bring-up on a live device: the coex thread of the previous
+   * one shares the transport, and the batch below is single-threaded by
+   * contract, so stop and join it before anything is queued. A running RX
+   * loop (and its phydm worker) cannot be stopped from here — that is the
+   * caller's thread — so it is refused outright. */
+  if (_rx_loop_active.load())
+    throw std::runtime_error(
+        "Jaguar3: InitWrite while the RX loop is running — stop it first");
+  if (_coex_thread.joinable()) {
+    _coex_stop = true;
+    _coex_thread.join();
+    _coex_stop = false;
+  }
+  /* Readiness is provisional from here until the batch closes clean: a
+   * throw from any bring-up step (a failed queued write is only known at
+   * the close) must not leave the runtime APIs believing the chip is
+   * programmed — including a re-init that fails after a successful one. */
+  struct BroughtUpGuard {
+    bool &flag;
+    bool committed = false;
+    ~BroughtUpGuard() {
+      if (!committed)
+        flag = false;
+    }
+  } brought_up_guard{_brought_up};
+  _brought_up = false;
+  /* The transfer counter is a USB notion (xfers is emitted only when a
+   * counter is attached); a PCIe transport gets none, and its timer omits
+   * the field instead of reporting 0. */
+  InitTimer timer(_logger, "j3init",
+                  _device.is_usb() ? InitTimer::XferCounter{[this] { return _device.ctrl_xfers(); }}
+                                   : InitTimer::XferCounter{},
+                  [this] { _device.flush_writes(); });
   WriteBatchScope batch(_device);
   _hal.rtw_hal_init(channel);  /* full vendor-source bring-up */
   timer.stage("hal_init");
@@ -829,6 +915,7 @@ void RtlJaguar3Device::InitWrite(SelectedChannel channel) {
         }
         _logger->error("CW tone arm: USB glitch ({}) — retry {}/3", ex.what(),
                        attempt);
+        _device.flush_writes(); /* settle from a drained queue before retrying */
         std::this_thread::sleep_for(std::chrono::milliseconds(150));
       }
     }
@@ -836,6 +923,12 @@ void RtlJaguar3Device::InitWrite(SelectedChannel channel) {
       _device.rtw_write<uint32_t>(0x0040, v40 | 0x14030008u);
       _device.rtw_write<uint32_t>(0x0064, v64 & ~0x02040000u);
     }
+    /* This return leaves InitWrite early: close the batch here so a
+     * failed completion during the CW arm fails the call, instead of the
+     * scope destructor draining it and dropping the verdict. */
+    if (!batch.end())
+      throw std::runtime_error(
+          "Jaguar3: pipelined register write(s) failed during CW-tone arm");
     _logger->info("Jaguar3: CW tone hold (minimal bring-up, no coex thread)");
     return;
   }
@@ -848,7 +941,7 @@ void RtlJaguar3Device::InitWrite(SelectedChannel channel) {
    * intermediate bring-up steps on sane references. */
   apply_tx_power_current(/*full=*/true);
   timer.stage("txpower_pre");
-  _brought_up = true;
+  _brought_up = true; /* provisional — see BroughtUpGuard above */
   /* WiFi-only coex bring-up: disable the BT/LTE antenna arbitration and lock the
    * antenna to WLAN so on-air TX is not killed by the coex firmware. */
   _hal.coex_wlan_only_init();
@@ -986,7 +1079,18 @@ void RtlJaguar3Device::InitWrite(SelectedChannel channel) {
                     _device.rtw_read32(a + 8), _device.rtw_read32(a + 12));
   }
   timer.stage("dpdt_ack_misc");
-  batch.end(); /* sync writes from here: the coex thread shares the transport */
+  /* Sync writes from here: the coex thread shares the transport. A queued
+   * write that completed failed or short is only known at this close, and
+   * a chip with one register unprogrammed is not one to start the coex
+   * thread over and announce ready. */
+  if (!batch.end())
+    throw std::runtime_error(
+        "Jaguar3: pipelined register write(s) failed during bring-up");
+  brought_up_guard.committed = true;
+  /* The timing closes here, before the coex thread starts: it shares the
+   * adapter's transfer counter, so anything emitted after it would count
+   * that thread's register and H2C traffic as bring-up. */
+  timer.total();
   _coex_thread = std::thread([this] { coex_runtime_loop(); });
   if (_cfg.rx.ack_responder &&
       !SetAckResponder(*_cfg.rx.ack_responder)) /* DEVOURER_ACK_RESPONDER */
@@ -994,8 +1098,6 @@ void RtlJaguar3Device::InitWrite(SelectedChannel channel) {
         "Jaguar3: configured ACK responder could not be armed");
   if (_cfg.tx.ampdu)
     SetAmpduMode(*_cfg.tx.ampdu); /* DEVOURER_TX_AMPDU_MODE */
-  timer.stage("coex_thread_ampdu");
-  timer.total();
   _logger->info("Jaguar3: ready for TX (monitor inject)");
 }
 
@@ -1202,8 +1304,17 @@ RxEnergy RtlJaguar3Device::GetRxEnergy(bool with_nhm) {
   auto set_bb = [this](uint16_t a, uint32_t m, uint32_t v) {
     _device.phy_set_bb_reg(a, m, v);
   };
+  /* Both NHM windows below (the IGI-relative one, then the absolute idle
+   * floor) re-arm the shared CCX engine, so they destroy an armed CLM busy
+   * window on this map. The note goes under the CCX lock, atomic with the
+   * re-arms and INSIDE _reg_mu (the ordering every other CCX user takes), or
+   * a destroyed window reads back valid. They also reprogram what the
+   * busy-NHM recipe cache holds. */
+  std::unique_lock<std::mutex> ccx(busy_window_mutex(), std::defer_lock);
   if (with_nhm) {
-    _nhm_busy_ready = false; /* the IGI-relative / absolute-floor windows below reprogram NHM */
+    ccx.lock();
+    busy_window_note_nhm_read();
+    _nhm_busy_ready = false;
     devourer::read_nhm(devourer::nhm_regs_jgr3(), e.igi, rd, set_bb, e);
   }
 
@@ -1254,7 +1365,7 @@ RxEnergy RtlJaguar3Device::GetRxEnergy(bool with_nhm) {
  * kAsyncWriteDepth = 8 that is two completion waits.
  * Composed full-dword writes, never phy_set_bb_reg — masked BB writes on JGR3
  * have the double-shift gotcha (jaguar3/CLAUDE.md) and cost a read-modify-
- * write each. Batched: see IRtlTransport::ctrl_batch.
+ * write each. Batched: see ITransport::ctrl_batch.
  *
  * The two reset dwords are read fresh inside the same batch every call; a
  * host-side shadow buys nothing measurable once batched
@@ -1315,7 +1426,7 @@ RxEnergy RtlJaguar3Device::GetRxEnergy(bool with_nhm) {
  * magnitude of that inflation is unknown.
  *
  * ONE ESCAPE ROUTE valid_fa does NOT cover, so a caller should know: if the
- * transport falls back to IRtlTransport::ctrl_batch's synchronous path (a
+ * transport falls back to ITransport::ctrl_batch's synchronous path (a
  * dead async pool, or usb.ctrl_batch off), its reads go through
  * UsbTransport::ctrl_read, which THROWS std::ios_base::failure on a failed
  * register read rather than returning false. So on a dying device this
@@ -1373,7 +1484,7 @@ RxEnergy RtlJaguar3Device::GetRxEnergyScout() {
   return e;
 }
 
-/* Busy-airtime NHM (IRtlDevice::ArmNhmBusy). First call: read the three
+/* Busy-airtime NHM (IRtlRadio::ArmNhmBusy). First call: read the three
  * registers the recipe shares bits with, compose full dwords
  * (NhmBusyMath.h), write thresholds + cfg + period, pulse the trigger --
  * one read batch, one write batch. Later calls: period + trigger pulse
@@ -1384,6 +1495,11 @@ RxEnergy RtlJaguar3Device::GetRxEnergyScout() {
 bool RtlJaguar3Device::ArmNhmBusy(uint16_t period_4us) {
   std::lock_guard<std::mutex> lk(_reg_mu);
   if (!_brought_up) return false;
+  /* The NHM trigger re-arms the shared CCX engine, which destroys an armed
+   * CLM busy window on this map: note it under the CCX lock, as GetRxEnergy
+   * does, so that window reads back spoiled rather than valid. */
+  std::lock_guard<std::mutex> ccx(busy_window_mutex());
+  busy_window_note_nhm_read();
   if (!_nhm_busy_ready) {
     std::vector<devourer::CtrlOp> rd = {
         {false, 0x1e40, 0}, {false, 0x1e5c, 0}, {false, 0x1e60, 0}};
@@ -1466,22 +1582,67 @@ NhmBusy RtlJaguar3Device::ReadNhmBusy() {
  * MEASURED: the full recipe dropped 8822EU delivery from ~6800 to ~10 frames.
  * These MAC 0x520/0x524 bits gate TX only and are safe on a live RX. */
 void RtlJaguar3Device::apply_cca_mode_locked(bool disabled) {
+  apply_cca_gates_locked(disabled, disabled);
+}
+
+void RtlJaguar3Device::apply_cca_gates_locked(bool primary_disabled,
+                                              bool edcca_disabled) {
   uint32_t v520 = _device.rtw_read<uint32_t>(0x0520);
   uint32_t v524 = _device.rtw_read<uint32_t>(0x0524);
-  if (disabled) {
-    v520 |= (1u << 15) | (1u << 14);   /* DIS_EDCCA (energy) + DIS_CCA (carrier-sense) */
-    v524 &= ~(1u << 11);
-  } else {
-    v520 &= ~((1u << 15) | (1u << 14));
-    v524 |= (1u << 11);
-  }
+  /* DIS_EDCCA (energy) + DIS_CCA (carrier-sense); a set bit disables. */
+  if (primary_disabled) v520 |= (1u << 14); else v520 &= ~(1u << 14);
+  if (edcca_disabled)   v520 |= (1u << 15); else v520 &= ~(1u << 15);
+  /* 0x524[11] is BIT_EDCCA_MSK_CNTDOWN_EN (REG_RD_CTRL) — EDCCA masking the
+   * backoff countdown. Same name and bit on 8822B/8822C/8822E, so the
+   * meaning is family-stable rather than an 8822C guess. Being EDCCA-scoped
+   * it follows edcca_disabled alone: leaving it set in the EDCCA-off arm
+   * would let EDCCA keep masking the countdown, i.e. only half-disable the
+   * gate the caller asked to turn off. SetCcaMode's two pure states are
+   * unaffected — both gates equal means this writes what it always did. */
+  if (edcca_disabled) v524 &= ~(1u << 11);
+  else                v524 |= (1u << 11);
   _device.rtw_write<uint32_t>(0x0520, v520);
   _device.rtw_write<uint32_t>(0x0524, v524);
 }
 
+bool RtlJaguar3Device::GetCcaGates(bool &primary_disabled, bool &edcca_disabled) {
+  std::lock_guard<std::mutex> lk(_reg_mu);
+  /* Before bring-up 0x520 holds whatever the chip's own boot left there (or
+   * whatever the bus returns on a powered-down part), and reporting that as
+   * the gate state would be a fabricated measurement. Same guard as Jaguar1,
+   * and it keeps the setter's refusal below honest: a caller that cannot set
+   * the gates yet cannot be handed a reading of them either. */
+  if (!_brought_up)
+    return false;
+  const uint32_t v = _device.rtw_read<uint32_t>(0x0520);
+  primary_disabled = (v & (1u << 14)) != 0;
+  edcca_disabled = (v & (1u << 15)) != 0;
+  return true;
+}
+
+bool RtlJaguar3Device::SetCcaGates(bool primary_disabled, bool edcca_disabled) {
+  std::lock_guard<std::mutex> lk(_reg_mu);
+  /* Post-bring-up only, and it says so rather than recording a request it
+   * will not carry out: neither Init nor InitWrite replays this state, so
+   * caching it here and returning true would report success for a write that
+   * never happens. The "configure it from bring-up" path is the existing
+   * tuning.disable_cca knob, which Init applies through SetCcaMode. */
+  if (!_brought_up)
+    return false;
+  /* Sticky the same way dis_cca is: a channel set rewrites the BB CCA
+   * registers and SetMonitorChannel re-asserts from these. */
+  _cca_primary_disabled = primary_disabled;
+  _cca_edcca_disabled = edcca_disabled;
+  apply_cca_gates_locked(primary_disabled, edcca_disabled);
+  _logger->info("Jaguar3: CCA gates primary={} edcca={}",
+                primary_disabled ? "OFF" : "on", edcca_disabled ? "OFF" : "on");
+  return true;
+}
+
 void RtlJaguar3Device::SetCcaMode(bool disabled) {
   std::lock_guard<std::mutex> lk(_reg_mu);
-  _cca_disabled = disabled;
+  _cca_primary_disabled = disabled;
+  _cca_edcca_disabled = disabled;
   if (_brought_up)
     apply_cca_mode_locked(disabled);
   _logger->info("Jaguar3: MAC carrier-sense {}",
@@ -1489,12 +1650,21 @@ void RtlJaguar3Device::SetCcaMode(bool disabled) {
 }
 
 void RtlJaguar3Device::SetMonitorChannel(SelectedChannel channel) {
+  /* A window armed before this retune would integrate across the channel
+   * change and report the blend as one channel's occupancy. */
   _phydm.on_channel_change();
   /* Serialize against the coex thread's housekeeping tick (and any concurrent
    * FastRetune) — channel config is register RMW. Init/InitWrite call the
    * radio-management core directly (no lock needed: the coex thread isn't
    * running yet), so locking here cannot self-deadlock. */
   std::lock_guard<std::mutex> lk(_reg_mu);
+  /* The note must not be able to land before a concurrent arm that then
+   * commits while this tune runs. _reg_mu above is what spans the tune, and
+   * with_ccx takes _reg_mu BEFORE this lock, so an arm cannot interleave.
+   * Ordering is always the family's register lock first, then this one. */
+  std::lock_guard<std::mutex> ccx(busy_window_mutex());
+  busy_window_note_retune();
+
   const bool ch_changed = channel.Channel != _channel.Channel;
   _channel = channel;
   _rx_bw_code.store(channel_width_to_bw_code(channel.ChannelWidth),
@@ -1511,8 +1681,8 @@ void RtlJaguar3Device::SetMonitorChannel(SelectedChannel channel) {
     apply_tx_power_current(/*full=*/true);
   /* dis_cca is sticky — the channel set rewrote the BB CCA registers, so
    * re-assert the disable if it was armed. */
-  if (_brought_up && _cca_disabled)
-    apply_cca_mode_locked(true);
+  if (_brought_up && (_cca_primary_disabled || _cca_edcca_disabled))
+    apply_cca_gates_locked(_cca_primary_disabled, _cca_edcca_disabled);
   /* Per-packet power banks are sticky too (the lever contract): the channel
    * set doesn't touch 0x1e70[31:16] today, but a cheap RMW re-assert keeps
    * the contract robust against future channel-path changes. */
@@ -1523,7 +1693,14 @@ void RtlJaguar3Device::SetMonitorChannel(SelectedChannel channel) {
 void RtlJaguar3Device::FastRetune(uint8_t channel, bool cache_rf) {
   std::lock_guard<std::mutex> lk(_reg_mu);
   if (channel == _channel.Channel)
-    return;
+    return; /* no tune, so nothing to spoil — the note goes after this */
+  /* A window armed before this retune would integrate across the channel
+   * change and report the blend as one channel's occupancy. */
+  {
+    std::lock_guard<std::mutex> ccx(busy_window_mutex());
+    busy_window_note_retune();
+  }
+
   const bool band_change = (_channel.Channel <= 14) != (channel <= 14);
   if (_radioManagement.fast_retune(channel, _channel.ChannelOffset,
                                    _channel.ChannelWidth, cache_rf)) {
@@ -1547,7 +1724,14 @@ void RtlJaguar3Device::FastRetune(uint8_t channel, bool cache_rf) {
 void RtlJaguar3Device::FastSetBandwidth(ChannelWidth_t bw) {
   std::lock_guard<std::mutex> lk(_reg_mu);
   if (bw == _channel.ChannelWidth)
-    return;
+    return; /* no reconfiguration, so nothing to spoil */
+  /* A bandwidth change reconfigures the front end, so a window armed before
+   * it was measuring a different receiver — the same argument as a retune,
+   * and the full path below tunes the RF outright. */
+  {
+    std::lock_guard<std::mutex> ccx(busy_window_mutex());
+    busy_window_note_retune();
+  }
   auto in_set = [](ChannelWidth_t b) {
     return b == CHANNEL_WIDTH_20 || b == CHANNEL_WIDTH_5 ||
            b == CHANNEL_WIDTH_10;
@@ -1853,6 +2037,10 @@ devourer::AdapterCaps RtlJaguar3Device::GetAdapterCaps() {
   c.tx_chains = 2; /* 8822C/8822E are 2T2R */
   c.rx_chains = 2;
   c.per_chain_rssi = true;
+  /* CCX CLM via NhmReader's JGR3 map; separated arm-vs-quiet on air (#431). */
+  c.busy_airtime_ok = true;
+  c.busy_airtime_measured = true;
+  c.rx_energy_ok = true;
   /* Hardware ARQ (truth table at the AdapterCaps declarations): both dies
    * measured — responder matrix + retry-knob A/B + the arq_e2e ledgers. */
   c.ack_responder_ok = true;
@@ -1883,6 +2071,7 @@ devourer::AdapterCaps RtlJaguar3Device::GetAdapterCaps() {
   c.narrowband_ok = true; /* 5/10 MHz baseband re-clock — Jaguar3 only */
   c.hw_rx_timestamp = true;  /* FrameParserJaguar3 fills RxAtrib.tsfl */
   c.hw_beacon_txtsf = true;  /* StartBeacon: MAC inserts the egress TSF into beacons */
+  c.tsf_write_ok = true;     /* WriteTsf: REG_TSFTR (8822C readback) */
   c.xtal_cap_max = 0x7f;   /* 7-bit AFE crystal-cap trim (0x1040) */
   c.xtal_cap_default = 0x20;
   /* LDPC RX: both variants decode HT+VHT LDPC (bench: encoding-matrix
@@ -2051,7 +2240,7 @@ size_t RtlJaguar3Device::send_packets(const TxPacketView *pkts, size_t count) {
    * interface-default per-frame loop. */
   const unsigned agg = _cfg.tx.usb_agg_max;
   if (agg <= 1 || !_device.is_usb() || count == 0)
-    return IRtlDevice::send_packets(pkts, count);
+    return IRadio::send_packets(pkts, count);
 
   devourer::TxAggLimits lim;
   lim.desc_size = jaguar3::TXDESC_SIZE_8822C;
@@ -2341,7 +2530,7 @@ size_t RtlJaguar3Device::build_tx_block(const uint8_t *packet, size_t length,
    * the kernel's descriptor for group-addressed frames. */
   const uint8_t *dot11 = packet + radiotap_length;
   bool bmc = frame_len >= 6 && (dot11[4] & 0x01);
-  /* STBC guard (IRtlDevice contract) — 8822C/8822E are 2T2R so this never
+  /* STBC guard (IRadio contract) — 8822C/8822E are 2T2R so this never
    * fires today, but keeps the invariant uniform across families: never air an
    * STBC frame the chip can't do. */
   if (stbc && !GetTxCaps().stbc_ok)
@@ -2454,21 +2643,16 @@ uint64_t RtlJaguar3Device::ReadTsf() {
    * _reg_mu (shared with the coex runtime thread). Starved to 0 under a heavy
    * RX bulk-IN flood — reliable from a quiet TX. */
   std::lock_guard<std::mutex> lk(_reg_mu);
-  uint32_t hi = _device.rtw_read<uint32_t>(0x0564);
-  uint32_t lo = _device.rtw_read<uint32_t>(0x0560);
-  if (_device.rtw_read<uint32_t>(0x0564) != hi) {
-    hi = _device.rtw_read<uint32_t>(0x0564);
-    lo = _device.rtw_read<uint32_t>(0x0560);
-  }
-  return (static_cast<uint64_t>(hi) << 32) | lo;
+  return devourer::read_tsftr(_device);
 }
 
-void RtlJaguar3Device::WriteTsf(uint64_t tsf) {
-  /* REG_TSFTR 0x0560 (low) / 0x0564 (high). Serialized on _reg_mu against the
-   * coex tick. The counter keeps running, so this sets it to ~tsf. */
+bool RtlJaguar3Device::WriteTsf(uint64_t tsf) {
+  /* REG_TSFTR, serialized on _reg_mu against the coex tick. The counter keeps
+   * running, so this sets it to ~tsf. Readback-measured on the RTL8822C; the
+   * 8822E rides the same pair and is not separately measured. Success rule:
+   * devourer::write_tsftr. */
   std::lock_guard<std::mutex> lk(_reg_mu);
-  _device.rtw_write<uint32_t>(0x0560, static_cast<uint32_t>(tsf));
-  _device.rtw_write<uint32_t>(0x0564, static_cast<uint32_t>(tsf >> 32));
+  return devourer::write_tsftr(_device, tsf);
 }
 
 bool RtlJaguar3Device::SetAckResponder(const devourer::MacAddr &mac) {

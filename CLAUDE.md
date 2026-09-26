@@ -5,7 +5,8 @@ code in this repository. It holds **cross-cutting** facts only. Deep subtree
 facts live in nested `CLAUDE.md` files, auto-loaded when working there:
 `src/{jaguar1,jaguar2,jaguar3,kestrel,rtl8733b}/` for per-generation registers,
 descriptors and per-chip mechanisms; `src/hopset/` for keyed FHSS and the
-adaptive hopset; `src/chanmig/` for channel migration. Add new facts to the
+adaptive hopset; `src/chanmig/` for channel migration; `src/sensing/` for the
+device-touching survey executor. Add new facts to the
 narrowest file that covers them.
 
 Two standing rules for this file: never duplicate what a header already
@@ -60,7 +61,7 @@ construction from the `SYS_CFG2` chip-id (Kestrel: PID-first):
   20/40 MHz on 2.4/5 GHz, plus long-preamble CCK on 2.4 GHz at 20 MHz, plus
   10 MHz narrowband (5 MHz refused — `src/rtl8733b/CLAUDE.md`).
   Everything the backend has not ported (TSF/beacons, A-MPDU, CCX/`tx.report`,
-  the flat-index and per-rate TX-power knobs) falls through to `IRtlDevice`'s
+  the flat-index and per-rate TX-power knobs) falls through to `IRadio`/`IRtlRadio`'s
   not-ported defaults rather than being faked, so read the base class before
   assuming a cross-generation feature below applies here. `FastRetune` IS
   ported (intra-band, TSSI kept live — `src/rtl8733b/CLAUDE.md`). SGI, LDPC, STBC, VHT
@@ -79,12 +80,12 @@ PCIe sibling of the 8821CU — rides the same Jaguar2 HAL through a vfio-pci
 transport (`src/PcieTransport.{h,cpp}`: BAR2 MMIO registers over the same
 0x0000..0xFFFF space the USB vendor-control path addresses, 88xx
 buffer-descriptor DMA rings for TX/RX). USB and PCIe are independent
-transports behind `devourer::IRtlTransport` (`src/RtlTransport.h`); the
+transports behind `devourer::ITransport` (`src/Transport.h`); the
 bus-neutral `RtlAdapter` the HALs hold forwards to whichever it was built
 with. The few genuinely bus-specific bring-up steps gate on `is_usb()` (PCIe
 power-seq rows, PQ map, no USB RX-agg, no DLFW 512-pad) or ride `hci_setup()`
 (pre-power TRX ring programming, no-op on USB). Factory:
-`WiFiDriver::CreateRtlDevicePcie(PcieTransport::Open(bdf, logger))` — the
+`WiFiDriver::CreateRadioPcie(PcieTransport::Open(bdf, logger))` — the
 caller owns vfio like it owns libusb. Demos: `DEVOURER_PCIE_BDF=0000:01:00.0`
 on rxdemo and txdemo; `pcieprobe <bdf>` validates the layers bottom-up.
 Bind/restore: `tests/pcie_vfio_bind.sh` — driver_override, **not** new_id,
@@ -173,7 +174,8 @@ second back-to-back `sdr_duty` read can fail to reacquire and report ~0).
 
 Suspect a DUT itself (deaf with a green init, chronic FW-boot fails):
 `build/doctor` grades adapter health — EFUSE read-stability ×N, fw-boot,
-RX smoke → HEALTHY/SUSPECT/FAILING in the exit code;
+RX smoke → HEALTHY/SUSPECT/FAILING in the exit code (EFUSE stability is
+`IRtlRadio`-only; the other legs are `IRadio`);
 `tests/adapter_doctor_cold.sh` wraps it in per-rep VBUS cold + a vouched
 flood for a definitive verdict (`docs/adapter-doctor.md`). Two cold-init
 traps it encodes: the in-tree rtw88 modules auto-probe (and fw-download
@@ -207,11 +209,11 @@ dumps (kernel cross-validation format).
 **The library reads no environment.** Construction-time knobs live in
 `devourer::DeviceConfig` (`src/DeviceConfig.h` — rx / tx / bf / tuning / debug /
 usb sections, every field doc-tagged with its env-var spelling and value
-grammar), passed as `CreateRtlDevice`'s defaulted fourth argument. Mid-session
-knobs are runtime setters on `IRtlDevice` (`SetTxMode`, `SetTxPowerOffsetQdb`,
+grammar), passed as `CreateRadio`'s defaulted fourth argument. Mid-session
+knobs are runtime setters on `IRadio` (`SetTxMode`, `SetTxPowerOffsetQdb`,
 `SetTxPowerIndexOverride`, `SetRxPathMask`, `SetCcaMode`, `FastRetune`, ...).
 
-**Adapter capabilities**: `IRtlDevice::GetAdapterCaps()` (`src/AdapterCaps.h`)
+**Adapter capabilities**: `IRadio::GetAdapterCaps()` (`src/AdapterCaps.h`)
 aggregates chip identity, chain counts, the composed `GetTxCaps` +
 `GetTxPowerCaps`, channel widths, per-band tunable + characterized frequency
 spans, and feature flags — resolved at construction, thread-safe, callable
@@ -270,7 +272,7 @@ those are the ones listed below.
 - `DEVOURER_USB_DEBUG=1` — libusb DEBUG log level (~7 MB / 15 s, has filled
   `/tmp` mid-capture; adds 0.5–0.8 s to init).
 - `DEVOURER_THERMAL_POLL_MS=N` — emit `thermal` events from the RF 0x42 meter,
-  on every generation (the poller rides `IRtlDevice::GetThermalStatus`).
+  on every generation (the poller rides `IRadio::GetThermalStatus`).
   `raw` is 0..63 thermal units (~1.5–2 °C each, **not** absolute °C); `delta`
   = raw − EFUSE baseline. **Telemetry only**: the poller emits and warns
   (`DEVOURER_THERMAL_WARN_DELTA`, default 15) and never stops RX; no HAL gates
@@ -278,6 +280,12 @@ those are the ones listed below.
   degradation predictor — `docs/warm-tx-degradation.md` has delivery scattered
   63–83% with no relation to the meter, and inside one uninterrupted session
   the meter stays pinned while delivery drifts.
+- `DEVOURER_RX_BUSY_MS=N` (rxdemo) — the vendor-neutral busy-airtime window
+  at a fixed cadence: arm, wait N ms, read, one `rx.busy` event per window
+  (`IRadio::ArmChannelBusy`/`GetChannelBusy`, so it runs on the MT7612U where
+  `DEVOURER_RX_ENERGY_MS` cannot). It is the survey executor's dwell shape,
+  which makes it the harness for "does polling at dwell cadence cost the
+  receiver anything".
 - `DEVOURER_LINKHEALTH=1` (rxdemo, needs `DEVOURER_RX_ENERGY_MS=N`) — classify
   the RX sensor tuple via `src/LinkHealth.h`. **EVM, not SNR, is the
   saturation tell**: strong RSSI + poor EVM means back power OFF, which is the
@@ -322,12 +330,31 @@ Behavioural traps the per-field docs can't carry:
   Jaguar1/2/3; on Jaguar1 the enable is real work — its BB table parks the
   EDCCA thresholds (`0x8a4`) at never-trigger, so bring-up programs the
   vendor adaptivity operating point (IGI-coupled; the phydm watchdog
-  re-tracks it when running). The primary-CCA bit is the one that matters:
-  monitor injection is not CCA-free, it defers ~40–60% to a co-channel
-  802.11 transmitter, and clearing `[14]` recovers ~1.5–2.2× (on-air
-  8822EU/8812CU, `tests/dis_cca_tx_onair.sh`); the energy bit `[15]` alone
-  is null against a decodable preamble. **On by default on the streamtx FPV
-  downlink** (the link owns the channel — CSMA backoff only stutters it);
+  re-tracks it when running). **Which bit matters is family-specific and the
+  two measured families disagree — do not generalise either result.** On
+  Jaguar3, monitor injection defers to a co-channel 802.11 transmitter and
+  clearing `[14]` recovers it while the energy bit `[15]` alone is null
+  against a decodable preamble (on-air 8822EU/8812CU,
+  `tests/dis_cca_tx_onair.sh`, measuring the DUT's host-side `submitted`
+  rate). On Jaguar1 it inverts: with an 8812AU injecting on an idle channel
+  and two independent witnesses decoding, clearing `[15]` alone recovers
+  ~95% while clearing `[14]` alone recovers little, because what stops this
+  family is the EDCCA its own bring-up turned on. The two are not in
+  conflict — they measure different things on different silicon — but
+  neither is the general answer.
+
+  Turning both gates off is WORSE than turning off the one that matters:
+  with EDCCA off and primary CCA left on, the same Jaguar1 injector delivers
+  95% on an idle channel and still 78% under a co-channel flooder; with both
+  gates off it collapses to 0.3%, because it stops waiting for a gap and
+  collides instead. `SetCcaGates` (`IRtlRadio`, Jaguar1 and Jaguar3) is the
+  one-bit-at-a-time form for exactly this; `SetCcaMode` remains the portable
+  all-or-nothing call and is `SetCcaGates(d, d)`. Both gate calls are
+  post-bring-up only and return false before it — see `src/IRtlRadio.h` for
+  the contract, and `tests/cca_gates_regcheck.sh` to reproduce the tables.
+
+  `DEVOURER_DIS_CCA` is **on by default on the streamtx FPV downlink** (the
+  link owns the channel — CSMA backoff only stutters it);
   `DEVOURER_DIS_CCA=0` forces standard carrier-sense back. On Kestrel the
   8852C runs the same enabled default (measured: full-rate TX, 2.4x flood
   deferral); the 8852B TX bring-up still clears the gates and WARNS pending
@@ -388,7 +415,7 @@ temporal layer and injects each at its ladder's rate
 
 ## Frequency hopping
 
-`IRtlDevice::FastRetune(channel)` — lean intra-band, same-bandwidth retune on
+`IRadio::FastRetune(channel)` — lean intra-band, same-bandwidth retune on
 all five generations (RF channel switch only, write-only from a
 compose cache); falls back to full `SetMonitorChannel` on a band change.
 FHSS-grade on the Jaguar/Kestrel dies: ~0.5–2.5 ms per hop depending on chip.
@@ -418,7 +445,7 @@ reference, policy thresholds, measured sensing constants and the on-air
 harnesses: `src/hopset/CLAUDE.md`. Article + results: `docs/fhss.md`,
 `docs/jammer-resilience.md`.
 
-`IRtlDevice::FastSetBandwidth(bw)` is the bandwidth analogue — a lean
+`IRadio::FastSetBandwidth(bw)` is the bandwidth analogue — a lean
 same-channel toggle between 20 MHz and 5/10 MHz narrowband (baseband re-clock
 only; ~0.18 ms on the 8812AU vs ~90 ms for the full `SetMonitorChannel`);
 falls back to the full path for a 40/80 MHz endpoint. Validation:
@@ -428,6 +455,29 @@ RX counterpart: `DEVOURER_RX_SWEEP` dwells FastRetune-cheap bins emitting
 per-bin energy + frame stats; `tests/sounding_sweep.sh` + `tests/sounding_map.py`
 recover a coarse per-bin H(f) — down to 5 MHz bins on Jaguar3
 (`docs/rx-spectrum-sensing.md`).
+
+The frame-free energy read also carries the two CCX window products, `clm`
+(hardware busy **airtime** %) and `nhm_env` (NHM mass above the receiver's own
+floor — the comparable form of the histogram, unlike the naive `nhm_busy` that
+rails ~100 on a quiet channel). Their disagreement is the signal: an 802.11
+transmitter lifts both, a non-802.11 emitter lifts only `nhm_env`, which is the
+case a frame sniffer calls a free channel. Three cross-cutting caveats, none of
+them chip-specific: plain `fa_ofdm` outperformed both new sensors on every part
+measured, so this buys an airtime unit and a non-railing ratio rather than a new
+detection; `nhm_env` is referenced to the live IGI, so it is only dependable
+where DIG is not free to walk the gain out from under it (the per-generation
+windows are in each `src/<gen>/CLAUDE.md`); and the ~2 ms window makes one dwell
+a sample, not a measurement.
+
+That last one is what `IRadio::ArmChannelBusy(window_us)` addresses: a busy
+figure over the caller's own window instead of a 2 ms slice of it. The contract
+— what arming promises, what invalidates a window, and what own transmission
+does to the reading — is documented once, on the declaration in `src/IRadio.h`.
+The per-generation behaviour and every measured number live in each
+`src/<gen>/CLAUDE.md` and `docs/rx-spectrum-sensing.md`.
+Both are **emitted, not scored**: neither `ChannelScore` nor the hopset
+occupancy law reads them. Measured numbers, the generation matrix and the
+harness: `docs/rx-spectrum-sensing.md`.
 
 ## Adaptive channel migration
 
@@ -498,16 +548,16 @@ sensor; C2H rides the RX path, so J1/J2 TX-only sessions see none (run
 
 ## Architecture
 
-**The caller owns libusb.** `WiFiDriver::CreateRtlDevice` is intentionally
+**The caller owns libusb.** `WiFiDriver::CreateRadio` is intentionally
 thin — `libusb_init`, device open, kernel-driver detach, and
 `libusb_claim_interface(handle, 0)` must happen **before** handing the handle
 to the factory. `examples/rx/main.cpp` is the canonical boilerplate;
 `devourer::claim_interface_then_reset` (src/UsbOpen.h) is the recommended
 open path (advisory per-adapter lock before reset).
 
-Owning libusb means owning the **teardown order**: destroy the `IRtlDevice`
+Owning libusb means owning the **teardown order**: destroy the `IRadio`
 first, then release the interface, close the handle, and only then
-`libusb_exit`. The device is what quiesces TX (`IRtlDevice::Stop`, and the
+`libusb_exit`. The device is what quiesces TX (`IRadio::Stop`, and the
 destructor as a backstop: Jaguar1's async bulk-OUT URBs must be cancelled and
 reaped while the context still exists), so tearing libusb down first is a
 crash, not a leak — and only under enough TX load to keep URBs outstanding at
@@ -516,27 +566,32 @@ that order; the transport logs a diagnostic naming this if it is destroyed
 with TX still in flight.
 
 **Chip identity is resolved at construction** from the `SYS_CFG2` chip-id +
-USB PID. `CreateRtlDevice` returns an `IRtlDevice` (`Init` = bring-up + RX
+USB PID. `CreateRadio` returns an `IRadio` (`Init` = bring-up + RX
 loop; `InitWrite` = TX bring-up; `StartRxLoop` = blocking RX worker on an
 already-up chip, enabling TX+RX on one handle; `send_packet`) and constructs
 `RtlJaguarDevice` / `RtlJaguar2Device` / `RtlJaguar3Device` / `RtlKestrelDevice`
 / `Rtl8733bDevice` per backend. `Rtl8812aDevice` is a deprecated alias of
-`RtlJaguarDevice`. Optional device methods are **virtual with not-ported
-defaults**, not pure virtual — a backend that hasn't ported a feature inherits
+`RtlJaguarDevice`. The five Realtek backends derive from `IRtlRadio`
+(`src/IRtlRadio.h`), the Realtek-only extension of `IRadio` — the header
+carries the member list and the downcast contract. Optional device methods
+are **virtual with not-ported defaults**, not pure virtual — a backend that
+hasn't ported a feature inherits
 `false`/`0`/a full-path fallback rather than a fake. Check the override list in
 the backend's header before believing a cross-generation claim.
 
 Generation-agnostic core in `src/` (always compiled; depends on no HAL):
 
-- `WiFiDriver` — the factory (`CreateRtlDevice`).
+- `IRadio` (`src/IRadio.h`) — the vendor-neutral radio contract every backend
+  implements; `WiFiDriver::CreateRadio` returns one.
+- `WiFiDriver` — the factory (`CreateRadio`).
 - `DeviceConfig.h` — construction-time configuration struct; every component
   copies the sub-struct it consumes at construction.
 - `RtlAdapter` — the bus-neutral register/frame accessor; a copyable value
-  type shared by every component, forwarding to the `IRtlTransport` it was
+  type shared by every component, forwarding to the `ITransport` it was
   built with (`UsbTransport` = libusb vendor control + bulk; `PcieTransport` =
   BAR2 MMIO + DMA rings). `RtlUsbAdapter` is a deprecated alias. An RX
   `on_data` callback can run on any thread that calls a batching register
-  method (`IRtlTransport::ctrl_batch`, `src/RtlTransport.h`), so nothing
+  method (`ITransport::ctrl_batch`, `src/Transport.h`), so nothing
   reachable from `on_data` may take a device register lock.
 - `Radiotap.c` — radiotap iterator. TX buffers passed to `send_packet` **must**
   begin with a radiotap header; rate/MCS/VHT/STBC/LDPC/SGI/bandwidth are read
@@ -546,6 +601,10 @@ Generation-agnostic core in `src/` (always compiled; depends on no HAL):
 - `PhyTableLoader` — runtime walker for Realtek's phydm-format register tables
   (`check_positive` + opcode state machine, without pulling in phydm itself).
   Shared by Jaguar1 + Jaguar2; Jaguar3 has its own `PhyTableLoaderJaguar3`.
+- `sensing/` — the one helper subtree that CALLS device methods: the
+  channel-survey dwell executor and the shared observation window. Its
+  lifecycle contract is what lets `chanmig/` and `hopset/` stay pure —
+  `src/sensing/CLAUDE.md`.
 - `cell/` — caller-side per-cell helpers built on the device API
   (`UeRxAttribution`: per-transmitter windowed RX statistics keyed by 802.11
   TA); the device RX loops are untouched.
@@ -619,7 +678,7 @@ byte-for-byte; prefer that shape when adding one.
 ```cpp
 auto logger = std::make_shared<Logger>();
 WiFiDriver driver(logger);
-auto dev = driver.CreateRtlDevice(handle);  // handle is already claimed
+auto dev = driver.CreateRadio(handle);  // handle is already claimed
 dev->InitWrite(SelectedChannel{ .Channel = 36, .ChannelOffset = 0,
                                 .ChannelWidth = CHANNEL_WIDTH_20 });
 dev->send_packet(buffer, len);  // buffer[0..] = radiotap header, then 802.11

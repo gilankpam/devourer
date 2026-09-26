@@ -16,12 +16,20 @@
 #else
 #  include <libusb-1.0/libusb.h>
 #endif
-#include <pthread.h>
-#include <time.h>
+/* C++ only: the sync members below are std:: types, chosen over pthreads
+ * because MSVC has no <pthread.h> and devourer builds Windows first-class.
+ * Nothing outside this subtree includes this header; the public C ABI in
+ * include/mt7612u/mt7612u.h is unaffected and stays C-includable. */
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
 #include <stdint.h>
 #include <stddef.h>
 #include <stdio.h>
 #include "regs.h"
+#include "Mt7612uRxCorr.h"
 #include "include/mt7612u/mt7612u.h"
 
 /* Per-rate TX power, 0.5 dB units, exactly mt76x02_rate_power's layout. */
@@ -40,8 +48,18 @@ struct mt_tx_power_info {
 
 /* EEPROM-derived values the host computes with (firmware does the rest). */
 struct mt7612u_cal {
-	int8_t  rssi_offset[2];
-	int8_t  lna_gain;
+	/* The per-channel RSSI correction (mt76x02_mac_get_rssi's two chain
+	 * offsets and the LNA gain), packed into one word so that a retune
+	 * publishes all three at once. mt_read_rx_gain() rewrites them on every
+	 * tune from the caller's thread while mt_rx_parse() reads them on the
+	 * libusb event thread for every frame; as three separate bytes a frame
+	 * parsed mid-retune got the new offset with the old LNA gain - a wrong
+	 * RSSI, which ThreadSanitizer reported against real hardware. One
+	 * relaxed atomic word is the whole fix: the reader sees either the old
+	 * triple or the new, never a mix, and the hot path pays one load.
+	 * Encode/decode with mt_rx_corr_pack()/mt_rx_corr_unpack()
+	 * (Mt7612uRxCorr.h). */
+	std::atomic<uint32_t> rx_corr;
 	int8_t  high_gain[2];
 	uint8_t init_cal_done;
 	uint8_t channel_cal_done;
@@ -63,6 +81,7 @@ struct mt7612u_cal {
 	 * RX hot path does no cross-thread write at all. */
 };
 
+#define MT_SYNC_POOL 4   /* pooled transfers for the sync helpers */
 #define MT_RX_RING  16
 /* 16 slots, not 32: the slots now carry a full aggregate, so this is the
  * difference between 256 KB and 512 KB of ring. Depth is not what buys
@@ -124,9 +143,14 @@ struct mt_async {
 	int     tx_busy[MT_TX_RING];
 	/* Guards running, rx_active, tx_busy[], tx_inflight and rx_inflight -
 	 * all of which the event thread writes and the caller reads. */
-	pthread_mutex_t lock;
-	pthread_cond_t  cv;
-	pthread_t evt;
+	std::mutex lock;
+	/* condition_variable_any, not condition_variable: it waits on any
+	 * BasicLockable, so every site below keeps the plain lock()/unlock()
+	 * shape the pthread code had instead of being restructured around
+	 * unique_lock. The waits here are teardown and TX back-pressure, not a
+	 * hot path, so the extra indirection costs nothing measurable. */
+	std::condition_variable_any cv;
+	std::thread evt;
 	int evt_started;
 	int running, rx_active;
 	int tx_inflight, rx_inflight;
@@ -158,12 +182,35 @@ struct mt7612u_dev {
 	uint8_t  mcu_stale_pending;
 	uint8_t  chan;
 	uint8_t  bw;
-	pthread_mutex_t io_lock;   /* recursive: guards register + MCU transactions */
-	uint8_t  io_lock_ready;    /* io_lock initialised - guards its destroy */
+	/* Recursive: the PHY tick holds this and then nests mt_vendor_req /
+	 * mt_mcu_send, which take it again. As a member it is constructed with
+	 * the device, which is what retires the old io_lock_ready flag: a zeroed
+	 * pthread_mutex_t was a valid NON-recursive lock, so a path that skipped
+	 * the explicit init (the adopt path once did) self-deadlocked the tick.
+	 * That failure is now unrepresentable. */
+	std::recursive_mutex io_lock;
 	/* Observe-but-do-not-repair, for wedge experiments.  A field, not a
-	 * getenv: this library reads no environment - the tool that wants the
-	 * behaviour sets it before mt_open() (bringup does). */
+	 * getenv - the tool that wants the behaviour sets it before mt_open()
+	 * (bringup does). True of the library as a whole now: the selector moved
+	 * to a field too, so nothing here reads the environment. */
 	uint8_t  no_autorecover;
+	/* Which adapter to open, "<bus>-<port>" as bringup spells it, or NULL for
+	 * "the first one". A field and not a getenv: this is a LIBRARY now
+	 * (DEVOURER_MT7612U links it into libdevourer), and a library that picks
+	 * its hardware from ambient process state can claim an adapter its caller
+	 * never asked for. Points at caller-owned storage and is only read during
+	 * mt_open(). */
+	const char *dev_selector;
+	/* The adapter's exclusivity lock (flock on the same file UsbDeviceLock
+	 * uses), or -1. PER DEVICE, not a file-global: mt7612u_open_selected()
+	 * makes one process holding two adapters a supported shape, and a single
+	 * global fd meant opening B overwrote A's descriptor - so closing A
+	 * released B's lock and leaked A's, leaving another process free to
+	 * reset and claim B while A was still using it. */
+	/* -1, NOT the 0 that value-initialising the device would give: 0 is
+	 * stdin, and unlock_adapter() would close it on a device that never took
+	 * a lock. */
+	int lock_fd = -1;
 	uint8_t  bw_clamp_warned;   /* the "never widen" notice is once, not per frame */
 	int8_t   txpower_conf;      /* limit, 0.5 dB units (dBm * 2) */
 	int8_t   target_power;
@@ -174,23 +221,63 @@ struct mt7612u_dev {
 
 	unsigned io_err;          /* EP0 transfers that exhausted their retries */
 	int      transfers_stranded; /* libusb still owns a cancelled ring */
+	/* libusb_transfer objects for the synchronous helpers (usb.cpp), taken
+	 * from here rather than allocated per call. Allocated in
+	 * mt_dev_state_init(), i.e. before any event thread exists, so the
+	 * thread's first lock of a transfer's mutex is ordered after its
+	 * initialisation by thread creation - a per-call allocation is ordered
+	 * only through the kernel's URB handoff, which ThreadSanitizer cannot
+	 * see and reports. Empty pool = allocate fresh (correct, just noisier). */
+	std::mutex sync_pool_mu;
+	struct libusb_transfer *sync_pool[MT_SYNC_POOL];
+	int      sync_pool_n;
 	uint16_t max_mpdu_rx;     /* from MT_MAX_LEN_CFG at init, less the FCS */
 	uint64_t stats_last_us;   /* previous mt7612u_link_stats() mark */
+	int      ch_time_armed;   /* channel timers configured and zeroed */
+	/* Set when mt7612u_link_stats() cleared the channel timers while a
+	 * ch_time window was armed: the two share MT_CH_BUSY/MT_CH_IDLE, which
+	 * are read-and-clear, so the telemetry poll takes the counts the window
+	 * was accumulating. Without this the later read covers only the
+	 * remainder while still claiming the full interval. */
+	int      ch_time_disturbed;
+	uint64_t ch_time_last_us; /* previous mt7612u_ch_time() mark — separate
+	                           * from stats_last_us for the same reason it
+	                           * is per-device: two readers sharing one mark
+	                           * report nonsense intervals to both. */
 
 	/* Oracle-diff log: every EP0 write we emit, in order. */
 	uint8_t  ack_saved_mac[6];
 	int      ack_saved;
+	/* Set when mt7612u_beacon_start() was the one that retargeted the port
+	 * identity, so mt7612u_beacon_stop() restores it - and does NOT when a
+	 * caller had already armed an ACK responder, because then the identity is
+	 * theirs and restoring would silently disarm it. */
+	int      beacon_took_identity;
+	/* The addr2 AND addr3 mt7612u_beacon_start() programmed, so an in-place
+	 * update can refuse a beacon that would change either. Both, because they
+	 * land in different registers: addr2 in MT_MAC_ADDR and the MBSS base,
+	 * addr3 in the APC BSSID slot. Guarding addr2 alone let an update move the
+	 * BSSID the beacon advertises while the slot still held the old one - the
+	 * AP beacons perfectly and acknowledges nobody, which is the exact failure
+	 * this guard exists to prevent. The two are adjacent in the 802.11 header
+	 * (bytes 10 and 16 of the 24-byte management header beacon_split()
+	 * requires), so one memcpy covers them. */
+	uint8_t  beacon_ident[12];
 	struct mt_async *a;
 	FILE    *wrlog;
 	FILE    *mculog;
 };
 
 /* --- usb.c --- */
-/* Per-device state both open paths need before ANY register I/O: the recursive
- * io_lock and the calibration sentinels.  Both mt_open() and mt_adopt() reach
- * mt_vendor_req() (which locks io_lock) during identification, so this must run
- * first on either path.  Idempotent.  mt_dev_state_destroy() is the matching
- * teardown, guarded so it runs exactly once regardless of how far open got. */
+/* Per-device state both open paths need before ANY register I/O.
+ *
+ * This used to construct the recursive io_lock, and existed because both
+ * mt_open() and mt_adopt() reach mt_vendor_req() (which locks it) during
+ * identification, so a path that skipped it locked an uninitialised mutex.
+ * io_lock is a std::recursive_mutex member now, constructed with the device,
+ * so that hazard is gone and both functions are empty - kept as named seams
+ * because the calibration sentinels belong to the same step, and because two
+ * public open paths and one close path call them. */
 void     mt_dev_state_init(struct mt7612u_dev *d);
 void     mt_dev_state_destroy(struct mt7612u_dev *d);
 int      mt_open(struct mt7612u_dev *d, const char **err);
@@ -286,6 +373,7 @@ int mt_hdrlen_from_fc(const uint8_t *frame);
 #define MT_TXOPT_RATE_LUT  0x01  /* set MT_TXWI_FLAGS_TX_RATE_LUT */
 #define MT_TXOPT_AMPDU     0x02  /* AMPDU flag + density + BA window */
 #define MT_TXOPT_QSEL_MGMT 0x04  /* mt76 uses MT_QSEL_MGMT for aggregated TX */
+#define MT_TXOPT_BEACON    0x08  /* HW timestamp (FLAGS_TS) + HW sequence (ACK_CTL_NSEQ) */
 int mt_tx_build(struct mt7612u_dev *d, uint8_t *buf, size_t bufsz,
                 const void *frame, size_t len,
                 const struct mt7612u_tx_rate *rate, uint8_t wcid, unsigned opts,
@@ -293,6 +381,19 @@ int mt_tx_build(struct mt7612u_dev *d, uint8_t *buf, size_t bufsz,
 int mt_tx_raw(struct mt7612u_dev *d, const void *frame, size_t len,
               const struct mt7612u_tx_rate *rate, uint8_t wcid, unsigned opts);
 void mt_wcid_setup(struct mt7612u_dev *d, uint8_t idx, const uint8_t *mac);
+
+/* --- beacon.c --- */
+/* Static reserved-page beacon. mt_beacon_init() prepares the beacon engine
+ * (offsets, bypass, sync) once; mt_beacon_write() loads slot 0; mt_beacon_set_enable()
+ * arms or disarms auto-TX. No pre-TBTT host work - the MAC beacons on its own. */
+void mt_beacon_init(struct mt7612u_dev *d);
+int  mt_beacon_write(struct mt7612u_dev *d, const void *frame, size_t len,
+                     const struct mt7612u_tx_rate *rate);
+int  mt_beacon_set_enable(struct mt7612u_dev *d, int on, unsigned interval_tu);
+/* Publish the AP's BSSID in APC slot `idx` so the MAC matches and auto-ACKs
+ * frames addressed to the BSS. mac_setaddr() zeroes every slot at init.
+ * Returns 0 on success, -1 if either half of the address failed to program. */
+int mt_ap_set_bssid(struct mt7612u_dev *d, uint8_t idx, const uint8_t *addr);
 
 /* --- radiotap.c --- */
 int mt_radiotap_parse(const uint8_t *buf, size_t len, struct mt7612u_tx_rate *r);

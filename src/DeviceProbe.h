@@ -7,9 +7,10 @@ struct libusb_device;
 
 #include "AdapterCaps.h"
 #include "kestrel/KestrelUsbIds.h"
+#include "mt7612u/Mt7612uUsbIds.h"
 #include "rtl8733b/Rtl8733bUsbIds.h"
 
-/* Pre-open device probe: "would CreateRtlDevice know what to do with this?"
+/* Pre-open device probe: "would CreateRadio know what to do with this?"
  * answered WITHOUT claiming the interface or resetting the device.
  *
  * Motivation: a host with several adapters (a diversity ground station) has to
@@ -17,10 +18,11 @@ struct libusb_device;
  * normal way is destructive -- devourer::claim_interface_then_reset detaches
  * the kernel driver and resets the port, which is not something to do to a
  * card reader that happens to share the Realtek VID. This path costs one
- * device-recipient vendor control read; an unrelated device STALLs it and is
- * left otherwise untouched.
+ * device-recipient vendor control read, which an unrelated device either STALLs
+ * or leaves unanswered until USB_TIMEOUT (500 ms; the MT7612U does the latter,
+ * see WiFiDriver.cpp) — slow in that case, but otherwise untouched.
  *
- * The dispatch below MUST mirror WiFiDriver::CreateRtlDevice: same ids, same
+ * The dispatch below MUST mirror WiFiDriver::CreateRadio: same ids, same
  * order (PID-gated generations first -- on AX silicon 0x00FC is a different
  * register -- then the SYS_CFG2 byte). tests/device_probe_selftest.cpp is the
  * guard against the two drifting.
@@ -53,10 +55,14 @@ inline ChipGeneration generation_for_chip_id(uint8_t chip_id) {
   }
 }
 
-/* Generations dispatched by USB id rather than by register read. Kestrel (11ax)
- * is here because 0x00FC is R_AX_SYS_CHIPINFO on that silicon and the 8852A
- * die-id collides with the 8822B cold transient above. */
+/* Generations dispatched by USB id rather than by register read. The MT7612U
+ * is a MediaTek part (no Realtek register map at all), checked first as the
+ * factory does. Kestrel (11ax) is here because 0x00FC is R_AX_SYS_CHIPINFO on
+ * that silicon and the 8852A die-id collides with the 8822B cold transient
+ * above. */
 inline ChipGeneration generation_for_usb_id(uint16_t vid, uint16_t pid) {
+  if (mt7612u::is_usb_id(vid, pid))
+    return ChipGeneration::Mt7612u;
   if (kestrel::variant_for_usb_id(vid, pid))
     return ChipGeneration::Kestrel;
   return ChipGeneration::Unknown;

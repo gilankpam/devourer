@@ -8,19 +8,19 @@
 #include "DeviceConfig.h"
 #include "FrameParser8733b.h"
 #include "Halmac8733bMac.h"
-#include "IRtlDevice.h"
+#include "IRtlRadio.h"
 #include "Phy8733b.h"
 #include "Rtl8733bBringup.h"
 #include "RtlAdapter.h"
 #include "SelectedChannel.h"
 #include "logger.h"
 
-/* Dedicated RTL8733B IRtlDevice boundary. Power, firmware, EFUSE, HALMAC,
+/* Dedicated RTL8733B IRadio boundary. Power, firmware, EFUSE, HALMAC,
  * PHY/RF, monitor RX, and bounded legacy/HT injection all use the production
  * path. Unsupported optional controls refuse loudly rather than silently
  * no-opping, but a refusal never tears the session down — asking for a knob
  * this backend has not ported is not a hardware-safety event. */
-class Rtl8733bDevice : public IRtlDevice {
+class Rtl8733bDevice : public IRtlRadio {
 public:
   Rtl8733bDevice(RtlAdapter device, Logger_t logger,
                  devourer::DeviceConfig cfg = {});
@@ -35,7 +35,7 @@ public:
   /* Lean intra-band, same-bandwidth hop (see Phy8733b::fast_retune — the
    * profile that sized it and the TSSI in-place contract live there). Falls
    * back to the full SetMonitorChannel on a band/width change or a cold
-   * radio, per the IRtlDevice contract. The cache_rf default binds at the
+   * radio, per the IRadio contract. The cache_rf default binds at the
    * interface declaration. */
   void FastRetune(uint8_t channel, bool cache_rf) override;
   bool send_packet(const uint8_t *packet, size_t length) override;
@@ -74,13 +74,13 @@ public:
   /* Runtime TX power. Only the relative offset is ported: on a TSSI-offset PG
    * unit the closed loop is the power control, and moving its target is the
    * one lever this part has that was measured to work. The flat-index and
-   * per-rate-diff knobs stay on IRtlDevice's not-ported defaults —
+   * per-rate-diff knobs stay on IRadio's not-ported defaults —
    * kSafeTxAgcIndex8733b was witnessed unable to carry HT at all, and no
    * dB-per-step slope has been measured for the index. */
   devourer::TxPowerCaps GetTxPowerCaps() override;
   int SetTxPowerOffsetQdb(int qdb) override;
   devourer::TxPowerState GetTxPowerState() override;
-  /* Overridden only to refuse out loud. IRtlDevice's default returns void and
+  /* Overridden only to refuse out loud. IRadio's default returns void and
    * ignores the value, so on this backend — where the flat index is genuinely
    * unported — silence would be the caller's only answer, and a knob that
    * looks granted is precisely the defect this family's offset knob was added
@@ -94,6 +94,58 @@ public:
   devourer::FwBootStatus GetFwBootStatus() override;
 
 private:
+  /* This generation's CCX map and register access, under its locks — see
+   * IRtlRadio::with_ccx. Private: the base class calls it, nobody else.
+   *
+   * The JGR3 map, and the proof is in this tree: hal/hal8733b_tables.c:792
+   * onward, the shipped 8733B phy_reg init table, programs 0x1e40, 0x1e44,
+   * 0x1e48, 0x1e5c and 0x1e60 at bring-up — the CCX block, at the JGR3
+   * addresses, on this die. The vendor agrees: at the pinned
+   * reference/rtl8733bu-20230626, hal/phydm/phydm_pre_define.h:513 lists
+   * ODM_RTL8733B in PHYDM_IC_SUPPORT_IFS_CLM, and :523-525 define
+   * PHYDM_IC_JGR3_SERIES_SUPPORT when RTL8733B_SUPPORT is set.
+   *
+   * That init table is also the only other writer of these registers:
+   * nothing in src/rtl8733b/ touches 0x1e40-0x1e60 or 0x2d88 at runtime,
+   * so the masked read-modify-writes below cannot corrupt another
+   * subsystem's state. arm_clm_only never touches 0x1e5c, where the table
+   * leaves a non-zero value.
+   *
+   * CLM is reachable here even though GetRxEnergy is not overridden:
+   * arm_clm_only() and read_clm_only() take no IGI argument, because busy
+   * airtime is a tick count and needs no receiver-noise reference the way
+   * NHM's IGI-referenced thresholds do. So this backend answers
+   * GetChannelBusy through an armed window while its sampled path still
+   * reports no reading, and rx_energy_ok stays false. */
+  bool with_ccx(const CcxFn &fn) override {
+    std::lock_guard<std::recursive_mutex> reg(_reg_mu);
+    /* Nothing to lend before the BB is programmed: a window armed against it
+     * would be forgotten by Init/InitWrite's reset. _phy_ready is this
+     * family's _brought_up, and it goes true the moment _phy.initialize()
+     * succeeds rather than at the end of bring_up_to_phy() — which is the
+     * right point for THIS question, because everything after it is MAC-level
+     * (the ACK window, the ACK responder) and does not bear on whether a BB
+     * register is safe to touch. Cleared by Stop().
+     *
+     * Read UNDER _reg_mu, unlike the Jaguar2/3 overrides this is modelled on.
+     * It is a plain bool written under that lock by bring_up_to_phy() and
+     * Stop(), so checking it before taking the lock is both a data race and a
+     * TOCTOU: the check passes, the lock then blocks behind a concurrent
+     * Stop(), and the register access below proceeds against a card that has
+     * just been powered down. Costs nothing to do it in the right order. */
+    if (!_phy_ready)
+      return false;
+    std::lock_guard<std::mutex> ccx(busy_window_mutex());
+    const Read32 rd = [this](uint16_t a) {
+      return _device.rtw_read<uint32_t>(a);
+    };
+    const SetBb wr = [this](uint16_t a, uint32_t m, uint32_t v) {
+      _device.phy_set_bb_reg(a, m, v);
+    };
+    fn(devourer::nhm_regs_jgr3(), rd, wr);
+    return true;
+  }
+
   void bring_up_to_phy();
   bool configure_tx_power(SelectedChannel channel);
   /* Fill one [txdesc][frame] block at `out`. `agg_num` is the USB TX

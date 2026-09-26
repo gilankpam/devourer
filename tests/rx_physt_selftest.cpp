@@ -118,8 +118,7 @@ void test_jgr3_fill_tiers() {
     expect("jgr3 null buffer -> None",
            jaguar3::parse_phy_sts_jgr3(nullptr, 32, 0, a) == PhyStsFill::None);
     expect("jgr3 27-byte report -> None",
-           jaguar3::parse_phy_sts_jgr3(p.data(), 27, 0, a) ==
-               PhyStsFill::None);
+           jaguar3::parse_phy_sts_jgr3(p.data(), 27, 0, a) == PhyStsFill::None);
     expect("jgr3 rejected report leaves the attrib untouched",
            a.rssi[0] == 0 && a.snr[0] == 0 && a.cfo_tail == 0);
   }
@@ -130,8 +129,7 @@ void test_jgr3_fill_tiers() {
     std::vector<uint8_t> p = jgr3_page(0);
     p[1] = 88;
     expect("jgr3 page 0 (CCK) -> Power",
-           jaguar3::parse_phy_sts_jgr3(p.data(), 32, 0, a) ==
-               PhyStsFill::Power);
+           jaguar3::parse_phy_sts_jgr3(p.data(), 32, 0, a) == PhyStsFill::Power);
     expect("jgr3 page 0 fills path-A rssi", a.rssi[0] == 88);
     expect("jgr3 page 0 leaves snr/evm/cfo unset",
            a.snr[0] == 0 && a.evm[0] == 0 && a.cfo_tail == 0);
@@ -142,8 +140,7 @@ void test_jgr3_fill_tiers() {
     a.data_rate = 12; /* HT -> bandwidth read from ht_rxsc */
     std::vector<uint8_t> p = jgr3_page(1);
     expect("jgr3 page 1 (OFDM type1) -> Full",
-           jaguar3::parse_phy_sts_jgr3(p.data(), 32, 0, a) ==
-               PhyStsFill::Full);
+           jaguar3::parse_phy_sts_jgr3(p.data(), 32, 0, a) == PhyStsFill::Full);
     expect("jgr3 page 1 fills per-path rssi",
            a.rssi[0] == 90 && a.rssi[3] == 93);
     expect("jgr3 page 1 fills per-stream snr/evm",
@@ -160,8 +157,7 @@ void test_jgr3_fill_tiers() {
     rx_pkt_attrib a{};
     std::vector<uint8_t> p = jgr3_page(5);
     expect("jgr3 page 5 (other OFDM page) -> Power",
-           jaguar3::parse_phy_sts_jgr3(p.data(), 32, 0, a) ==
-               PhyStsFill::Power);
+           jaguar3::parse_phy_sts_jgr3(p.data(), 32, 0, a) == PhyStsFill::Power);
     expect("jgr3 page 5 fills per-path rssi from the common header",
            a.rssi[0] == 90 && a.rssi[3] == 93);
     expect("jgr3 page 5 leaves snr/evm/cfo unset",

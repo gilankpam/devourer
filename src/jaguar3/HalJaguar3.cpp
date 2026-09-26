@@ -1,5 +1,5 @@
-#include "InitTimer.h"
 #include "HalJaguar3.h"
+#include "InitTimer.h"
 #include <cstdlib>
 #include <cstring>
 
@@ -42,15 +42,17 @@ void retry_cal(Logger_t &logger, const char *what, F &&step, int tries = 3) {
  * write. */
 void write_bb(RtlAdapter &dev, uint32_t addr, uint32_t data) {
   switch (addr) {
-  /* The ms-scale table delays exist to let the preceding writes settle:
-   * drain the pipelined-write queue before sleeping (sub-ms ones are noise
-   * next to the ~0.2 ms a depth-8 queue can hold). */
+  /* The table delays exist to let the preceding writes settle, so every
+   * one of them drains the pipelined-write queue before sleeping — a
+   * settle measured from a write that is still queued is no settle. The
+   * drain is free when the queue is empty and bounded by its depth when
+   * not. */
   case 0xfe: dev.flush_writes(); std::this_thread::sleep_for(std::chrono::milliseconds(50)); return;
   case 0xfd: dev.flush_writes(); std::this_thread::sleep_for(std::chrono::milliseconds(5)); return;
   case 0xfc: dev.flush_writes(); std::this_thread::sleep_for(std::chrono::milliseconds(1)); return;
-  case 0xfb: std::this_thread::sleep_for(std::chrono::microseconds(50)); return;
-  case 0xfa: std::this_thread::sleep_for(std::chrono::microseconds(5)); return;
-  case 0xf9: std::this_thread::sleep_for(std::chrono::microseconds(1)); return;
+  case 0xfb: dev.flush_writes(); std::this_thread::sleep_for(std::chrono::microseconds(50)); return;
+  case 0xfa: dev.flush_writes(); std::this_thread::sleep_for(std::chrono::microseconds(5)); return;
+  case 0xf9: dev.flush_writes(); std::this_thread::sleep_for(std::chrono::microseconds(1)); return;
   default: dev.phy_set_bb_reg(static_cast<uint16_t>(addr), MASKDWORD, data);
   }
 }
@@ -91,7 +93,13 @@ void HalJaguar3::run_iqk(SelectedChannel channel) {
  * Every step is ported from vendor source. */
 void HalJaguar3::rtw_hal_init(SelectedChannel channel) {
   ChannelWidth_t bw = channel.ChannelWidth;
-  InitTimer timer(_logger, "j3hal");
+  /* The transfer counter is a USB notion (xfers is emitted only when a
+   * counter is attached); a PCIe transport gets none, and its timer omits
+   * the field instead of reporting 0. */
+  InitTimer timer(_logger, "j3hal",
+                  _device.is_usb() ? InitTimer::XferCounter{[this] { return _device.ctrl_xfers(); }}
+                                   : InitTimer::XferCounter{},
+                  [this] { _device.flush_writes(); });
 
   _macinit.pre_init_system_cfg();
   timer.stage("pre_init_system_cfg");
@@ -498,14 +506,14 @@ void HalJaguar3::monitor_rx_cfg() {
    * MACRXEN(+ENSWBCN). init_mac_cfg only set CR=0x0F (DMA enable); without
    * MACRXEN (BIT7) the MAC RX engine never runs — the structured-path RX gap. */
   _device.rtw_write16(0x0100, 0x06FF);
-  /* accept-all + keep FCS/ICV-error frames + append phy-status (BIT28).
+  /* accept-all + append phy-status (BIT28 is inside the leading 0xF nibble).
    * BIT0 (AAP) is what makes monitor mode promiscuous for unicast: without it
    * the WMAC passes only broadcast/multicast/physical-match (APM|AM|AB) up,
    * silently dropping unicast frames addressed to third parties — e.g. NDPA
    * control frames and VHT beamforming reports, which is why the beamformee
    * (whose arm programs the self-MAC to the NDPA RA) saw sounding frames while
    * a plain monitor did not. */
-  uint32_t rcr = 0xF410400F | (1u << 28);
+  uint32_t rcr = 0xF410400F;
   /* DEVOURER_RX_KEEP_CORRUPTED: also pass FCS/ICV-failed frames (ACRC32 BIT8,
    * AICV BIT9). The vendor 8822E driver clears both in init_misc and on every
    * opmode change except monitor; the RX descriptor's crc_err/icv_err bits
@@ -600,6 +608,7 @@ uint8_t HalJaguar3::efuse_phys_read_8822e(uint16_t addr) {
   uint32_t v = _device.rtw_read32(EFC);
   v = (v & ~(kAddr | kData | kRdy)) | ((static_cast<uint32_t>(addr) & 0x7ff) << 16);
   _device.rtw_write32(EFC, v);
+  _device.flush_writes(); /* the 50 µs settle counts from the trigger landing */
   for (int i = 0; i < 1000; ++i) {
     std::this_thread::sleep_for(std::chrono::microseconds(50));
     uint32_t t = _device.rtw_read32(EFC);
@@ -1012,8 +1021,8 @@ void HalJaguar3::apply_bb_rf_agc_tables(InitTimer *timer) {
     return [this, base](uint32_t addr, uint32_t data) {
       switch (addr) {
       case 0xffe: _device.flush_writes(); std::this_thread::sleep_for(std::chrono::milliseconds(50)); return;
-      case 0xfe:  std::this_thread::sleep_for(std::chrono::microseconds(100)); return;
-      case 0xffff: std::this_thread::sleep_for(std::chrono::microseconds(1)); return;
+      case 0xfe:  _device.flush_writes(); std::this_thread::sleep_for(std::chrono::microseconds(100)); return;
+      case 0xffff: _device.flush_writes(); std::this_thread::sleep_for(std::chrono::microseconds(1)); return;
       case 0x0:
         /* RF reg 0x0 (mode register) can't be written through the direct
          * window — it silently no-ops (hardware-observed on the 8822e). The
@@ -1025,12 +1034,15 @@ void HalJaguar3::apply_bb_rf_agc_tables(InitTimer *timer) {
         return;
       default:
         /* Plain 20-bit write, not the vendor's read-modify-write under
-         * MASK20BITS: the direct window's bits [31:20] read back 0 for every
-         * one of the 1540 table entries, cold boot and warm restart alike
-         * (histogrammed on one 8812EU unit), so preserving them is a
-         * no-op that cost a synchronous read per entry -- half the RF table
-         * stage, ~80 ms on the ssc338q. Write-only also pipelines
-         * (IRtlTransport::write_batch_begin). */
+         * MASK20BITS: the direct window's bits [31:20] are not storage --
+         * every one of the 512 window words (both paths) poked with those
+         * bits set reads back 0, on one 8812CU and one 8812EU
+         * (tests/j3_rf_window_readback.sh) -- so an RMW there writes
+         * exactly `data`, and preserving those bits was a no-op that cost a
+         * synchronous read per entry: about half the RF table stage (~80 ms
+         * on the one 8812EU + ssc338q host measured; x86 bench figures in
+         * src/jaguar3/CLAUDE.md). Write-only also pipelines
+         * (ITransport::write_batch_begin). */
         _device.rtw_write32(static_cast<uint16_t>(base + ((addr & 0xff) << 2)),
                             data & RFREG_MASK);
       }

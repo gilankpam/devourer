@@ -14,6 +14,7 @@
 #include "HalmacJaguar3MacInit.h"
 #include "PhyTableLoaderJaguar3.h"
 
+class InitTimer; /* src/InitTimer.h — stage timer for the bring-up */
 namespace jaguar3 {
 
 /* HalJaguar3 — Jaguar3 chip bring-up: power sequencing, queue/page/LLT init, BB /
@@ -80,7 +81,7 @@ public:
   bool probe_efuse_map(uint8_t *map, size_t len);
 
   /* Per-unit MAC at logical EFUSE offset 0x157 on this generation (why the MAC
-   * is the identity key at all: IRtlDevice::GetPermanentMacAddress).
+   * is the identity key at all: IRadio::GetPermanentMacAddress).
    *
    * On 8822E this is served from the value captured during rtw_hal_init: the
    * OTP is not reliably readable after TX/coex bring-up by design, the same
@@ -99,7 +100,7 @@ private:
   void power_off();           /* card-disable PWR_SEQ — reset from active state */
   void power_on();            /* card-enable PWR_SEQ */
   void init_rfk();            /* RF-calibration init (0x1B00 cal_init block) */
-  void apply_bb_rf_agc_tables(class InitTimer *timer = nullptr); /* phydm BB/AGC/RF tables via PhyTableLoader */
+  void apply_bb_rf_agc_tables(::InitTimer *timer = nullptr); /* phydm BB/AGC/RF tables via PhyTableLoader; stage checkpoints when given */
   void bf_init();                /* rtl8822c_phy_bf_init: BF/MU + NDPA sounding */
   void config_phydm_parameter_init(); /* POST_SETTING: 3-wire + OFDM/CCK block */
   void enable_tx_path();         /* OFDM/CCK TX block + AGC/path enable (on-air TX) */

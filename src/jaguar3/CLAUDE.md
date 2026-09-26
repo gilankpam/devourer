@@ -75,8 +75,8 @@ preserved nothing at the price of a synchronous read per entry.
 ## Runtime batched EP0 (`ctrl_batch`) — the scout read and the cached hop
 
 The same slot pool, driven at runtime instead of during bring-up.
-`IRtlTransport::ctrl_batch` (contract + the USB hazards are doc-commented at
-the declaration in `src/RtlTransport.h` and at the definition in
+`ITransport::ctrl_batch` (contract + the USB hazards are doc-commented at
+the declaration in `src/Transport.h` and at the definition in
 `src/UsbTransport.cpp` — read those, not a copy here) submits a group of EP0
 reads/writes back to back and pays one completion wait per chunk. Two Jaguar3
 callers, both holding `_reg_mu` across the whole group:
@@ -112,6 +112,40 @@ landing mid-group blocks on it; and an RX `on_data` callback can be reaped on th
 from it may take `_reg_mu` (`cfo_tick()` does — latent only because
 `DEVOURER_CFO_TRACK` defaults off).
 
+## Bring-up cost and the pipelined register writes
+
+`InitWrite` is ~14k USB register transfers and nothing else. The stage
+timing shows it: `init.timing` events under the `j3hal.*` (HAL bring-up)
+and `j3init.*` (`InitWrite`) scopes, field schema in `src/InitTimer.h` /
+`docs/logging.md`; `bench_init.py` parses them but reports only `ms`. The
+batching contract itself — ordering, what waits, single-threadedness,
+failure propagation — is documented once, at `ITransport::write_batch_begin`
+(`src/Transport.h`) and in `UsbTransport`; this file carries only how
+Jaguar3 uses it:
+
+- `InitWrite` runs its whole bring-up inside one `WriteBatchScope`
+  (`RtlJaguar3Device.cpp`), ended before the coex thread starts because that
+  thread shares the transport. A queued write that completed failed or
+  short fails the batch close, and `InitWrite` throws there rather than
+  start the coex thread over an incompletely programmed chip. `Init`
+  (RX-only) opens no batch yet — not measured on a ground-station card.
+- Every settle delay drains the queue first, µs ones included, on both
+  dies: the `write_bb` / `rf_writer` table delay markers, `delay_us` and
+  `delay_ms` on `Halrf8822c` and `Halrf8822e`, the efuse power-cut. A settle
+  that sleeps while its writes are still queued is no settle; the drain is
+  free on an empty queue and bounded by its depth otherwise.
+- Measured: 1.30 → 0.65 s warm, 2.04 → ~0.7 s cold on one drone-side
+  8812EU (ssc338q host). The transfer-count reduction is deterministic; the
+  wall-clock figure is one unit, one host.
+
+The RF radio-table load is write-only: bits [31:20] of the direct window
+(`0x3c00`/`0x4c00 + addr*4`) are not storage, so the vendor's `MASK20BITS`
+read-modify-write preserved nothing at the price of a synchronous read per
+entry. Scope of that claim (`tests/j3_rf_window_readback.sh`): every one of
+the 512 window words (both paths) poked with the high 12 bits set read back
+0, on one 8812CU and one 8812EU; the post-bring-up histogram (all 512 words
+0) is only a control, since the write-only load itself clears those bits.
+
 ## TX power
 
 Both dies drive the SAME TXAGC block (`set_tx_power_ref` is the port of
@@ -146,6 +180,50 @@ On-air-validated on 8822CU + 8822EU, sticky across
 `SetMonitorChannel`/`FastRetune`; the E compresses deep cuts (≈−6 dB floor,
 same TSSI reshape as its offset slope).
 
+## CCX energy sensing (`clm` / `nhm_env`)
+
+**`Stop()` forgets any armed busy window** — the rule, and the residual it
+does not close, are at `IRadio::ArmChannelBusy`, the one declaration site
+where they can be kept true. What is specific to this die:
+
+Measured on an RTL8812CU with the reset removed: arm, `Stop()`, retune, read
+reports `spoil=retuned`; with it, `spoil=none` and no reading (`Stop()` runs
+`rtw_hal_deinit()`). The reset sits OUTSIDE `_reg_mu`, unlike the RTL8733B's,
+and deliberately: `Stop()` joins the coex thread, and that thread takes
+`_reg_mu`, so holding it across the join would deadlock. The coex loop never
+takes the CCX lock, which is what makes this ordering safe.
+
+**An armed busy window (`ArmChannelBusy`) is DESTROYED by an NHM read on this
+map.** Measured on an RTL8812CU: a clean 240 ms window read 60.4-61.6% under
+load, while the same window with one `GetRxEnergy(with_nhm=true)` mid-way came
+back as the 2 ms re-arm (311-326 of 62500 ticks). The 11AC families survive the
+same intrusion and merely read 3-4 points high, so this is the generation where
+the shared-engine rule is not optional. `GetRxQuality()` takes that NHM read,
+which makes the trap easy to spring from a caller that never touches the busy
+API.
+
+`GetRxEnergy(with_nhm=true)` runs the shared CCX window (`src/NhmReader.h`) on
+the JGR3 register map (CLM period is the low half of `0x1e40`, trigger
+`0x1e60[0]`, ready+result `0x2d88`); on-air validated on an RTL8812CU, ch100.
+
+This is the generation where `nhm_env` works as intended, because
+`PhydmRuntimeJaguar3.cpp` clamps DIG to `DIG_MIN_COVERAGE 0x1e` …
+`DIG_MAX_OF_MIN_COVERAGE 0x22` — four steps — so the gain reference barely
+moves and the histogram mass is free to march up under an interferer. Against a
+5 MHz non-802.11 carrier on a traffic-free channel: 0 frames decoded, `clm` 6,
+`nhm_env` 56, against a quiet 0/0/0; 802.11 traffic at MCS1 read 606 frames /
+15 / 15. The discriminator is the ratio — `nhm_env`/`clm` ≈ 1 under 802.11, ≈ 9
+under the carrier. Note `fa_ofdm` moved 0 → 1776 on that same arm and remains
+the more sensitive counter, and that the magnitudes are session-specific (an
+earlier run of the same arms read 34 / 98 with `fa_ofdm` 2926 — a stronger
+carrier at the receiver for the same SDR gain). Compare arms within one
+session.
+
+In a **TX session** with a 300 ms quiet window the counters are alive (clean
+0/0/0, carrier `clm` 5 / `fa` 1118 / `cca` 1122) — on the same 8812CU and code
+path that previously read *inert* with 4–20 ms windows, so window length rather
+than generation is the live variable in that older result.
+
 ## Busy-airtime NHM (ArmNhmBusy / ReadNhmBusy)
 
 Non-blocking NHM window for a caller that wants airtime, not a floor:
@@ -157,10 +235,10 @@ period on this device — a caller compares it with its own to detect that
 another caller re-armed in between. `read_nhm`/`read_nhm_absolute` are NOT
 built on this path. Unvalidated on air in this repo — no in-repo consumer.
 
-- **Recipe cache.** Valid only while `RtlJaguar3Device.cpp` is the sole
-  writer of `0x1e40`/`0x1e60`; cleared by `GetRxEnergy(with_nhm)` —
-  including via `GetRxQuality()` —, `SetMonitorChannel`, `Init` and
-  `InitWrite`. It survives `FastRetune` (the hop does not touch
+- **Recipe cache.** Holds the composed `0x1e40`/`0x1e60` dwords, which the
+  CLM busy window (`ArmChannelBusy`) shares; cleared by every CCX access
+  through `with_ccx`, by `GetRxEnergy(with_nhm)` — including via
+  `GetRxQuality()` —, `SetMonitorChannel`, `Init` and `InitWrite`. It survives `FastRetune` (the hop does not touch
   `0x1e40`/`0x1e60`), so a window in flight across a hop spans both
   channels — arm after the hop.
 - **The FA/CCA counter reset does not touch it.** phydm's "reset all
@@ -173,6 +251,10 @@ built on this path. Unvalidated on air in this repo — no in-repo consumer.
   window cleared to its last 50 ms could not have hidden. The ready bit
   and the 255 sum were unaffected too. One unit, one channel; 2.4 GHz
   and the 8822C not checked.
+- **It spoils an armed CLM window.** The NHM trigger re-arms the shared
+  engine, so `ArmNhmBusy` notes itself as an NHM read (see "CCX energy
+  sensing" below): a CLM window it lands inside reads back spoiled, never
+  as a valid short one. Use one busy facility per card at a time.
 - **Frozen power estimate.** The BB power estimate can be frozen (a
   single-bucket histogram at a fixed level) after bring-up, after a
   `FastRetune` and on 2.4 GHz, and `ReadNhmBusy` does not reject it. A

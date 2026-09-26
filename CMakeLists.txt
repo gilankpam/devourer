@@ -41,6 +41,20 @@ option(DEVOURER_KESTREL_8852C "RTL8852CU / 8832CU (Kestrel 11ax, G6)"           
 # with the older rtlwifi-style own-bit descriptor DMA, a different engine.
 # OFF by default — libusb-only builds are bit-identical.
 option(DEVOURER_PCIE          "PCIe transport via vfio-pci (Linux; RTL8821CE)"  OFF)
+# MediaTek MT7612U / MT7662U — the first non-Realtek part. Compiles the
+# src/mt7612u subtree (its own C++ library with a C ABI, landed unwired in #412)
+# into libdevourer along with Mt7612uRadio, the IRadio backend WiFiDriver
+# constructs for a MediaTek adapter. OFF by default, but it DOES count as chip
+# support in the "No chip support selected" check below: with the backend behind
+# it an MT7612U-only build opens, receives and transmits, which is exactly what
+# that check exists to require.
+#
+# Turning it on also compiles the subtree across the whole platform matrix —
+# gcc, clang, MSVC, mingw, macOS — where it was previously only ever built by
+# its own Makefile, on Linux. The option does NOT gate the factory's MediaTek id
+# gate, which is unconditional: with it OFF, such an adapter is refused rather
+# than misdetected as Realtek.
+option(DEVOURER_MT7612U       "MediaTek MT7612U / MT7662U (2T2R 11ac USB)"      OFF)
 
 # Compile-time diagnostics floor (src/logger.h). Calls below the floor —
 # including their argument expressions at DVR_TRACE/DVR_DEBUG sites — compile
@@ -84,7 +98,8 @@ else()
 endif()
 if(NOT DEVOURER_JAGUAR1 AND NOT DEVOURER_JAGUAR2 AND NOT DEVOURER_JAGUAR3
    AND NOT DEVOURER_8733B
-   AND NOT DEVOURER_KESTREL)
+   AND NOT DEVOURER_KESTREL
+   AND NOT DEVOURER_MT7612U)
     message(FATAL_ERROR
         "No chip support selected. Enable at least one of DEVOURER_JAGUAR1 / "
         "DEVOURER_JAGUAR2_8822B / DEVOURER_JAGUAR2_8821C / DEVOURER_JAGUAR3_8822C "
@@ -173,7 +188,7 @@ add_library(devourer
     src/Radiotap.c
     src/RadiotapBuilder.cpp
     src/RadiotapBuilder.h
-    src/RtlTransport.h
+    src/Transport.h
     src/RtlAdapter.cpp
     src/RtlAdapter.h
     src/RtlUsbAdapter.h # compat alias shim (RtlUsbAdapter = RtlAdapter)
@@ -215,6 +230,10 @@ add_library(devourer
     src/chanmig/MigClock.h
     src/chanmig/MigProposer.h
     src/chanmig/MigResponder.h
+    src/sensing/SenseWindow.h
+    src/sensing/SenseWindow.cpp
+    src/sensing/SurveyFrameAgg.h
+    src/sensing/DwellExecutor.h
     src/hopset/HopsetState.h
     src/hopset/HopsetTypes.h
     src/hopset/HopsetWire.h
@@ -224,7 +243,8 @@ add_library(devourer
     src/hopset/HopsetSense.h
     src/hopset/HopsetFusion.h
     src/hopset/HopsetEvents.h
-    src/IRtlDevice.h
+    src/IRadio.h
+    src/IRtlRadio.h
     src/SignalStop.cpp
     src/SignalStop.h
     src/DeviceProbe.cpp
@@ -344,6 +364,48 @@ if(DEVOURER_JAGUAR2_8821C)
         hal/hal8821c_fw.c hal/hal8821c_fw.h
         hal/phydm/rtl8821c/Hal8821c_PhyTables.c hal/phydm/rtl8821c/Hal8821c_PhyTables.h)
     target_compile_definitions(devourer PUBLIC DEVOURER_HAVE_JAGUAR2_8821C=1)
+endif()
+
+# --- MediaTek MT7612U (MT7662 MAC) ---
+# Note the option gates only the COMPILE. Mt7612uUsbIds.h is header-only and is
+# included unconditionally by WiFiDriver.cpp, so a default OFF build still
+# refuses MediaTek adapters and still runs the mt7612u_usb_ids test; it just
+# links none of the subtree.
+# The subtree is self-contained: it talks to libusb directly rather than through
+# RtlAdapter/ITransport, because 32-bit registers and an in-band MCU over EP8/EP5
+# do not fit the Realtek shape. Its public surface is the C ABI in
+# include/mt7612u/mt7612u.h; nothing here exports its internal headers, so the
+# include directory is PRIVATE until the backend needs it.
+if(DEVOURER_MT7612U)
+    target_sources(devourer PRIVATE
+        src/mt7612u/async.cpp
+        src/mt7612u/beacon.cpp
+        src/mt7612u/caps.cpp
+        src/mt7612u/eeprom.cpp
+        src/mt7612u/fw.cpp
+        src/mt7612u/init.cpp
+        src/mt7612u/mcu.cpp
+        src/mt7612u/phy.cpp
+        src/mt7612u/radiotap.cpp
+        src/mt7612u/rx.cpp
+        src/mt7612u/tx.cpp
+        src/mt7612u/usb.cpp
+        src/mt7612u/Mt7612uRadio.cpp src/mt7612u/Mt7612uRadio.h
+        src/mt7612u/Mt7612uMapping.h
+        src/mt7612u/Mt7612uRxQueue.h
+        src/mt7612u/Mt7612uTsfRead.h
+        src/mt7612u/internal.h
+        src/mt7612u/regs.h
+        src/mt7612u/initvals.h
+        src/mt7612u/Mt7612uUsbIds.h)  # listed for IDEs; compiled unconditionally
+    target_include_directories(devourer PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/mt7612u)
+    # PUBLIC: Mt7612uRadio.h is reached as "mt7612u/Mt7612uRadio.h" and pulls in
+    # <mt7612u/mt7612u.h>, so a consumer compiling against this target needs the
+    # subtree's public include root too.
+    target_include_directories(devourer PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/mt7612u/include)
+    target_compile_definitions(devourer PUBLIC DEVOURER_HAVE_MT7612U=1)
 endif()
 
 # --- PCIe transport (vfio-pci; see src/PcieTransport.h) ---
@@ -568,7 +630,7 @@ endif()
 # rtl8733bprobe — staged USB bring-up prober for the RTL8733B (HALMAC 87xx),
 # the pcieprobe/kestrelprobe sibling: identity -> power-on + EFUSE -> firmware
 # -> MAC/PHY -> TSSI audit stages, used alongside normal factory dispatch. It
-# never substitutes for the production IRtlDevice path.
+# never substitutes for the production IRadio path.
 if(DEVOURER_8733B)
     add_executable(rtl8733bprobe
         examples/rtl8733bprobe/main.cpp
@@ -578,6 +640,32 @@ if(DEVOURER_8733B)
     target_include_directories(rtl8733bprobe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/examples/common)
 endif()
 
+# mt7612uprobe — the MediaTek bring-up harness, the rtl8733bprobe/kestrelprobe
+# sibling: one subcommand per verified hardware gate (registers, firmware, MAC,
+# channel, TX, RX, ACK responder, the wedge experiments). Same source the
+# subtree's own Makefile builds as ./bringup, built here so the chip-specific
+# tool is not the one part of this backend that only a second build system can
+# produce — and so it picks up CMAKE_C_COMPILER and DEVOURER_SANITIZE, which
+# shelling out to that Makefile would silently ignore.
+#
+# It talks to the C library directly, NOT through Mt7612uRadio: it predates the
+# backend and its whole purpose is to exercise the layer underneath one. It
+# never substitutes for the production IRadio path.
+# UNIX-only, unlike its kestrelprobe/rtl8733bprobe siblings. Those are portable
+# C++; this one is the hardware bench harness and uses <unistd.h>,
+# <sys/resource.h> and getrusage() unguarded, so on the MSVC cell of the
+# multi-platform matrix - which now passes DEVOURER_MT7612U=ON - an unguarded
+# add_executable would put it in `all` and break the build. The LIBRARY is
+# MSVC-clean; this tool is not, and does not need to be.
+if(DEVOURER_MT7612U AND UNIX)
+    add_executable(mt7612uprobe
+        src/mt7612u/tools/bringup.cpp
+    )
+    target_link_libraries(mt7612uprobe PRIVATE devourer PkgConfig::libusb)
+    target_include_directories(mt7612uprobe PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/mt7612u)
+endif()
+
 # reglat — register round-trip latency microbench (USB ctrl-xfer vs PCIe MMIO).
 # Times RtlAdapter::rtw_read32; the PCIe path compiles only with DEVOURER_PCIE
 # (inherited via the devourer PUBLIC DEVOURER_HAVE_PCIE define). See its header.
@@ -585,7 +673,7 @@ add_executable(reglat tests/reglat.cpp)
 target_link_libraries(reglat PUBLIC devourer PRIVATE PkgConfig::libusb)
 
 # scout_read_bench — USB transfer-count + latency bench for
-# IRtlDevice::GetRxEnergyScout() vs the full GetRxEnergy(false) (Jaguar3
+# IRtlRadio::GetRxEnergyScout() vs the full GetRxEnergy(false) (Jaguar3
 # channel-scout read). Needs a live Jaguar3 card and an
 # InitWrite bring-up, so it uses DeviceSession/WiFiDriver like the doctor
 # demo, not reglat's bare RtlAdapter path — see its header.
@@ -688,7 +776,7 @@ target_link_libraries(duplex PUBLIC devourer PRIVATE PkgConfig::libusb)
 target_include_directories(duplex PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/examples/common)
 
 # txpower — reference consumer of the runtime TX-power API
-# (IRtlDevice::SetTxPowerOffsetQdb / SetTxPowerIndexOverride / GetTxPowerState /
+# (IRadio::SetTxPowerOffsetQdb / SetTxPowerIndexOverride / GetTxPowerState /
 # GetThermalStatus): opens one adapter, steps the knobs from CLI args (no env
 # vars), and prints machine-readable state markers. The register-level
 # validation driver for tests/txpwr_offset_regcheck.sh and the shape of an
@@ -758,6 +846,25 @@ add_executable(chipstate
 target_include_directories(chipstate PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/examples/common)
 target_link_libraries(chipstate PUBLIC devourer PRIVATE PkgConfig::libusb)
 
+# The in-tree caller for the carrier-sense gate split. Needs hardware, so it is
+# a tool rather than an add_test — tests/cca_gates_regcheck.sh drives it and
+# cross-checks the registers with chipstate.
+add_executable(CcaGatesProbe
+    tests/cca_gates_probe.cpp
+)
+target_include_directories(CcaGatesProbe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/examples/common)
+target_link_libraries(CcaGatesProbe PUBLIC devourer PRIVATE PkgConfig::libusb)
+
+# On-air driver for IRadio::ArmChannelBusy, through the public contract only
+# (arm + GetChannelBusy). tests/busy_window_probe.sh runs its arms and asserts
+# the separations; a spoiled window must come back INVALID with its reason,
+# never as a plausible number.
+add_executable(BusyWindowProbe
+    tests/busy_window_probe.cpp
+)
+target_include_directories(BusyWindowProbe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/examples/common)
+target_link_libraries(BusyWindowProbe PUBLIC devourer PRIVATE PkgConfig::libusb)
+
 # Headless regression guard for the binary-stdin framing shared by the two
 # stream demos above (examples/common/stream_stdin.h). No libusb, no radio — just the
 # set_stdin_binary() + read_exact() path, so a text-mode regression (e.g. the
@@ -787,7 +894,90 @@ target_link_libraries(ToneMaskSelftest PRIVATE devourer)
 
 add_test(NAME tone_mask_math COMMAND ToneMaskSelftest)
 
-# Headless guard for the TX quiesce seam (IRtlTransport::quiesce_tx via
+# Headless guard for the radio contract: a radio implementing only IRadio's
+# pure-virtual core must compile without any Realtek type, its not-ported
+# defaults must hold, and it must not be an IRtlRadio. A Realtek-typed pure
+# virtual added to IRadio stops this compiling, which is the point.
+add_executable(RadioIfaceSelftest
+    tests/radio_iface_selftest.cpp
+)
+target_link_libraries(RadioIfaceSelftest PRIVATE devourer)
+
+add_test(NAME radio_iface COMMAND RadioIfaceSelftest)
+
+# Headless guard for the MediaTek USB-id gate. CreateRadio consults it BEFORE
+# the Realtek SYS_CFG2 read, so an id it wrongly claims is refused outright with
+# no second chance. This pins the one property that makes that safe: the
+# MediaTek pair set never claims a device a Realtek table owns. Header-only, so
+# it costs a compile and no hardware.
+add_executable(Mt7612uUsbIdsSelftest
+    tests/mt7612u_usb_ids_selftest.cpp
+)
+target_link_libraries(Mt7612uUsbIdsSelftest PRIVATE devourer)
+
+add_test(NAME mt7612u_usb_ids COMMAND Mt7612uUsbIdsSelftest)
+
+# Headless guard for the MT7612U <-> devourer descriptor translations. Pure
+# lookups, so no hardware and no subtree compile — this cell runs whether or
+# not DEVOURER_MT7612U is on, which is the point: the header it covers is the
+# one place a wrong RSSI base or a per-chain copy that publishes the noise
+# floor would be introduced, and both have happened.
+add_executable(Mt7612uMappingSelftest
+    tests/mt7612u_mapping_selftest.cpp
+)
+target_link_libraries(Mt7612uMappingSelftest PRIVATE devourer)
+target_include_directories(Mt7612uMappingSelftest PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/mt7612u/include)
+
+add_test(NAME mt7612u_mapping COMMAND Mt7612uMappingSelftest)
+
+# Headless guard for the RX hand-off queue, the one piece of backend BEHAVIOUR
+# (as opposed to descriptor lookups) that can be exercised without a radio. Its
+# two load-bearing properties - a full ring drops the newest frame and counts
+# it, and a popped slot outlives the lock so user code can run unlocked - are
+# both invisible on a healthy bench and both turn into a wedge, a reorder or a
+# use-after-free when broken. Like the mapping cell it compiles regardless of
+# DEVOURER_MT7612U: it is header-only and needs no libusb.
+add_executable(Mt7612uRxQueueSelftest
+    tests/mt7612u_rx_queue_selftest.cpp
+)
+# The first selftest in the tree to use <thread> directly. It links today
+# without this because libdevourer already pulls the thread runtime in, and on
+# glibc >= 2.34 pthread is part of libc anyway — but that is two accidents, not
+# a dependency, and this costs nothing.
+find_package(Threads REQUIRED)
+target_link_libraries(Mt7612uRxQueueSelftest PRIVATE devourer Threads::Threads)
+
+add_test(NAME mt7612u_rx_queue COMMAND Mt7612uRxQueueSelftest)
+
+# Headless guard for the MT7612U coherent TSF read. The two register halves are
+# not latched, so the read order is the whole correctness argument, and on a
+# bench a wrong order only shows for a few hundred microseconds every 71.6 min.
+# The cell sweeps a scripted counter across the low-word wrap and requires the
+# pre-fix order to tear in the same sweep. Header-only; no libusb.
+add_executable(Mt7612uTsfReadSelftest
+    tests/mt7612u_tsf_read_selftest.cpp
+)
+target_link_libraries(Mt7612uTsfReadSelftest PRIVATE devourer)
+
+add_test(NAME mt7612u_tsf_read COMMAND Mt7612uTsfReadSelftest)
+
+# The C entry points' failure contract, which the cell above cannot reach: a
+# failed read must be distinguishable from a value, because 0xffffffff is a
+# legitimate register word on this part. Needs the subtree's symbols, so it is
+# gated on DEVOURER_MT7612U (CI's MediaTek jobs turn it on).
+if(DEVOURER_MT7612U)
+    add_executable(Mt7612uTsfApiSelftest
+        tests/mt7612u_tsf_api_selftest.cpp
+    )
+    target_link_libraries(Mt7612uTsfApiSelftest PRIVATE devourer)
+    target_include_directories(Mt7612uTsfApiSelftest PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/mt7612u/include)
+
+    add_test(NAME mt7612u_tsf_api COMMAND Mt7612uTsfApiSelftest)
+endif()
+
+# Headless guard for the TX quiesce seam (ITransport::quiesce_tx via
 # RtlAdapter): the explicit "stop TX and wait it out" call every device makes
 # before anything is released. UsbTransport's cancel/drain is validated on
 # hardware under ASan — the test header says what it does and does not cover.
@@ -840,6 +1030,43 @@ target_include_directories(BulkOutTimeoutSelftest PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
 add_test(NAME bulk_out_timeout COMMAND BulkOutTimeoutSelftest)
+# Headless guard for the NHM utility reduction (src/NhmEnvMath.h): bucket
+# weights, the rounded ratio helper shared with CLM, and the noise-floor-cluster
+# exclusion that makes nhm_env_ratio usable where the naive ratio rails. Pure
+# math, header-only.
+add_executable(NhmEnvMathSelftest tests/nhm_env_math_selftest.cpp)
+target_include_directories(NhmEnvMathSelftest PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src)
+# Standalone (does not link `devourer`, so it does not inherit that target's
+# PUBLIC cxx_std_20) and the header uses inline constexpr variables, which MSVC
+# rejects below /std:c++17.
+target_compile_features(NhmEnvMathSelftest PRIVATE cxx_std_20)
+
+add_test(NAME nhm_env_math COMMAND NhmEnvMathSelftest)
+
+# Headless guard for the vendor-neutral ChannelBusy conversions (src/RxSense.h):
+# the Realtek RxEnergy reduction and the MediaTek channel-timer ratio. Pure
+# arithmetic, header-only. The load-bearing case is the refusal — a counter that
+# was never armed must report NO reading, never 0% busy.
+add_executable(ChannelBusySelftest tests/channel_busy_selftest.cpp)
+target_include_directories(ChannelBusySelftest PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_compile_features(ChannelBusySelftest PRIVATE cxx_std_20)
+
+add_test(NAME channel_busy_math COMMAND ChannelBusySelftest)
+
+# Headless guard for the CLM busy-window state machine (src/BusyWindow.h) with
+# mocked register access — the clamp, the CLM-only arm sequence (NHM's half of
+# the shared period dword must not move), the period-bounded ratio, and every
+# way a window stops describing the caller's dwell. Those refusals are the
+# point: on the 11AC map a spoiled window reads 3-4 points high, which no
+# consumer can tell from a real channel.
+add_executable(BusyWindowSelftest tests/busy_window_selftest.cpp)
+target_include_directories(BusyWindowSelftest PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_compile_features(BusyWindowSelftest PRIVATE cxx_std_20)
+
+add_test(NAME busy_window_state COMMAND BusyWindowSelftest)
 
 # Headless round-trip guard for the 802.11ax HE TX radiotap path
 # (src/RadiotapBuilder.cpp build_he + the shared Radiotap.c field-23 size entry
@@ -1041,7 +1268,7 @@ add_executable(NhmBusySelftest tests/nhm_busy_selftest.cpp)
 target_link_libraries(NhmBusySelftest PRIVATE devourer)
 add_test(NAME nhm_busy_math COMMAND NhmBusySelftest)
 
-# Headless guard for the IRtlTransport::ctrl_batch contract against a fake
+# Headless guard for the ITransport::ctrl_batch contract against a fake
 # transport (synchronous default only).
 add_executable(CtrlBatchSelftest tests/ctrl_batch_selftest.cpp)
 target_include_directories(CtrlBatchSelftest PRIVATE
@@ -1100,7 +1327,7 @@ target_link_libraries(AdapterCapsSelftest PRIVATE devourer)
 add_test(NAME adapter_caps_derive COMMAND AdapterCapsSelftest)
 
 # Headless guard for the pre-open device probe (src/DeviceProbe.h): its
-# id dispatch must stay in step with WiFiDriver::CreateRtlDevice.
+# id dispatch must stay in step with WiFiDriver::CreateRadio.
 add_executable(DeviceProbeSelftest
     tests/device_probe_selftest.cpp
 )
@@ -1239,6 +1466,18 @@ add_executable(SurveyAggSelftest tests/survey_agg_selftest.cpp)
 target_link_libraries(SurveyAggSelftest PRIVATE devourer)
 add_test(NAME survey_aggregate COMMAND SurveyAggSelftest)
 
+# The executor gate (src/sensing/): the dwell phase machine against a scripted
+# fake radio and a scripted clock — discard-barrier ordering, the FastRetune
+# width-restoration rule after a full-width dwell, counter plausibility at the
+# exact ceiling, the read-failure latch, the retune-throw paths, frame
+# attribution as configuration, a non-Realtek radio still producing evidence,
+# and round/seq bookkeeping against the real ScanScheduler. This loop was demo
+# code until now; a regression in it used to be findable only on air.
+add_executable(DwellExecSelftest tests/dwell_exec_selftest.cpp)
+target_link_libraries(DwellExecSelftest PRIVATE devourer)
+
+add_test(NAME dwell_executor COMMAND DwellExecSelftest)
+
 # The #277 gate: the RecommendEngine's two-leg policy over the issue's ten
 # offline scenarios (recommend / hold-healthy / weak!=congestion / saturation
 # / broad-degradation / overlap ordering / burst no-flap / stale / cooldown /
@@ -1294,6 +1533,17 @@ if(Python3_Interpreter_FOUND)
                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/rx_tone_localize.py --self-test
     )
 
+    # FCS-presence handling in tools/bf_report_decode.py. The C++ trim has the
+    # bf_report_decode cell; this covers the Python one, which is where both
+    # review-found regressions actually were - a dropped None guard that turned
+    # a skippable malformed event into an uncaught TypeError across three
+    # tools, and an unconditional trailing-byte reservation in parse_mu_snr.
+    add_test(
+        NAME bf_report_fcs
+        COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/bf_report_fcs_selftest.py
+    )
+
     # Headless guard for the LA-capture CSI math (tools/la_csi.py): synthetic
     # L-LTF through a known 2-tap channel + CFO + AWGN must locate, correct,
     # and recover |H(k)| with correlation > 0.99. Skips (77) without numpy.
@@ -1314,6 +1564,28 @@ if(Python3_Interpreter_FOUND)
         COMMAND ${Python3_EXECUTABLE}
                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/nitroqam_waterfall.py --self-test
     )
+
+    # The two MediaTek artifacts that are transcriptions of reference/mt76 —
+    # the USB-id gate table and the generated MAC initvals. Both were
+    # hand-checked once and then trusted; the id table was wrong the first time
+    # (11 of 16 entries, from the host kernel tree rather than the pinned one)
+    # and nothing caught it. Both SKIP (77) when the submodule is absent, which
+    # is the case in CI: `actions/checkout` here does not fetch submodules, so
+    # these are bench cells, not CI cells. Anyone who can regenerate initvals.h
+    # can run them.
+    add_test(
+        NAME mt7612u_usb_ids_vs_mt76
+        COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/mt7612u_usb_ids_vs_mt76.py
+    )
+    set_tests_properties(mt7612u_usb_ids_vs_mt76 PROPERTIES SKIP_RETURN_CODE 77)
+
+    add_test(
+        NAME mt7612u_initvals_generated
+        COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tools/extract_mt7612u_tables.py --check
+    )
+    set_tests_properties(mt7612u_initvals_generated PROPERTIES SKIP_RETURN_CODE 77)
 endif()
 
 # --- selftest aggregate ----------------------------------------------------

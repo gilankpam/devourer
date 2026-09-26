@@ -38,6 +38,8 @@
  *   --listen-secs N             RX smoke window (default 8; 0 = skip)
  *   --expect-traffic            operator vouches for on-channel traffic:
  *                               0 frames heard upgrades to FAILING
+ *   --mt7612u-fw-dir DIR        MediaTek DUTs: where mt7662.bin and
+ *                               mt7662_rom_patch.bin live (decompressed)
  *
  * Bench protocol for a definitive verdict on a suspect unit: put it on a
  * uhubctl-switchable hub port, VBUS-cycle, run doctor with a beacon flood on
@@ -70,6 +72,7 @@
 #include "SignalStop.h"
 #include "UsbOpen.h"
 #include "WiFiDriver.h"
+#include "IRtlRadio.h"
 #include "logger.h"
 
 namespace {
@@ -89,6 +92,10 @@ struct Args {
   int reads = 4;
   int listen_secs = 8;
   bool expect_traffic = false;
+  /* MediaTek firmware directory (mt7662.bin + mt7662_rom_patch.bin). The
+   * library reads no environment and this tool takes no environment either,
+   * so the one backend whose firmware is not embedded needs it on the CLI. */
+  std::string mt7612u_fw_dir;
 };
 
 bool parse_int(const char *s, int &out) {
@@ -123,6 +130,8 @@ bool parse_args(int argc, char **argv, Args &a) {
       ;
     else if (k == "--expect-traffic")
       a.expect_traffic = true;
+    else if (k == "--mt7612u-fw-dir" && i + 1 < argc)
+      a.mt7612u_fw_dir = argv[++i];
     else {
       std::fprintf(stderr, "devourer [W] unknown/incomplete arg: %s\n",
                    k.c_str());
@@ -225,20 +234,22 @@ int main(int argc, char **argv) {
    * (informational only); enable_with_tx so Jaguar3's InitWrite keeps the RX
    * filters open for the StartRxLoop smoke window. */
   devourer::DeviceConfig cfg;
+  if (!a.mt7612u_fw_dir.empty())
+    cfg.mt7612u.firmware_dir = a.mt7612u_fw_dir;
   cfg.rx.keep_corrupted = true;
   cfg.rx.enable_with_tx = true;
 
   WiFiDriver driver(logger);
-  std::unique_ptr<IRtlDevice> owned_device =
-      driver.CreateRtlDevice(handle, ctx, lock, cfg);
+  std::unique_ptr<IRadio> owned_device =
+      driver.CreateRadio(handle, ctx, lock, cfg);
   if (!owned_device) {
-    logger->error("CreateRtlDevice failed (chip support not built?)");
+    logger->error("CreateRadio failed (chip support not built?)");
     return 3;
   }
   /* The session owns the device from here: it is what guarantees the device
    * (and its in-flight TX) dies before libusb does. */
   session.adopt_device(std::move(owned_device));
-  IRtlDevice *const dev = session.device();
+  IRadio *const dev = session.device();
 
   devourer::emit_adapter_caps(logger->events(), dev);
 
@@ -262,7 +273,11 @@ int main(int argc, char **argv) {
 
   if (in.init_completed) {
     /* 2. EFUSE stability */
-    in.efuse = dev->ProbeEfuseStability(a.reads);
+    if (auto *rtl = dynamic_cast<IRtlRadio *>(dev))
+      in.efuse = rtl->ProbeEfuseStability(a.reads);
+    else
+      logger->warn("doctor: the EFUSE stability probe is Realtek-only "
+                   "(IRtlRadio) — skipped on this radio");
 
     /* 4. RX smoke */
     if (a.listen_secs > 0 && !g_devourer_should_stop) {

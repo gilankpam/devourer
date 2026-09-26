@@ -8,7 +8,7 @@
 
 #include "logger.h"
 #include "CfoTracker.h"
-#include "IRtlDevice.h"
+#include "IRtlRadio.h"
 #include "TxMode.h"
 #include "RtlAdapter.h"
 #include "SelectedChannel.h"
@@ -21,7 +21,7 @@
 
 /* RtlJaguar3Device is the orchestrator for the Realtek "Jaguar3" 802.11ac family
  * — RTL8822CU, RTL8812EU, RTL8822EU. It is the Jaguar3 sibling of
- * RtlJaguarDevice (Jaguar1) and implements the same IRtlDevice contract so the
+ * RtlJaguarDevice (Jaguar1) and implements the same IRadio contract so the
  * demos and WiFiDriver factory treat both uniformly.
  *
  * Bring-up is ported from Realtek vendor source (rtl88x2cu/phydm/halrf):
@@ -29,7 +29,7 @@
  * channel/bandwidth (incl. 5/10 MHz narrowband) and on-air TX. send_packet is
  * on-air; sustained continuous TX is kept alive by the coex runtime thread
  * (coex_runtime_loop) — see src/jaguar3/CLAUDE.md. */
-class RtlJaguar3Device : public IRtlDevice {
+class RtlJaguar3Device : public IRtlRadio {
 public:
   RtlJaguar3Device(RtlAdapter device, Logger_t logger,
                    jaguar3::ChipVariant variant = jaguar3::ChipVariant::C8822C,
@@ -38,7 +38,7 @@ public:
 
   void Init(Action_ParsedRadioPacket packetProcessor,
             SelectedChannel channel) override;
-  /* Blocking RX worker loop on an already-brought-up chip (see IRtlDevice).
+  /* Blocking RX worker loop on an already-brought-up chip (see IRadio).
    * Init = bring-up + BFEE arm + StartRxLoop; a TX+RX caller (self-sounding
    * single-radio ground station) does InitWrite once, then runs this on its
    * own std::thread next to the TX loop. NB: for reliable RX the TX+RX intent
@@ -66,16 +66,16 @@ public:
   void FastSetBandwidth(ChannelWidth_t bw) override;
   void InitWrite(SelectedChannel channel) override;
   bool send_packet(const uint8_t *packet, size_t length) override;
-  /* Batch TX with USB aggregation (IRtlDevice contract): with
+  /* Batch TX with USB aggregation (IRadio contract): with
    * cfg.tx.usb_agg_max > 1 consecutive frames are packed into shared bulk-OUT
    * URBs — one [txdesc][frame] block per frame, first descriptor carrying the
    * count in DMA_TXAGG_NUM (see src/TxAggPlan.h). Falls back to the per-frame
    * loop when the knob is off. */
   size_t send_packets(const TxPacketView *pkts, size_t count) override;
-  /* Hardware ACK responder (IRtlDevice contract; src/AckResponder.h). */
+  /* Hardware ACK responder (IRadio contract; src/AckResponder.h). */
   bool SetAckResponder(const devourer::MacAddr &mac) override;
   void ClearAckResponder() override;
-  /* A-MPDU TX mode (IRtlDevice contract; src/AmpduMode.h). Programs the 8822C
+  /* A-MPDU TX mode (IRadio contract; src/AmpduMode.h). Programs the 8822C
    * aggregate-fill timer (0x455) under _reg_mu (serialized against the coex
    * thread) and records the descriptor state the TX path reads. */
   bool SetAmpduMode(const devourer::AmpduMode &mode) override;
@@ -87,20 +87,20 @@ public:
    * OTP is not reliably readable later), decoded on demand on 8822C. */
   bool GetPermanentMacAddress(uint8_t out[6]) override;
   uint64_t ReadTsf() override;
-  void WriteTsf(uint64_t tsf) override;
+  bool WriteTsf(uint64_t tsf) override;
   bool StartBeacon(const uint8_t *beacon, size_t len, int interval_tu) override;
-  /* In-place beacon content swap (IRtlDevice contract): a fresh
+  /* In-place beacon content swap (IRadio contract): a fresh
    * download_beacon_page; interval/TBTT/port identity untouched. */
   bool UpdateBeaconPayload(const uint8_t *beacon, size_t len) override;
   bool StopBeacon() override;
   int32_t AdjustBeaconTiming(int32_t microseconds) override;
   int32_t AdjustBeaconTimingFine(int32_t microseconds) override;
-  /* TSF-preserving absolute TBTT pin (IRtlDevice contract; the J2 pattern —
+  /* TSF-preserving absolute TBTT pin (IRadio contract; the J2 pattern —
    * no reserved-page re-download needed on J3). */
   int32_t PinBeaconTbtt(int32_t offset_us) override;
   void Stop() override;
 
-  /* Runtime TX-power control (IRtlDevice contract; see src/TxPower.h).
+  /* Runtime TX-power control (IRadio contract; see src/TxPower.h).
    * Jaguar3 caps: 7-bit TXAGC reference, 0.25 dB (1 qdB) per step. The offset
    * shifts the per-path reference anchor (0x18e8/0x41e8 OFDM, 0x18a0/0x41a0
    * CCK) — the 0x3a00 per-rate diff table is offset-invariant, so a live step
@@ -137,9 +137,9 @@ public:
   int GetXtalCap() override { return _xtal_cap; }
   devourer::TxPowerState GetTxPowerState() override;
   devourer::ThermalStatus GetThermalStatus() override;
-  /* Per-chip TX caps (IRtlDevice): 8822C/8822E are 2T2R (STBC ok). */
+  /* Per-chip TX caps (IRadio): 8822C/8822E are 2T2R (STBC ok). */
   devourer::TxCaps GetTxCaps() override;
-  /* Aggregate identity + radio + feature caps (IRtlDevice). Composes GetTxCaps
+  /* Aggregate identity + radio + feature caps (IRadio). Composes GetTxCaps
    * / GetTxPowerCaps; identity from ChipVariant, transport from the adapter. */
   devourer::AdapterCaps GetAdapterCaps() override;
   /* Live per-chain RX-path activity (fed via _rxpaths in the RX loop). */
@@ -187,7 +187,7 @@ public:
    * recipe; NoiseFloorMath.h) — this generation has no idle-noise report. */
   RxEnergy GetRxEnergy(bool with_nhm) override;
 
-  /* Frame-free scout read (see IRtlDevice::GetRxEnergyScout) — 8 reads then
+  /* Frame-free scout read (see IRtlRadio::GetRxEnergyScout) — 8 reads then
    * a 4-write composed reset, 12 EP0 transfers in TWO batched groups (the
    * writes are composed from two of the reads, so they cannot share a
    * group; at kAsyncWriteDepth = 8 that is two completion waits). The two
@@ -200,7 +200,7 @@ public:
   RxEnergy GetRxEnergyScout() override;
 
   /* Busy-airtime NHM window and RF18 channel readback — contracts on
-   * IRtlDevice, caveats (counter-reset collisions, frozen estimate, recipe
+   * IRtlRadio, caveats (counter-reset collisions, frozen estimate, recipe
    * cache invalidation) in jaguar3/CLAUDE.md "Busy-airtime NHM". */
   bool ArmNhmBusy(uint16_t period_4us) override;
   NhmBusy ReadNhmBusy() override;
@@ -212,12 +212,15 @@ public:
    * arithmetic is right — a stuck 0x1eb4[25] would otherwise pass every
    * host test and still hold the OFDM counters in permanent reset).
    * Serializes on _reg_mu like every other register access here. Not on
-   * IRtlDevice — chip-specific by design, for a caller that already knows
+   * IRtlRadio — chip-specific by design, for a caller that already knows
    * it holds a Jaguar3 (the bench downcasts). */
   uint32_t DebugPeekBb(uint16_t addr) {
     std::lock_guard<std::mutex> lk(_reg_mu);
     return _device.rtw_read<uint32_t>(addr);
   }
+  /* This adapter's register-transfer count (RtlAdapter::ctrl_xfers) — for
+   * tests/scout_read_bench.cpp's per-call bracketing. */
+  uint64_t DebugCtrlXfers() const { return _device.ctrl_xfers(); }
 
   /* Consolidated windowed RX link-quality snapshot (see RxQuality.h) — subsumes
    * GetRxEnergy. Fed per decoded frame in the RX loop via _rxq. On Jaguar3 the
@@ -231,10 +234,13 @@ public:
    * vendor rtw_proc.c dis_cca recipe (MAC BIT_DIS_EDCCA 0x520[15] + EDCCA-mask
    * countdown 0x524[11], BB 0x1a9c[20]/0x1a14[9:8]/0x1d58[0xff8]); disabled=false
    * restores the inverse. Sticky across SetMonitorChannel; serialized on _reg_mu
-   * against the coex tick. On IRtlDevice: measured to collapse the hardware-beacon
+   * against the coex tick. On IRadio: measured to collapse the hardware-beacon
    * downlink residual from ~472 µs to 0.39 µs on a crowded channel (the TBTT
    * beacon airs on schedule instead of after a CSMA backoff). */
   void SetCcaMode(bool disabled) override;
+  /* The two gates independently — see IRtlRadio. */
+  bool SetCcaGates(bool primary_disabled, bool edcca_disabled) override;
+  bool GetCcaGates(bool &primary_disabled, bool &edcca_disabled) override;
 
   /* Adapter-health probes (see src/AdapterHealth.h). EFUSE probe is 8822C
    * only — the 8822E's OTP is not reliably readable post-bring-up by design
@@ -271,6 +277,28 @@ private:
     default:
       return 0;
     }
+  }
+
+  /* This generation's CCX map and register access, under its locks — see
+   * IRtlRadio::with_ccx. Private: the base class calls it, nobody else. */
+  bool with_ccx(const CcxFn &fn) override {
+    /* Nothing to lend before bring-up: the BB is not programmed, and a
+     * window armed against it would be forgotten by Init/InitWrite's reset. */
+    if (!_brought_up)
+      return false;
+    std::lock_guard<std::mutex> reg(_reg_mu);
+    std::lock_guard<std::mutex> ccx(busy_window_mutex());
+    /* A CLM arm rewrites the CCX dwords the busy-NHM recipe cache holds
+     * (period low half, ctrl bit0): recompose it on the next ArmNhmBusy. */
+    _nhm_busy_ready = false;
+    const Read32 rd = [this](uint16_t a) {
+      return _device.rtw_read<uint32_t>(a);
+    };
+    const SetBb wr = [this](uint16_t a, uint32_t m, uint32_t v) {
+      _device.phy_set_bb_reg(a, m, v);
+    };
+    fn(devourer::nhm_regs_jgr3(), rd, wr);
+    return true;
   }
 
   /* Parse one send_packet-contract buffer (radiotap + 802.11) and build its
@@ -365,10 +393,16 @@ private:
   std::atomic<bool> _bf_apply_on{false};
   std::atomic<uint64_t> _bf_cbr_count{0};
   uint8_t _bf_peer[6] = {0};
-  /* dis_cca sticky state — re-applied after SetMonitorChannel (the channel set
-   * rewrites the BB CCA registers). Caller holds _reg_mu. */
-  bool _cca_disabled = false;
+  /* dis_cca sticky state, one field per gate — re-applied after
+   * SetMonitorChannel (the channel set rewrites the BB CCA registers) and
+   * handed to phydm as edcca_track. Both false is the default. Caller holds
+   * _reg_mu. There is deliberately no combined flag: every consumer wants
+   * one specific gate, and the single all-or-nothing bool this replaced was
+   * how EDCCA tracking ended up keyed on the wrong one. */
+  bool _cca_primary_disabled = false;
+  bool _cca_edcca_disabled = false;
   void apply_cca_mode_locked(bool disabled);
+  void apply_cca_gates_locked(bool primary_disabled, bool edcca_disabled);
   /* TX+RX intent (DEVOURER_TX_WITH_RX at InitWrite / an RX-side Init):
    * keeps the RX filters open across the TX bring-up. */
   bool _rx_wanted = false;
@@ -437,7 +471,7 @@ private:
    * active (_rx_loop_active) the coex thread skips its C2H drain — the RX async
    * loop sees the C2H reports as part of its stream. */
   std::thread _coex_thread;
-  volatile bool _coex_stop = false;
+  std::atomic<bool> _coex_stop{false}; /* written by Stop/~/re-init, read by the coex loop */
   void coex_runtime_loop();
   /* Nominal beacon interval in TU while a beacon is active (0 = none); the
    * AdjustBeaconTiming one-shot tweak restores to this. */

@@ -1,7 +1,7 @@
 // scout_read_bench.cpp — transfer count, latency and on-hardware reset
-// verification for IRtlDevice::GetRxEnergyScout() against the full
+// verification for IRtlRadio::GetRxEnergyScout() against the full
 // GetRxEnergy(false), on a live Jaguar3 card after an InitWrite bring-up
-// (WiFiDriver::CreateRtlDevice, the doctor demo's open path). The scout is
+// (WiFiDriver::CreateRadio, the doctor demo's open path). The scout is
 // 8 reads + 4 composed full-dword writes = 12 transfers in two ctrl_batch
 // groups; the full read is 8 reads + 8 masked writes (each a
 // read-modify-write) = 24. This file is the one home of the ctrl_batch
@@ -11,8 +11,9 @@
 //   DEVOURER_VID/PID pick the adapter, DEVOURER_CHANNEL the bring-up channel
 //   (default 6); DEVOURER_CTRL_BATCH=0 runs the unbatched side of the A/B.
 //
-// Per-call bracketing. devourer::usb_ctrl_xfers() (src/UsbXferCount.h) is one
-// process-global counter, and the coex thread's ~2 s tick issues ~70
+// Per-call bracketing. The adapter's transfer counter (RtlAdapter::ctrl_xfers,
+// read through RtlJaguar3Device::DebugCtrlXfers) also counts the coex
+// thread's traffic, and its ~2 s tick issues ~70
 // transfers under the same _reg_mu, so a call blocked behind a tick absorbs
 // the tick's transfers and latency. Contamination can only add, so every call
 // is bracketed on its own and the per-run minimum is the attributable cost;
@@ -74,13 +75,14 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <limits>
 #include <memory>
 #include <thread>
 #include <vector>
 
 #include "DeviceSession.h"
-#include "UsbXferCount.h"
+#include "IRtlRadio.h"
 #include "WiFiDriver.h"
 #include "jaguar3/RtlJaguar3Device.h"
 #include "logger.h"
@@ -122,10 +124,14 @@ struct RunResult {
   int n_implausible = 0;
 };
 
+/* The adapter's transfer counter; set in main() once the device is known to
+ * be a Jaguar3 (DebugCtrlXfers), zero otherwise. */
+std::function<uint64_t()> g_xfers = [] { return uint64_t{0}; };
+
 /* Above this, a counter value is not a reading. See RunResult::n_implausible. */
 constexpr uint32_t kImplausibleCount = 4096;
 
-/* Runs `n` calls of `fn`, bracketing usb_ctrl_xfers() and the clock around
+/* Runs `n` calls of `fn`, bracketing the transfer counter and the clock around
  * EACH INDIVIDUAL call (see the file header for why not one delta over
  * the whole loop) and tracking fa_ofdm/cca_ofdm
  * min/max (a stuck reset shows as max==0 for the whole run). */
@@ -135,13 +141,13 @@ RunResult bench_run(Fn fn, int n) {
   std::vector<double> us(n);
   RunResult r;
   for (int i = 0; i < n; ++i) {
-    const uint64_t x0 = devourer::usb_ctrl_xfers().load();
+    const uint64_t x0 = g_xfers();
     const auto t0 = std::chrono::steady_clock::now();
     const RxEnergy e = fn();
     us[i] = std::chrono::duration<double, std::micro>(
                 std::chrono::steady_clock::now() - t0)
                 .count();
-    xfers[i] = devourer::usb_ctrl_xfers().load() - x0;
+    xfers[i] = g_xfers() - x0;
     if (e.valid_fa) {
       if (e.fa_ofdm > kImplausibleCount || e.cca_ofdm > kImplausibleCount)
         ++r.n_implausible;
@@ -195,13 +201,13 @@ void print_run(const char *label, int run_idx, int runs, int n,
 }
 
 /* Idle ambient-rate sample: no calls of ours in flight, so any
- * usb_ctrl_xfers() movement during `dur` is background traffic (the coex
+ * transfer-counter movement during `dur` is background traffic (the coex
  * thread) alone — reported separately from, not folded into, the per-call
  * floor above. */
 void measure_ambient(std::chrono::milliseconds dur) {
-  const uint64_t x0 = devourer::usb_ctrl_xfers().load();
+  const uint64_t x0 = g_xfers();
   std::this_thread::sleep_for(dur);
-  const uint64_t x1 = devourer::usb_ctrl_xfers().load();
+  const uint64_t x1 = g_xfers();
   std::printf("ambient (idle, no calls, %lld ms window): %llu xfers "
              "(%.2f xfers/s) — background coex-thread traffic, NOT part of "
              "the per-call floor above\n",
@@ -253,13 +259,17 @@ int main() {
               "synchronous per-op path)\n",
               cfg.usb.ctrl_batch ? "ON" : "OFF");
   WiFiDriver driver(logger);
-  std::unique_ptr<IRtlDevice> owned = driver.CreateRtlDevice(handle, ctx, lock, cfg);
+  std::unique_ptr<IRadio> owned = driver.CreateRadio(handle, ctx, lock, cfg);
   if (!owned) {
-    std::fprintf(stderr, "CreateRtlDevice failed (not a Jaguar3 card?)\n");
+    std::fprintf(stderr, "CreateRadio failed (not a Jaguar3 card?)\n");
     return 1;
   }
   session.adopt_device(std::move(owned));
-  IRtlDevice *const dev = session.device();
+  auto *const dev = dynamic_cast<IRtlRadio *>(session.device());
+  if (!dev) {
+    std::fprintf(stderr, "not a Realtek radio (no GetRxEnergy)\n");
+    return 1;
+  }
 
   uint8_t channel = 6;
   if (const char *c = std::getenv("DEVOURER_CHANNEL"))
@@ -277,6 +287,8 @@ int main() {
    * actually has DebugPeekBb — the Jaguar3-specific downcast is
    * deliberate, see the file header. */
   auto *j3 = dynamic_cast<RtlJaguar3Device *>(dev);
+  if (j3)
+    g_xfers = [j3] { return j3->DebugCtrlXfers(); };
   if (!j3) {
     std::fprintf(stderr,
                  "not a Jaguar3 device (no DebugPeekBb) — skipping the "

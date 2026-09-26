@@ -110,6 +110,19 @@ struct mt7612u_dev;
 struct mt7612u_dev *mt7612u_open(const char *fw_dir, const char **err);
 
 /*
+ * Same, but choosing which adapter to open when more than one is attached:
+ * selector is "<bus>-<port>" as lsusb spells the port path (e.g. "2-1"), or
+ * NULL for "the first one", which is what mt7612u_open() passes.
+ *
+ * Explicit because this is a library. It reads no environment of its own, so a
+ * caller with two adapters is never at the mercy of an inherited variable —
+ * the tool that wants MT7612U_DEV reads it and passes it here. The string is
+ * borrowed for the duration of the call only.
+ */
+struct mt7612u_dev *mt7612u_open_selected(const char *selector,
+                                          const char *fw_dir, const char **err);
+
+/*
  * Same, but adopting a libusb handle the caller already opened, reset and
  * claimed interface 0 on. Neither the handle nor the context is closed by
  * mt7612u_close() - the caller keeps ownership of both, and of any exclusive
@@ -127,6 +140,32 @@ struct mt7612u_dev *mt7612u_open_handle(void *h, void *ctx, const char *fw_dir,
                                         const char **err);
 
 void mt7612u_close(struct mt7612u_dev *dev);
+
+/*
+ * Diagnostic sink.
+ *
+ * This library emits human diagnostics — bring-up progress, firmware version,
+ * USB and MCU failures. By default they go to stderr, formatted the way
+ * devourer's own logger formats its lines, which is right for the standalone
+ * bring-up tool and wrong for anything embedding this library: writing straight
+ * to stderr bypasses the host's log level, bypasses a redirected diagnostic
+ * stream, and on Android bypasses __android_log_write entirely, so the lines
+ * land nowhere a user can see them.
+ *
+ * Install a sink and every line goes there instead. `level` is one of
+ * 'I' / 'W' / 'E'; `line` is the bare message with NO prefix, so a host can
+ * apply its own — a devourer consumer forwards it to Logger::info/warn/error,
+ * which re-adds "devourer [X] " and honours the level and stream it was
+ * configured with. Passing NULL restores the built-in stderr sink; installing a
+ * sink that does nothing silences the library.
+ *
+ * Set it before any worker thread starts, and do not change it afterwards: the
+ * pointer is read from the RX event thread without synchronisation. That is the
+ * same discipline devourer's own logger documents for set_level and
+ * set_diag_stream, and for the same reason.
+ */
+typedef void (*mt7612u_log_sink)(void *user, char level, const char *line);
+void mt7612u_set_log_sink(mt7612u_log_sink sink, void *user);
 
 /* Reattaches the kernel driver on close unless this is set. */
 void mt7612u_keep_detached(struct mt7612u_dev *dev, int keep);
@@ -182,6 +221,26 @@ int mt7612u_rx_start(struct mt7612u_dev *dev, mt7612u_rx_cb cb, void *user);
 int mt7612u_rx_stop(struct mt7612u_dev *dev);
 
 /*
+ * Silence the receiver WITHOUT tearing the ring down: clears MAC RX only,
+ * leaving TX, the ring and the event thread alone.
+ *
+ * This is the first half of an orderly RX teardown, and the order is not
+ * cosmetic. mt7612u_rx_stop() cancels the bulk-IN transfers, which removes the
+ * drain; doing that while the MAC is still receiving is the state that wedges
+ * this part below the USB level, where libusb_reset_device, the sysfs
+ * authorized toggle and rebinding the kernel driver all fail to recover it and
+ * only a physical replug does. So: quiesce, then stop.
+ *
+ * mt7612u_stop() would also silence the receiver, but it stops the whole MAC
+ * including TX — no use to a caller that brought the chip up for transmit and
+ * is only shutting the RX half down.
+ *
+ * Leaves the ring restartable: a later mt7612u_start() re-enables MAC RX if a
+ * ring is running.
+ */
+int mt7612u_rx_quiesce(struct mt7612u_dev *dev);
+
+/*
  * Put the receive filter into monitor mode: pass everything the PHY decodes,
  * dropping only PHY errors and (unless keep_corrupted) frames that failed FCS.
  *
@@ -219,6 +278,64 @@ size_t mt7612u_send_packets(struct mt7612u_dev *dev,
  */
 int  mt7612u_set_ack_responder(struct mt7612u_dev *dev, const uint8_t mac[6]);
 void mt7612u_clear_ack_responder(struct mt7612u_dev *dev);
+
+/*
+ * Hardware beacon, from the MAC's reserved page.
+ *
+ * mt7612u_beacon_start() loads the beacon and arms the TBTT timer; the MAC
+ * then transmits it on its own at every TBTT, stamping the live 64-bit TSF
+ * into the timestamp field and assigning the 802.11 sequence number. There is
+ * no host involvement per beacon and no host jitter. `buf` is one
+ * radiotap-framed MPDU, the same contract as mt7612u_send_packet(); a bare
+ * MPDU with no radiotap header is accepted too and airs at OFDM 6 Mbps, the
+ * rate a beacon wants.
+ *
+ * addr2 becomes the MAC's identity - MT_MAC_ADDR (what it ACKs against) and
+ * the MT_MAC_BSSID base (what the per-BSS index is derived from), moved
+ * together the way mt76x02_mac_setaddr() moves them. Moving only the first
+ * leaves the hardware deriving its BSS index from a different address than the
+ * caller thinks, which is silent: the AP beacons perfectly and matches nobody.
+ * addr3 is then published in the APC slot that index selects - 1 for a
+ * locally-administered address, 0 otherwise.
+ *
+ * The identity is one register plane, shared with mt7612u_set_ack_responder():
+ * a caller doing both is setting the same thing twice and the last writer
+ * wins. mt7612u_beacon_stop() restores the factory identity ONLY if this call
+ * was what moved it - if a responder was already armed, that address is the
+ * caller's and stop leaves it alone.
+ *
+ * mt7612u_beacon_update() replaces the loaded beacon in place; the interval,
+ * TBTT phase and BSSID are untouched. It suppresses the slot for the duration
+ * of the copy, so a beacon airing across an update carries the PREVIOUS
+ * content rather than a torn mixture of the two - but it may be skipped
+ * entirely.
+ *
+ * mt7612u_beacon_stop() clears the timer bits, zeroes APC slots 0 and 1, and
+ * restores the identity as above. It matters that it is called: the MAC
+ * beacons AUTONOMOUSLY once armed, so killing the host process does NOT
+ * silence it, and a beacon left airing contaminates whatever runs next on that
+ * channel.
+ *
+ * What mt7612u_beacon_start() REFUSES, all silently fatal if allowed through:
+ *   - a multicast addr2 (a station cannot unicast-auth to it)
+ *   - an 802.11 header that is not 24 bytes. A QoS or 4-address frame makes
+ *     mt_tx_build() insert an interior L2 pad, and the reserved page needs an
+ *     unpadded [TXWI][MPDU]
+ *   - a beacon body that does not fit the 1600-byte slot alongside its TXWI
+ *   - an interval outside 1..4095 TU (INTVAL is 16 bits of 1/16 TU)
+ *
+ * And what it FORCES, whatever the caller's radiotap said: no_ack (a broadcast
+ * beacon must not request an ACK). A bare MPDU with no radiotap header is
+ * accepted and pinned to OFDM 6 Mbps, NSS 1, 20 MHz - the basic rate every
+ * station must decode.
+ *
+ * All three return 0 on success, negative on failure. A failed stop is a
+ * beacon still on the air; it is worth retrying.
+ */
+int mt7612u_beacon_start(struct mt7612u_dev *dev, const void *buf, size_t len,
+                         unsigned interval_tu);
+int mt7612u_beacon_update(struct mt7612u_dev *dev, const void *buf, size_t len);
+int mt7612u_beacon_stop(struct mt7612u_dev *dev);
 
 /*
  * TX/RX counters from the async rings. Zeroed when no ring is running, and
@@ -282,6 +399,14 @@ struct mt7612u_link_stats {
  */
 int mt7612u_link_stats_start(struct mt7612u_dev *dev);
 
+/* Arm the channel timers alone and restart their interval mark, for a caller
+ * measuring one busy window (IRadio::ArmChannelBusy). Separate from
+ * mt7612u_link_stats_start() on purpose: that one also clears the MIB block
+ * and the link-stats interval, which belong to the 1 Hz telemetry caller, and
+ * arming per dwell through it would corrupt every rate the tick reports.
+ * Returns 0 on success. */
+int mt7612u_ch_time_arm(struct mt7612u_dev *dev);
+
 /* Read and clear. Returns 0 on success; fills the interval since the previous
  * call to this function or to _start(). */
 int mt7612u_link_stats(struct mt7612u_dev *dev, struct mt7612u_link_stats *out);
@@ -301,11 +426,70 @@ int mt7612u_link_stats(struct mt7612u_dev *dev, struct mt7612u_link_stats *out);
  * mt7612u_link_stats() will see that column reduced.  Returns 0, or -1 before
  * a channel is set.
  */
+/*
+ * Channel busy/idle only — MT_CH_BUSY / MT_CH_IDLE (0x1134 / 0x1130) and
+ * nothing else.
+ *
+ * Deliberately NOT mt7612u_link_stats(): that function also reads
+ * MT_RX_STAT_1, whose false-CCA field is read-and-clear and is owned by
+ * mt7612u_phy_tick()'s AGC loop. Polling it at a caller's cadence would both
+ * misreport the interference figure and starve the gain tracking of the
+ * evidence it steps on. The channel timers are separate registers with no
+ * other reader inside the library.
+ *
+ * Read-and-clear like everything else here: each call returns the interval
+ * since the previous mt7612u_ch_time() call, tracked on its own per-device
+ * mark so it does not disturb mt7612u_link_stats()'s interval (and vice
+ * versa). Note mt7612u_link_stats() DOES also read and clear these two
+ * registers, so a session polling both splits the counts between them.
+ *
+ * Requires mt7612u_link_stats_start() to have armed the timers, and REFUSES
+ * until it has: the registers retain whatever a previous session left, and a
+ * busy+idle ratio would turn that residue into a perfectly plausible
+ * percentage for a window nobody measured. Arming also resets the interval
+ * mark, and a live channel change re-arms — otherwise the first sample after a
+ * retune would mix the old channel's airtime into the new channel's reading.
+ *
+ * Returns 0 on success, -1 on a bad device, an unarmed timer or a failed read
+ * — never a fabricated value, because a failed control transfer would
+ * otherwise read as a 100%-busy channel.
+ */
+int mt7612u_ch_time(struct mt7612u_dev *dev, uint32_t *busy, uint32_t *idle,
+                    uint32_t *interval_us);
+
+/* Reports, and clears, whether mt7612u_link_stats() read-and-cleared the
+ * channel timers since they were armed — i.e. whether that call took the
+ * counts a ch_time() reading would otherwise claim. The two share
+ * MT_CH_BUSY/MT_CH_IDLE and both clear on read.
+ *
+ * Nothing in Mt7612uRadio polls link_stats(), so this cannot fire through the
+ * IRadio path; it exists for a C-API caller that uses BOTH (tools/bringup.cpp
+ * does), where a window measured across such a poll would otherwise report
+ * the remainder as a full reading. A caller measuring one window treats it as
+ * a spoiled window, never as a quiet channel. */
+int mt7612u_ch_time_disturbed(struct mt7612u_dev *dev);
+
 int mt7612u_phy_tick(struct mt7612u_dev *dev);
 
-/* TSF, the hardware microsecond clock. Two register reads. */
+/*
+ * TSF, the hardware microsecond clock. Read only: there is no load path
+ * (measured, docs/mt7612u.md). Bring-up restarts it near 0 (measured on two
+ * units), so its low word first wraps 71.6 min later - and the two halves are
+ * not latched, so a plain two-register read tears there by 2^32 us. Both
+ * functions read high, low, high and retry across a wrap (three or four control
+ * transfers).
+ *
+ * mt7612u_read_tsf_chk: 0 and fills *out, or -1 on a failed transfer (or a
+ * NULL argument), leaving *out untouched. A separate return is what carries
+ * the failure because no value can: 0xffffffff is a legitimate word here (the
+ * low word passes through it once a wrap), so a sentinel would be a reading.
+ *
+ * mt7612u_read_tsf: the same read with no error channel - 0 on failure. A
+ * running counter never reads 0 after bring-up, but 0 cannot say why; use
+ * _chk wherever a failure has to be told apart.
+ */
+int      mt7612u_read_tsf_chk(struct mt7612u_dev *dev, uint64_t *out);
 uint64_t mt7612u_read_tsf(struct mt7612u_dev *dev);
-void     mt7612u_write_tsf(struct mt7612u_dev *dev, uint64_t tsf);
 
 /* What this adapter can do, so a caller need not assume. */
 struct mt7612u_caps {
@@ -339,6 +523,8 @@ struct mt7612u_caps {
 	unsigned per_chain_rssi : 1;
 	unsigned narrowband : 1;   /* 5/10 MHz - not available on this part */
 	unsigned fast_retune : 1;  /* sub-ms channel change - not on this part */
+	unsigned tsf_write : 1;    /* a TSF load path - none on this part (measured,
+	                            * docs/mt7612u.md); AdapterCaps::tsf_write_ok */
 };
 void mt7612u_get_caps(const struct mt7612u_dev *dev, struct mt7612u_caps *caps);
 

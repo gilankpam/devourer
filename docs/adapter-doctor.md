@@ -28,13 +28,14 @@ build/doctor --bus 3 --port 2.3.3  # topology select (two same-PID adapters)
 
 1. **Bring-up** — `InitWrite`; an abort is an immediate FAILING.
 2. **EFUSE stability** — N fresh *physical* map reads
-   (`IRtlDevice::ProbeEfuseStability`), cross-compared byte-for-byte +
+   (`IRtlRadio::ProbeEfuseStability`), cross-compared byte-for-byte +
    EEPROM-ID (0x8129) validated. Any read-to-read mismatch is
    conclusive by itself. Not probed on the 8822E — its OTP is not
    reliably readable after bring-up by design, so probing would flag
-   healthy units.
+   healthy units. Realtek-only (`IRtlRadio`): on another radio doctor
+   skips this step and grades the remaining legs.
 3. **FW boot** — checksum + MCU-ready outcome of the bring-up's
-   download (`IRtlDevice::GetFwBootStatus`).
+   download (`IRadio::GetFwBootStatus`).
 4. **RX smoke** — FCS-clean frame count over `--listen-secs`. Ambient
    traffic counts. Hearing *nothing* is only SUSPECT unless
    `--expect-traffic` vouches for a source on the channel — an
@@ -65,6 +66,16 @@ on every re-enumeration otherwise, and its probe firmware-download
 would contaminate first-touch), runs a radiation-verified beacon flood,
 and invokes `doctor --expect-traffic`. Exit code is the worst verdict
 across reps.
+
+A MediaTek DUT takes three env knobs the Realtek default does not need:
+`DOCTOR_RTW88_MOD=mt76x2u` (the module to keep away), `DOCTOR_DUT_VID=0x0e8d
+DOCTOR_DUT_PID=0x7612` (the doctor's default PID walk is Realtek-only), and
+`DOCTOR_MT7612U_FW_DIR=<dir>` holding the decompressed `mt7662.bin` +
+`mt7662_rom_patch.bin` (passed to the doctor as `--mt7612u-fw-dir`, since
+the doctor reads no environment). The EFUSE leg reports "not probed" there
+(`IRtlRadio`-only) and the FW leg reports `fw_attempted=0` because the
+backend does not surface `GetFwBootStatus`; the verdict rests on bring-up
+and the RX smoke.
 
 Validated on the bench pair: the healthy unit grades HEALTHY (stable
 0x8129 EFUSE ×4, FW ready, thousands of frames) and the dying unit

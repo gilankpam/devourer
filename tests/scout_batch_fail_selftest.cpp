@@ -35,14 +35,14 @@
 
 #include "DeviceConfig.h"
 #include "RtlAdapter.h"
-#include "RtlTransport.h"
+#include "Transport.h"
 #include "jaguar3/ChipVariant.h"
 #include "jaguar3/RtlJaguar3Device.h"
 #include "logger.h"
 
 namespace {
 
-struct FakeTransport : devourer::IRtlTransport {
+struct FakeTransport : devourer::ITransport {
   std::map<uint16_t, uint32_t> regs;
   std::set<uint16_t> fail_read; /* a batched read of these reports failure */
   std::vector<std::pair<uint16_t, uint32_t>> writes; /* what reached the bus */

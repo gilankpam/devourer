@@ -1,9 +1,9 @@
 /* Headless guard for the pre-open device probe (src/DeviceProbe.h): the
- * question "would CreateRtlDevice know what to do with this device?" asked
+ * question "would CreateRadio know what to do with this device?" asked
  * BEFORE claiming or resetting it, so a multi-card host can pick its radios
  * out of a bus without disturbing anything else plugged into it.
  *
- * The dispatch encoded here must stay in step with WiFiDriver::CreateRtlDevice
+ * The dispatch encoded here must stay in step with WiFiDriver::CreateRadio
  * -- same ids, same order (PID-gated generations first, then SYS_CFG2). This
  * selftest is what fails when the two drift. */
 #include <cstdio>
@@ -56,6 +56,10 @@ int main() {
          generation_for_usb_id(0x0bda, 0xb832) == ChipGeneration::Kestrel);
   expect("35bc:0101 (Archer TX50UH, RTL8852C) -> Kestrel by USB id",
          generation_for_usb_id(0x35bc, 0x0101) == ChipGeneration::Kestrel);
+  expect("0e8d:7612 (MT7612U) -> Mt7612u by USB id",
+         generation_for_usb_id(0x0e8d, 0x7612) == ChipGeneration::Mt7612u);
+  expect("0e8d:7612 (MT7612U) is a probe candidate",
+         is_probe_candidate(0x0e8d, 0x7612));
   expect("0bda:a81a (RTL8812EU) is not PID-dispatchable -> Unknown",
          generation_for_usb_id(0x0bda, 0xa81a) == ChipGeneration::Unknown);
 

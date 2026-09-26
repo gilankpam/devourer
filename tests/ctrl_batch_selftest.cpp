@@ -1,4 +1,4 @@
-/* Headless guard for the SEMANTIC contract of IRtlTransport::ctrl_batch
+/* Headless guard for the SEMANTIC contract of ITransport::ctrl_batch
  * (batched EP0 register transfers), pinned against a fake transport with no
  * bus under it. The contract, not the plumbing: every implementation owes the
  * caller all four of
@@ -14,7 +14,7 @@
  *      write group is a sequence the chip needs finished (a 3-wire bracket
  *      left open, a BB reset left asserted).
  *
- * This file links RtlTransport.h only, so it exercises the synchronous
+ * This file links Transport.h only, so it exercises the synchronous
  * default, never UsbTransport's pipelined version.
  *
  * ONE DELIBERATE DIVERGENCE: clause 4 as pinned here is the synchronous
@@ -30,11 +30,11 @@
 #include <set>
 #include <vector>
 
-#include "RtlTransport.h"
+#include "Transport.h"
 
 namespace {
 
-struct Fake : devourer::IRtlTransport {
+struct Fake : devourer::ITransport {
   std::map<uint16_t, uint32_t> regs;
   std::vector<uint16_t> order;   /* every register touched, in order */
   std::set<uint16_t> fail_write; /* writes to these addresses report failure */

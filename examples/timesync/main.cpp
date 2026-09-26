@@ -38,6 +38,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -122,7 +123,7 @@ static std::vector<uint8_t> build_std_beacon(int interval_tu) {
       0x01, 0x01, 0x82};                               // supported rates (1M)
 }
 
-static void run_master(IRtlDevice* dev, const timesync::Config& c) {
+static void run_master(IRadio* dev, const timesync::Config& c) {
   dev->InitWrite(SelectedChannel{c.channel, 0, CHANNEL_WIDTH_20});
   sleep_ms(2000);
   if (c.hwbeacon) {
@@ -157,9 +158,26 @@ static void run_master(IRtlDevice* dev, const timesync::Config& c) {
   while (!g_devourer_should_stop) {
     // Stamp with the master's hardware TSF at send time. TX-side ReadTsf() is
     // reliable (no bulk-IN flood), unlike on a busy receiver.
-    uint64_t tsf = dev->ReadTsf();
-    auto f = tdma::build_frame(rt, tdma::Class::Marker, seq++, 0, tsf);
-    dev->send_packet(f.data(), f.size());
+    // A failed read throws (IRadio contract); skip this marker rather than
+    // stamp it with a time the slave would fit as real.
+    uint64_t tsf = 0;
+    bool stamped = true;
+    try {
+      tsf = dev->ReadTsf();
+    } catch (const std::exception &e) {
+      static bool warned = false;
+      stamped = false;
+      if (!warned) {
+        warned = true;
+        fprintf(stderr, "timesync master: TSF read failed (%s), marker skipped "
+                        "(said once; markers keep being skipped while it fails)\n",
+                e.what());
+      }
+    }
+    if (stamped) {
+      auto f = tdma::build_frame(rt, tdma::Class::Marker, seq++, 0, tsf);
+      dev->send_packet(f.data(), f.size());
+    }
 
     if (std::chrono::steady_clock::now() >= next_stat) {
       next_stat += std::chrono::seconds(1);
@@ -230,7 +248,7 @@ static void slave_cb(const Packet& p) {
   g_fit.add(local_us, master_us);
 }
 
-static void run_slave(IRtlDevice* dev, const timesync::Config& c) {
+static void run_slave(IRadio* dev, const timesync::Config& c) {
   std::thread rx([&] {
     dev->Init(slave_cb, SelectedChannel{c.channel, 0, CHANNEL_WIDTH_20});
   });
@@ -303,7 +321,7 @@ static void master_ta_cb(const Packet& p) {
   emit(buf);
 }
 
-static void run_master_ta(IRtlDevice* dev, const timesync::Config& c) {
+static void run_master_ta(IRadio* dev, const timesync::Config& c) {
   g_slot_us = c.slot_ms * 1000.0; g_ta_gain = c.ta_gain;
   if (const char* f = std::getenv("DEVOURER_TSYNC_TA_FIXED")) {
     g_ta_fixed = true; g_ta_us.store(std::atof(f));   // authority test: hold TA constant
@@ -360,7 +378,7 @@ static void ue_cb(const Packet& p) {
   }
 }
 
-static void run_ue(IRtlDevice* dev, const timesync::Config& c) {
+static void run_ue(IRadio* dev, const timesync::Config& c) {
   dev->InitWrite(SelectedChannel{c.channel, 0, CHANNEL_WIDTH_20});
   std::thread rx([&] { dev->StartRxLoop(ue_cb); });
   sleep_ms(2000);
@@ -487,7 +505,7 @@ int main() {
   g_hwbeacon = c.hwbeacon;   // slave reads the standard 802.11 beacon timestamp
 
   WiFiDriver wifi(logger);
-  std::unique_ptr<IRtlDevice> owned_device;
+  std::unique_ptr<IRadio> owned_device;
   libusb_context* ctx = nullptr;
   /* DEVOURER_PCIE_BDF=0000:01:00.0 — drive a PCIe adapter (RTL8821CE) through
    * the vfio transport instead of libusb (DEVOURER_PCIE builds; mirrors the
@@ -499,7 +517,7 @@ int main() {
     auto transport = devourer::PcieTransport::Open(pcie_bdf, logger);
     if (!transport) return 1;
     owned_device =
-        wifi.CreateRtlDevicePcie(std::move(transport), devourer_config_from_env());
+        wifi.CreateRadioPcie(std::move(transport), devourer_config_from_env());
   } else
 #endif
   {
@@ -514,13 +532,13 @@ int main() {
     session.adopt_handle(handle, devourer::find_wifi_interface(handle));
     session.adopt_lock(lock);
     owned_device =
-        wifi.CreateRtlDevice(handle, ctx, lock, devourer_config_from_env());
+        wifi.CreateRadio(handle, ctx, lock, devourer_config_from_env());
   }
   if (!owned_device) { logger->error("no driver for this chip"); return 1; }
   // The session owns the device from here: it is what guarantees the device
   // (and its in-flight TX) dies before libusb does.
   session.adopt_device(std::move(owned_device));
-  IRtlDevice* const dev = session.device();
+  IRadio* const dev = session.device();
 
   if (c.role == timesync::Role::Ue) run_ue(dev, c);
   else if (c.role == timesync::Role::Master && c.uplink) run_master_ta(dev, c);

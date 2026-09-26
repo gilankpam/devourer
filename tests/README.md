@@ -99,6 +99,24 @@ probe on kernels 6.15+ (`failed to download firmware`, `error -22`), but
 - `iw`, `tcpdump`, `ip` on PATH
 - Passwordless `sudo`, or run directly as root
 
+### For MediaTek (MT7612U) DUTs
+
+- devourer configured with `-DDEVOURER_MT7612U=ON`. Without it `rxdemo`
+  still builds and still refuses the adapter at `CreateRadio`, by design —
+  falling through to the Realtek path would misdetect it as a Jaguar1.
+- `mt7662.bin` + `mt7662_rom_patch.bin`, decompressed, passed with
+  `--mt7612u-fw-dir`. They ship as `.bin.zst` in linux-firmware. The same
+  flag exists on `build/doctor`, and `adapter_doctor_cold.sh` takes it as
+  `DOCTOR_MT7612U_FW_DIR` beside `DOCTOR_DUT_VID=0x0e8d DOCTOR_DUT_PID=0x7612
+  DOCTOR_RTW88_MOD=mt76x2u`.
+- `mt76x2u` for the kernel-side cells.
+
+`regress.py` checks the first two before the first cell — each otherwise
+produces a cell that reads exactly like a dead radio — and only if `build/` has
+a CMake cache to read. A missing `mt76x2u` is a warning rather than an error,
+since a devourer-only run does not need it; it shows up later as
+`no wlan iface appeared for 0e8d:7612 after 20.0s`.
+
 ### Adaptive-hopset validation (`hopset_adaptive_jammer.sh`)
 
 Three radios — a transmitting authority, a lockstep receiver running the
@@ -204,7 +222,16 @@ per-cell stdout/stderr logs end up at `/tmp/devourer-regress-last/`.
 - `--duration SECONDS` — per-cell injection/measurement window (default 15)
 - `--pass-threshold N` — min hits to pass (default 1)
 - `--tx-pid 0xNNNN` / `--rx-pid 0xNNNN` — pick specific DUTs (defaults to
-  the first two auto-detected)
+  the first two auto-detected). Each also accepts a **sysfs id** (`2-1`,
+  `3-2.2`), which is the only way to name one of two adapters that share a
+  model — the normal case for a MediaTek matrix, where there is one PID
+  worth having.
+- `--mt7612u-fw-dir DIR` — where `mt7662.bin` + `mt7662_rom_patch.bin` live,
+  for MediaTek DUTs (env: `DEVOURER_MT7612U_FW_DIR`). Unlike every Realtek
+  backend the MediaTek firmware is not embedded: it ships zstd-compressed in
+  linux-firmware under its own licence, so the pair has to be decompressed
+  somewhere first. Unset lets the backend search its own defaults
+  (`/lib/firmware/mediatek`, then `./firmware`).
 - `--no-baseline-abort` — run all 4 cells even if kernel-kernel fails
   (useful when one chipset has no working kernel driver on the host)
 - `--no-rf-reset` — skip the per-cell USB port-level authorize-cycle.
@@ -219,7 +246,7 @@ per-cell stdout/stderr logs end up at `/tmp/devourer-regress-last/`.
 - `--keep-logs` — symlink the temp log dir at `/tmp/devourer-regress-last`
 
 Environment variable equivalents: `DEVOURER_VM_NAME`, `DEVOURER_VM_SSH`,
-`DEVOURER_SNIFFER_IFACE`.
+`DEVOURER_SNIFFER_IFACE`, `DEVOURER_MT7612U_FW_DIR`.
 
 ### `--sniffer-iface` — on-air encoding verification + attribution
 
@@ -552,6 +579,29 @@ when a wide-bandwidth cell scores zero — the emitter's own channel width comes
 from `DEVOURER_HOP_BW`, not from the `/40` in `DEVOURER_TX_RATE` (that only
 fills the descriptor field), and getting that wrong zeroes a cell for reasons
 that have nothing to do with the DUT.
+
+### `ccmp_cost_bench.sh`: what software CCMP costs per frame
+
+Headless, no device. Builds `tests/ccmp_cost_bench.cpp` and times the exact
+OpenSSL AES-128-CCM call sequence the AP harnesses use, one JSON line per
+frame size. It exists to put a number under the hardware-crypto question
+(`docs/mt7612u-ap-mode.md`); compare it with a transport's per-frame send
+cost, not with another CPU.
+
+### `mt7612u_tsf_wrap.sh`: the MT7612U TSF read across the low-word wrap
+
+Wraps `bringup tsfwrap`, which is where the "two TSF halves are not latched"
+table in `docs/mt7612u.md` comes from. The two register halves are not latched,
+so a read is only wrong for the few hundred microseconds around a low-word
+wrap, and bring-up restarts the counter: one run is ~72 min and covers one gap
+of the read. Both gaps cost ~2.4 h on one adapter, or ~72 min on two in
+parallel (`DEVS="6-1 7-1"`). `SMOKE=1` checks the schedule, the host-clock
+model and the plumbing against a 16.7 s carry in ~2.5 min, and says SMOKE
+rather than PASS because a carry inside the low word cannot tear a read.
+
+One adapter is enough to verify the claim; the second only buys another unit
+and the wall-clock. A run can end with no verdict (rc 3) when the wrap lands in
+the other gap — that is a re-run, which the script does once, not a defect.
 
 ## Supported DUTs
 
