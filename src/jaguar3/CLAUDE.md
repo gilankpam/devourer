@@ -163,12 +163,16 @@ built on this path. Unvalidated on air in this repo — no in-repo consumer.
   `InitWrite`. It survives `FastRetune` (the hop does not touch
   `0x1e40`/`0x1e60`), so a window in flight across a hop spans both
   channels — arm after the hop.
-- **Counter resets shorten a window silently.** Any `0x1eb4[25]` counter
-  reset clears an in-flight window without touching `period`:
-  `GetRxEnergy` (either mode, including via `GetRxQuality()`),
-  `GetRxEnergyScout`, and the coex thread's ~2 s `fa_stats` tick
-  (`PhydmRuntimeJaguar3.cpp`). The last cannot be avoided by the caller, so
-  ~one window per 2 s can come back short (reads LOW).
+- **The FA/CCA counter reset does not touch it.** phydm's "reset all
+  counter" (`0x1eb4[25]`, pulsed by `GetRxEnergy`, `GetRxEnergyScout` and
+  the coex thread's ~2 s `fa_stats` tick) leaves an in-flight window
+  intact. Measured on one 8812EU, 5 GHz ch 144, against a 100/100 ms
+  square-wave jam with 200 ms windows: windows pulsed 150 ms in read
+  48.3 % busy, sd 0.4 over 200 — identical to unpulsed ones (sd 0.5) —
+  where 50 ms windows on the same jam spread 0–97 % (sd 39.5), so a
+  window cleared to its last 50 ms could not have hidden. The ready bit
+  and the 255 sum were unaffected too. One unit, one channel; 2.4 GHz
+  and the 8822C not checked.
 - **Frozen power estimate.** The BB power estimate can be frozen (a
   single-bucket histogram at a fixed level) after bring-up, after a
   `FastRetune` and on 2.4 GHz, and `ReadNhmBusy` does not reject it. A

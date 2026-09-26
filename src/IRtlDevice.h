@@ -590,8 +590,8 @@ public:
    * returns the finished window, or valid=false if it has not finished.
    * Arm again for the next window. Jaguar3 only; every other generation
    * returns false / valid=false. Control-plane threading contract as
-   * GetRxEnergy. Caveats (counter resets that silently shorten a window, the
-   * frozen power estimate): src/jaguar3/CLAUDE.md "Busy-airtime NHM". */
+   * GetRxEnergy. Caveats (the frozen power estimate, re-arm and retune
+   * interactions): src/jaguar3/CLAUDE.md "Busy-airtime NHM". */
   virtual bool ArmNhmBusy(uint16_t period_4us) { (void)period_4us; return false; }
   virtual NhmBusy ReadNhmBusy() { return {}; }
 

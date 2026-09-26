@@ -1283,10 +1283,9 @@ RxEnergy RtlJaguar3Device::GetRxEnergy(bool with_nhm) {
  * unverified — in both GetRxEnergy and PhydmRuntimeJaguar3::fa_stats() the
  * 0x1a2c toggles and the 0x1eb4[25] reset always run together — but that
  * does not affect correctness now that valid_cck makes the caller's
- * obligation explicit. 0x1eb4[25] also clears the NHM counters (vendor
- * phydm_reset_bb_hw_cnt: "Reset all counter"), so a scout read inside an
- * ArmNhmBusy window corrupts that window — read the busy window before the
- * scout's reset, or re-arm after it.
+ * obligation explicit. The reset does NOT disturb an in-flight ArmNhmBusy
+ * window despite the vendor's "Reset all counter" (measured:
+ * src/jaguar3/CLAUDE.md "Busy-airtime NHM").
  *
  * The OFDM FA/CCA delta is shared with PhydmRuntimeJaguar3::fa_stats() (the
  * coex thread's periodic ~2 s tick performs the identical 0x1d2c/0x1eb4
