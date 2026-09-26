@@ -316,9 +316,10 @@ UsbTransport::UsbTransport(libusb_device_handle *dev_handle, Logger_t logger,
                            std::shared_ptr<devourer::UsbDeviceLock> usb_lock,
                            bool rx_zerocopy, RxMode rx_mode, int pool_spare,
                            int ring_ms, PoolExhaust pool_exhaust,
-                           bool ctrl_batch_enabled)
+                           bool ctrl_batch_enabled, bool tx_no_cancel_multipkt)
     : _dev_handle{dev_handle}, _ctx{ctx}, _logger{std::move(logger)},
-      _cfg_ctrl_batch{ctrl_batch_enabled}, _rx_zerocopy{rx_zerocopy},
+      _cfg_ctrl_batch{ctrl_batch_enabled},
+      _tx_no_cancel_multipkt{tx_no_cancel_multipkt}, _rx_zerocopy{rx_zerocopy},
       _rx_mode{rx_mode}, _pool_spare{pool_spare}, _ring_ms{ring_ms},
       _pool_exhaust{pool_exhaust}, _usb_lock{std::move(usb_lock)} {
   libusb_device_descriptor desc{};
@@ -375,8 +376,9 @@ UsbTransport::~UsbTransport() {
  * Submission order == completion order on EP0, so a pending queue of writes
  * followed by a read behaves exactly like the synchronous sequence; the win
  * is that the host does not sit through a full URB round trip per write. */
+
 /* Slot-pool allocation, shared by the bring-up write batch and the runtime
- * ctrl_batch (P8: there is one copy of this, not two). Idempotent. */
+ * ctrl_batch. Idempotent. */
 void UsbTransport::ensure_async_slots() {
   if (!_aw_all.empty())
     return;
@@ -413,21 +415,10 @@ void UsbTransport::write_batch_begin() {
 void UsbTransport::write_batch_end() {
   std::lock_guard<std::mutex> lk(_batch_mu);
   flush_writes();
-  /* _aw_errors belongs to THIS batch: write_batch_begin zeroes it, and a
-   * runtime ctrl_batch cannot overlap a bring-up batch (it falls back to the
-   * synchronous path while _batch is set, and both take _batch_mu), so
-   * nothing else can have contributed between the two.
-   *
-   * ctrl_batch does not add to this counter directly — it reports through its
-   * return value and its own log lines — but it is NOT true that it can never
-   * contribute: its wait loop calls flush_writes(), whose give-up branch does
-   * _aw_errors.fetch_add(stuck). That is harmless rather than merely
-   * unlikely, and for a reason worth writing down: the same branch latches
-   * _aw_abandoned, after which write_batch_begin returns early without
-   * setting _batch — so the `_batch && errs` test below can never fire again
-   * in this session, and those counts are never attributed to anyone's batch.
-   *
-   * "transfer", not "write": async_read lands here too. */
+  /* _aw_errors belongs to THIS batch: write_batch_begin zeroes it and a
+   * runtime ctrl_batch cannot overlap one (both take _batch_mu). A ctrl_batch
+   * drain that gives up also adds to it, but that latches _aw_abandoned, so no
+   * later batch opens to misattribute the count. Reads land here too. */
   const int errs = _aw_errors.load(std::memory_order_relaxed);
   if (_batch && errs)
     _logger->error("USB: {} pipelined register transfer(s) failed in this "
@@ -494,7 +485,7 @@ UsbTransport::AsyncWrite *UsbTransport::async_take_slot() {
       flush_writes(); /* recovers the pool on a stuck queue */
       std::lock_guard<std::mutex> lk(_aw_mu);
       if (_aw_free.empty())
-        return nullptr; /* pool unrecoverable — callers MUST check (P9) */
+        return nullptr; /* pool unrecoverable — callers MUST check */
     }
   }
   w->done.store(false, std::memory_order_relaxed);
@@ -633,16 +624,13 @@ bool UsbTransport::async_write(uint16_t wvalue, uint16_t windex,
 
 /* ---- batched control transfers ------------------------------------------
  * The interface contract is on IRtlTransport::ctrl_batch; this is how it is
- * kept on USB, and what the brief's sketch got wrong.
+ * kept on USB.
  *
- * ONE WAIT PER CHUNK, NOT ONE PER BATCH. The async slot pool is
- * kAsyncWriteDepth = 8 deep and was deliberately NOT raised for this feature.
- * So a batch is cut into chunks of at most 8 ops and each chunk pays its own
- * completion wait: the cached fast-retune hop's 9-11 writes are TWO chunks and
- * TWO waits. (The scout read's two groups — 8 reads, then 4 composed writes —
- * are one chunk each; its two waits come from the data dependency between
- * them, not from chunking.) The win is still real, but quote the real
- * number.
+ * ONE WAIT PER CHUNK, NOT ONE PER BATCH. The pool depth also caps a ctrl_batch
+ * chunk: a group of more than kAsyncWriteDepth ops pays one completion wait
+ * per chunk. The fast-retune hop's 9-11 writes are two chunks; the scout
+ * read's two groups (8 reads, then 4 composed writes) are one chunk each, and
+ * its two waits come from the data dependency between them.
  *
  * THE READ PAYLOAD IS COPIED INSIDE THE WAIT LOOP, right after that op's own
  * `done` is observed — not in a second pass after every wait. Two reasons,
@@ -655,79 +643,47 @@ bool UsbTransport::async_write(uint16_t wvalue, uint16_t windex,
  *   2. Ops are paired with their slots explicitly (`Pending{idx, w}`), so a
  *      mid-chunk submit failure cannot slide a cursor and write one op's
  *      register value into another op's `value` — a wrong number rather than
- *      an error. NOTHING IN THE HEADLESS SUITE GUARDS THIS FUNCTION:
- *      tests/ctrl_batch_selftest.cpp pins the CONTRACT against a fake
- *      transport (it includes RtlTransport.h only and never reaches this
- *      code), so it exercises the synchronous default, not this. A green
- *      ctest is NOT evidence that a change here is safe. The guard for this
- *      code is on-hardware: tests/scout_read_bench.cpp's counter-plausibility
- *      tripwire, which is what would catch a mis-paired read.
+ *      an error. tests/ctrl_batch_selftest.cpp reaches only the synchronous
+ *      default, so a green ctest says nothing about this function; the guard
+ *      is tests/scout_read_bench.cpp's on-hardware counter-plausibility check.
  *
  * async_take_slot() CAN RETURN NULL (an unrecoverable pool); that op fails and
  * the batch reports false. Never dereferenced blind.
  *
  * THREADING. _batch_mu is held for the whole call and across the _batch flip
- * in write_batch_begin/end, so this cannot start while a bring-up write batch
- * is being opened or closed; if one is already open, or the pool was
- * abandoned, or the config knob is off, fall back to the synchronous default.
- * BE PRECISE ABOUT WHAT THAT MUTEX BUYS, THOUGH: it is NOT what makes a
- * concurrent bring-up safe. The fallback runs the base ctrl_batch, which
- * calls read32/write32 -> ctrl_read/ctrl_write, and those re-enter
- * async_read/async_write when _batch is set — taking slots from the very same
- * pool the bring-up thread is using, outside _batch_mu. That is safe TODAY
- * only because of the pre-existing single-threaded-bring-up contract on
- * write_batch_begin (IRtlTransport). Anyone making bring-up concurrent must
- * fix that; this mutex does not cover them. (The same caveat is on _batch_mu's
- * declaration in UsbTransport.h — change both or neither.)
+ * in write_batch_begin/end; if a bring-up batch is already open, or the pool
+ * was abandoned, or the config knob is off, this falls back to the
+ * synchronous default. What the mutex does and does not cover is on its
+ * declaration in UsbTransport.h.
  * The deeper hazard is the event pump: this function pumps
  * libusb_handle_events_timeout_completed on the caller's thread while the RX
  * bulk loop pumps the same context on its own thread. libusb permits that,
  * but EITHER thread may reap EITHER thread's completions — so our control
  * transfers can complete on the RX thread, and RX URBs can complete on ours
- * (their callbacks then run here, inside this call). And "ours" is not only
- * the scout's thread: the cached FastRetune hop batches through here too, and
- * RtlJaguar3Device::FastRetune is called from the TX path, so a SENDER thread
- * pumps libusb here as well.
- * The wait therefore keys on the per-slot `done` flag, which async_write_cb
- * sets regardless of who reaped it; it never assumes "I pumped, so mine
- * finished".
+ * (their callbacks then run here, inside this call). The caller may be a TX
+ * thread too: RtlJaguar3Device::FastRetune batches through here from the TX
+ * path. The wait therefore keys on the per-slot `done` flag, which
+ * async_write_cb sets regardless of who reaped it; it never assumes "I
+ * pumped, so mine finished". An RX callback running here also adds its
+ * processing time to this call's latency.
  *
- * THE RX-CALLBACK-ON-OUR-THREAD DIRECTION IS *NOT* UNCONDITIONALLY BENIGN,
- * and an earlier revision of this comment said it was. The real constraint:
+ * The binding rule that follows: NO WORK REACHABLE FROM THE RX on_data
+ * CALLBACK MAY TAKE A LOCK THE ctrl_batch CALLER ALREADY HOLDS.
  *
- *   NO WORK REACHABLE FROM THE RX on_data CALLBACK MAY TAKE A LOCK THE
- *   ctrl_batch CALLER ALREADY HOLDS.
- *
- * Both current callers hold RtlJaguar3Device::_reg_mu across the whole group
- * (GetRxEnergyScout, and FastRetune from the TX path). In the default
- * RxMode::Async the chain is: caller holds _reg_mu -> ctrl_batch ->
- * async_wait_progress -> libusb_handle_events -> an RX URB completes ->
- * on_data. If anything on that path takes _reg_mu, it self-deadlocks on the
- * SAME thread against a non-recursive mutex. That is not hypothetical
- * plumbing: cfo_tick() does exactly this, and is live under the shipped
- * DEVOURER_CFO_TRACK=1 knob (default off, TXBF unarmed, which is the only
- * reason this is latent). RtlJaguar3Device.cpp already states the matching
- * rule from the other side — "register I/O CANNOT run on this thread" — and
- * that rule now binds this function too.
- *
- * Benign it is not; what IS true is the cost: a ctrl_batch call can absorb RX
- * processing time, one more reason the per-call latency numbers are quoted as
- * distributions rather than a best case.
- *
- * KNOWN, DEFERRED (post-merge work, deliberately not fixed on this branch
- * because it changes the TX path of a live video link and cannot be measured
- * on the PC rig, which has no RX loop and no real TX load):
- *   1. tx_async/tx_sync open with flush_writes(), a runtime no-op before this
- *      branch. Every send landing during a scout or hop now blocks on that
- *      group's 8-11 transfers (~600 us on the GS). Worse, on the drain's
- *      timeout branch the TX thread CANCELS the scout's in-flight transfers
- *      and latches _aw_abandoned, permanently downgrading the session to the
- *      synchronous path.
- *   2. _aw_wait_flag now has two concurrent waiters. The "no lost wakeups"
- *      reasoning at async_wait_progress holds for ONE waiter: a TX thread
- *      arming its own wait stores 0 while the scout is already blocked inside
- *      libusb keyed on that same flag, clobbering the scout's wakeup for up
- *      to 250 ms — a lot against a 5 ms dwell. */
+ * Known limitation: three interactions are not contained.
+ *   1. tx_async/tx_sync open with flush_writes(), so a send landing during a
+ *      batched group blocks on that group's transfers, and if the drain
+ *      times out the TX thread cancels the batch's in-flight transfers and
+ *      latches _aw_abandoned, downgrading the session to the synchronous path.
+ *   2. _aw_wait_flag is shared: with two concurrent waiters (a batch and a
+ *      TX-thread drain), one arming its wait stores 0 while the other is
+ *      blocked inside libusb on the same flag, which can cost the blocked
+ *      waiter up to ~250 ms (one async_wait_progress timeout) of lost wakeup.
+ *   3. cfo_tick self-deadlock: a caller holding the device register lock runs
+ *      ctrl_batch -> pumps libusb -> an RX URB completes -> on_data ->
+ *      cfo_tick -> takes the same non-recursive lock on the same thread. So
+ *      DEVOURER_CFO_TRACK=1 is incompatible with ctrl_batch under
+ *      RxMode::Async. */
 bool UsbTransport::ctrl_batch(std::vector<CtrlOp> &ops) {
   std::lock_guard<std::mutex> lk(_batch_mu);
   if (ops.empty())
@@ -741,13 +697,11 @@ bool UsbTransport::ctrl_batch(std::vector<CtrlOp> &ops) {
    * succeeded; the caller folds in whatever it already knows. Used whenever
    * the async pool stops being usable partway through a batch.
    *
-   * COST TRADE, recorded so nobody rediscovers it from a stall: on a
-   * genuinely dead device this pays USB_TIMEOUT (500 ms) per remaining op, so
-   * an 11-op group costs ~5.5 s under the caller's _reg_mu, against the ~2 s
-   * drain per remaining CHUNK it replaces. Crossover is around 4 remaining
-   * ops — which makes it the right trade for the two-chunk batches actually
-   * shipped here (the scout's 8-read and 4-write groups, and the 9-11-write
-   * hop), and a bad one for some future long batch. Size accordingly. */
+   * COST TRADE: on a dead device this pays USB_TIMEOUT (500 ms) per
+   * remaining op, so an 11-op group costs ~5.5 s under the caller's register
+   * lock, against the ~2 s drain per remaining CHUNK it replaces. Crossover
+   * is around 4 remaining ops: the right trade for the scout's 8-read and
+   * 4-write groups and the 9-11-write hop, a bad one for a long batch. */
   auto finish_synchronously = [&](size_t from) {
     std::vector<CtrlOp> rest(ops.begin() + from, ops.end());
     const bool rok = IRtlTransport::ctrl_batch(rest);
@@ -770,7 +724,7 @@ bool UsbTransport::ctrl_batch(std::vector<CtrlOp> &ops) {
     /* The pool can die mid-batch: a drain that times out inside this very
      * call latches _aw_abandoned and retires its slots. Re-check EVERY chunk
      * — submitting into a dead pool costs up to ~2 s of drain per chunk, and
-     * the caller (RtlJaguar3Device) is holding _reg_mu throughout, so every
+     * the caller holds its register lock throughout, so every
      * register access on the device freezes for as long as it takes. */
     if (_aw_abandoned.load(std::memory_order_acquire))
       return finish_synchronously(base) && ok;
@@ -778,9 +732,7 @@ bool UsbTransport::ctrl_batch(std::vector<CtrlOp> &ops) {
     /* ---- ACQUIRE PHASE, and it is load-bearing ----
      * Every slot this chunk will use is taken BEFORE anything is submitted,
      * and the chunk is sized by how many were actually free — not by
-     * kAsyncWriteDepth. Taking slots mid-submit is what broke the first
-     * version of this function on the ground station (RK3566, 2026-09-15),
-     * and the failure was silent data corruption, not an error:
+     * kAsyncWriteDepth. Taking slots mid-submit corrupts reads silently:
      *   async_write_cb sets `done` and only THEN pushes the slot back on the
      *   free list, and on a host where another thread also pumps the event
      *   loop (the Jaguar3 coex thread's synchronous transfers do), the waiter
@@ -790,11 +742,10 @@ bool UsbTransport::ctrl_batch(std::vector<CtrlOp> &ops) {
      *   chunk, waits for "progress" — and the progress it gets is one of ITS
      *   OWN just-completed reads, whose slot it then re-fills with a later
      *   write, overwriting the read payload before the wait loop copies it.
-     *   Observed on the GS as GetRxEnergyScout returning 0x40000000 /
-     *   0x33800002 (the reset write dwords) as fa/cca counter values, giving
-     *   fa_ofdm in the tens of thousands. It never reproduced on the x86 bench
-     *   host, where EP0 transfers do not overlap at all and each completes
-     *   before the next slot is taken.
+     *   The symptom is GetRxEnergyScout returning the reset write dwords
+     *   (0x40000000 / 0x33800002) as fa/cca counter values. A host where EP0
+     *   transfers do not overlap (each completes before the next slot is
+     *   taken) cannot show it.
      * With the acquire phase, nothing of this chunk is in flight while slots
      * are being taken, so a slot handed back can only belong to an older
      * call — the self-cannibalisation is structurally impossible rather than
@@ -814,7 +765,7 @@ bool UsbTransport::ctrl_batch(std::vector<CtrlOp> &ops) {
        * here either, so the same guarantee holds. */
       AsyncWrite *w = async_take_slot();
       if (!w) {
-        /* P9: async_take_slot CAN return null when the pool is unrecoverable.
+        /* async_take_slot CAN return null when the pool is unrecoverable.
          * Never dereferenced — and the remaining ops are still executed, just
          * synchronously: the contract says a failure reports false without
          * abandoning the rest of the group, and a half-issued hop is worse
@@ -1394,17 +1345,8 @@ void UsbTransport::quiesce_tx() {
   }
 }
 
-/* NOTE (2026-09-15, batched-EP0 branch): the flush_writes() that opens this
- * and tx_sync used to be a runtime no-op — nothing was ever pipelined outside
- * bring-up. Now a scout read or a cached hop can be in flight, so a send
- * landing in that window blocks on that group's 8-11 control transfers
- * (~600 us on the GS), and if the drain times out THIS thread cancels the
- * scout's in-flight transfers and latches _aw_abandoned for the rest of the
- * session. Known and DEFERRED, not overlooked: containing it changes the TX
- * path of a live video link and is unmeasurable on a bench rig with no RX loop
- * and no real TX load. See the KNOWN, DEFERRED note on ctrl_batch, which also
- * covers this thread's second interaction with a scout — the shared
- * _aw_wait_flag. */
+/* The opening flush_writes() waits on any in-flight ctrl_batch group; see the
+ * known limitation on UsbTransport::ctrl_batch. */
 bool UsbTransport::tx_async(uint8_t tx_ep, uint8_t *packet, size_t length,
                             unsigned timeout_ms) {
   flush_writes();
@@ -1553,12 +1495,8 @@ bool UsbTransport::tx_async(uint8_t tx_ep, uint8_t *packet, size_t length,
   return false;
 }
 
-/* The opening flush_writes() carries the same KNOWN, DEFERRED cost as
- * tx_async's — a send landing during a scout read or a cached hop blocks on
- * that group's 8-11 control transfers (~600 us on the GS), and a timed-out
- * drain cancels the scout's transfers and latches _aw_abandoned for the
- * session. See the note above tx_async and the KNOWN, DEFERRED note on
- * ctrl_batch. */
+/* The opening flush_writes() waits on any in-flight ctrl_batch group; see the
+ * known limitation on UsbTransport::ctrl_batch. */
 int UsbTransport::tx_sync(uint8_t ep, uint8_t *packet, size_t length,
                           int timeout_ms) {
   flush_writes();
@@ -1568,12 +1506,8 @@ int UsbTransport::tx_sync(uint8_t ep, uint8_t *packet, size_t length,
    * data toggle bit corrupts the chip's state machine. */
   int actual = 0;
   _tx_submitted.fetch_add(1, std::memory_order_relaxed);
-  /* Never cancel a multi-packet transfer (src/BulkOutTimeout.h): a cancel
-   * mid-transfer lets another sender's queued bytes splice into the packet
-   * and wedges the TXDMA. Single-packet transfers keep `timeout_ms`. */
-  int rc = libusb_bulk_transfer(
-      _dev_handle, ep, packet, static_cast<int>(length), &actual,
-      devourer::bulk_out_timeout_ms(length, _bulk_out_mps, timeout_ms));
+  int rc = libusb_bulk_transfer(_dev_handle, ep, packet,
+                                static_cast<int>(length), &actual, timeout_ms);
   if (rc != LIBUSB_SUCCESS) {
     _tx_failed.fetch_add(1, std::memory_order_relaxed);
     _tx_last_rc.store(rc, std::memory_order_relaxed);
@@ -1599,6 +1533,14 @@ int UsbTransport::tx_sync(uint8_t ep, uint8_t *packet, size_t length,
   }
   _logger->info("bulk_send EP {} OK {} bytes", (int)ep, actual);
   return actual;
+}
+
+int UsbTransport::tx_sync_data(uint8_t ep, uint8_t *packet, size_t length,
+                               int timeout_ms) {
+  if (_tx_no_cancel_multipkt)
+    timeout_ms = devourer::bulk_out_timeout_ms(length, _bulk_out_mps,
+                                               timeout_ms);
+  return tx_sync(ep, packet, length, timeout_ms);
 }
 
 TxStats UsbTransport::tx_stats() const {

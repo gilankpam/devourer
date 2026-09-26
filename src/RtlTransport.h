@@ -39,10 +39,11 @@ struct UsbLinkInfo {
   std::vector<uint8_t> bulk_out_eps; /* descriptor order */
 };
 
-/* ---- batched control transfers (mabur in-flight hop, 2026-09-14) ---------
+/* ---- batched control transfers -------------------------------------------
  * One register access in a group submitted to IRtlTransport::ctrl_batch.
  * `value` is the payload for a write and the RESULT slot for a read (filled
  * in place, in this op's own element — see the contract on ctrl_batch).
+ * 16-bit MAC/BB space only; the wIndex=1 window is not batchable.
  * Namespace scope, not nested in IRtlTransport: the selftest, RtlAdapter's
  * forwarder and every call site name it `devourer::CtrlOp`. */
 struct CtrlOp {
@@ -94,25 +95,10 @@ public:
   virtual void write_batch_end() {}
   virtual void flush_writes() {}
 
-  /* ---- batched control transfers (mabur in-flight hop, 2026-09-14) ----
-   * A group of EP0 register reads/writes submitted back to back and waited
-   * for in as few completion waits as the transport's slot pool allows: on
-   * USB the per-transfer host turnaround is paid roughly once per CHUNK
-   * instead of once per op. (Not "once per batch": UsbTransport's async slot
-   * pool is 8 deep — kAsyncWriteDepth, tuned for the ~14k-write bring-up
-   * pipeline and deliberately not raised for this — so a 10-op batch is two
-   * chunks and two waits. Size a latency-critical group with that in mind:
-   * on the RK3566 ground station the per-WAIT cost is ~290 us and the
-   * per-op cost inside a chunk is only ~7-16 us, so the wait count is the
-   * thing to minimise.)
-   * The win is strongly host-dependent: 5.6x on that ground station (3372 ->
-   * 603 us for the 12-op scout read), but exactly ZERO on an x86 xHCI bench
-   * host, where the per-transfer cost is wire time rather than host
-   * turnaround and nothing overlaps. Both are FLOORS — measured with no RX
-   * loop running, so nothing was reaping RX URBs on the context that a
-   * ctrl_batch caller's own event pump must service under live traffic. See
-   * DeviceConfig::Usb::ctrl_batch and tests/scout_read_bench.cpp's header
-   * before quoting a benefit.
+  /* ---- batched control transfers ----
+   * A group of EP0 register reads/writes submitted back to back, paying one
+   * completion wait per chunk of at most the transport's slot depth instead
+   * of one host round trip per op.
    *
    * CONTRACT, owed by every implementation:
    *   - ops execute in submission order, so a read after a write to the same
@@ -120,22 +106,18 @@ public:
    *     completion, the property the pipelined write batch already rests on);
    *   - each read's value lands in ITS OWN op's `value`;
    *   - a write op's `value` is an input and comes back untouched;
-   *   - returns false if ANY op failed, and a failure does NOT abort the rest
+   *   - returns false if an op failed, and a failure does NOT abort the rest
    *     of the batch (a half-issued hop leaves a 3-wire bracket open or a BB
-   *     reset asserted — finishing and reporting beats bailing out).
+   *     reset asserted — finishing and reporting beats bailing out). The
+   *     default below reports write failures only; a failed read leaves by
+   *     the transport's read idiom (exception on USB — read32 has no failure
+   *     return). UsbTransport's own ctrl_batch reports a failed read as false.
+   *     A read-then-compose-then-write caller must allow for both; see
+   *     RtlJaguar3Device::GetRxEnergyScout.
    * tests/ctrl_batch_selftest.cpp pins all four against a fake transport.
    *
-   * The last clause is weaker than it reads on the DEFAULT below, and a
-   * caller doing read-then-compose-then-write must know it: read32 has no
-   * failure return, so a failed READ here cannot come back as false. On USB
-   * it leaves by exception instead (ctrl_read throws — this codebase's house
-   * idiom for a dead register bus); on a transport whose read32 returns
-   * garbage it would be silent. UsbTransport's own ctrl_batch does report a
-   * failed read as false. See RtlJaguar3Device::GetRxEnergyScout, which is
-   * the caller this actually bites.
-   *
-   * Serialized by the CALLER (RtlJaguar3Device holds _reg_mu for the whole
-   * group; the transport additionally takes its own mutex so a bring-up
+   * Serialized by the CALLER (it holds its device register lock for the
+   * whole group; the transport additionally takes its own mutex so a bring-up
    * write_batch_* and a runtime ctrl_batch can never interleave over the same
    * slot pool). Default: synchronous, in order — correct on PCIe and on any
    * transport that has nothing to pipeline.
@@ -143,9 +125,11 @@ public:
    * HAZARD, USB: the implementation pumps libusb events from the CALLING
    * thread while the RX bulk pump may be doing the same on its own thread.
    * libusb permits that, but either thread may reap either thread's
-   * completions, so RX callbacks can run on the scout's thread and vice
-   * versa. The wait loop must therefore key on the per-slot `done` flag the
-   * completion callback sets — never on "I pumped, therefore mine finished".
+   * completions, so an RX on_data callback can run on the caller's thread
+   * inside this call, and vice versa. Hence: nothing reachable from on_data
+   * may take a lock a ctrl_batch caller holds (the device register lock),
+   * and the wait loop keys on the per-slot `done` flag the completion
+   * callback sets — never on "I pumped, therefore mine finished".
    * See UsbTransport::ctrl_batch. */
   virtual bool ctrl_batch(std::vector<CtrlOp> &ops) {
     bool ok = true;
@@ -168,6 +152,13 @@ public:
    * (USB: bulk completion; PCIe: hardware read-pointer / BCN kick). Returns
    * bytes submitted or a negative error. */
   virtual int tx_sync(uint8_t ep, uint8_t *buf, size_t len, int timeout_ms) = 0;
+  /* tx_sync for a DATA frame (never firmware download or a reserved-page
+   * write): the one bulk-OUT a transport may send with a relaxed timeout
+   * policy (USB: DeviceConfig::Tx::no_cancel_multipkt). Default: tx_sync. */
+  virtual int tx_sync_data(uint8_t ep, uint8_t *buf, size_t len,
+                           int timeout_ms) {
+    return tx_sync(ep, buf, len, timeout_ms);
+  }
   /* Blocking RX delivery loop until should_stop(). buf_size/n_xfers are USB
    * URB-queue tuning; the PCIe ring depth is fixed at transport creation. */
   virtual void rx_loop(int buf_size, int n_xfers,

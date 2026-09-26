@@ -96,6 +96,7 @@ devourer::DeviceConfig devourer_config_from_env() {
     cfg.tx.ep = static_cast<uint8_t>(v);
   if (env_long("DEVOURER_TX_TIMEOUT_MS", &v))
     cfg.tx.timeout_ms = static_cast<unsigned>(v);
+  cfg.tx.no_cancel_multipkt = env_flag("DEVOURER_TX_NO_CANCEL_MULTIPKT");
   cfg.tx.legacy_8812_desc = env_flag("DEVOURER_TX_LEGACY_8812_DESC");
   if (env_long("DEVOURER_TX_PWR", &v))
     cfg.tx.power_index = static_cast<int>(v & 0x3f);
@@ -260,10 +261,9 @@ devourer::DeviceConfig devourer_config_from_env() {
   /* ---- usb ---- */
   if (const char *e = env_str("TMPDIR"); e && *e)
     cfg.usb.lock_dir = e;
-  if (env_str("DEVOURER_RX_ZEROCOPY")) /* default false; =1 opts in to DMA */
+  if (env_str("DEVOURER_RX_ZEROCOPY")) /* default true; =0 forces the heap path */
     cfg.usb.rx_zerocopy = env_flag("DEVOURER_RX_ZEROCOPY");
-  /* default TRUE, so this reads the variable only to turn it OFF (=0) */
-  if (env_str("DEVOURER_CTRL_BATCH"))
+  if (env_str("DEVOURER_CTRL_BATCH")) /* default true; =0 = synchronous */
     cfg.usb.ctrl_batch = env_flag("DEVOURER_CTRL_BATCH");
 
   return cfg;

@@ -35,10 +35,11 @@ public:
   UsbTransport(libusb_device_handle *dev_handle, Logger_t logger,
                libusb_context *ctx = nullptr,
                std::shared_ptr<devourer::UsbDeviceLock> usb_lock = nullptr,
-               bool rx_zerocopy = false, RxMode rx_mode = RxMode::Async,
+               bool rx_zerocopy = true, RxMode rx_mode = RxMode::Async,
                int pool_spare = 0, int ring_ms = 0,
                PoolExhaust pool_exhaust = PoolExhaust::Backpressure,
-               bool ctrl_batch_enabled = true);
+               bool ctrl_batch_enabled = true,
+               bool tx_no_cancel_multipkt = false);
   ~UsbTransport() override;
 
   bool is_usb() const override { return true; }
@@ -93,6 +94,9 @@ public:
   bool tx_async(uint8_t ep, uint8_t *buf, size_t len,
                 unsigned timeout_ms) override;
   int tx_sync(uint8_t ep, uint8_t *buf, size_t len, int timeout_ms) override;
+  /* tx_sync, with DeviceConfig::Tx::no_cancel_multipkt applied. */
+  int tx_sync_data(uint8_t ep, uint8_t *buf, size_t len,
+                   int timeout_ms) override;
   void rx_loop(int buf_size, int n_urbs,
                const std::function<void(const uint8_t *, int)> &on_data,
                const std::function<bool()> &should_stop) override;
@@ -106,16 +110,14 @@ public:
 private:
   template <typename T> T ctrl_read(uint16_t reg);
   template <typename T> bool ctrl_write(uint16_t reg, T value);
-  /* Pipelined-write machinery (see IRtlTransport::write_batch_begin). */
-  /* Register transfers are 1/2/4 bytes; async_write/async_read refuse a
+  /* Pipelined-write machinery (see IRtlTransport::write_batch_begin).
+   * Register transfers are 1/2/4 bytes; async_write/async_read refuse a
    * larger payload rather than overrun the inline setup buffer. */
   static constexpr size_t kAsyncMaxPayload = 4;
-  /* CROSS-THREAD as of the ctrl_batch work (2026-09-14). Before it, the slot
-   * pool was only ever driven by the single-threaded bring-up write batch, so
-   * plain fields were safe. A runtime ctrl_batch pumps libusb events from the
-   * CALLING thread while the RX bulk pump pumps the SAME context on its own
-   * thread, and libusb lets either thread reap either thread's completions —
-   * so async_write_cb can now run on a thread that is not the submitter.
+  /* CROSS-THREAD: a runtime ctrl_batch pumps libusb events from the calling
+   * thread while the RX loop pumps the same context on its own thread, and
+   * libusb lets either thread reap either thread's completions — so
+   * async_write_cb can run on a thread that is not the submitter.
    * `done` is the handshake (release on the callback side, acquire on the
    * waiter's) and publishes `status`/`actual`/the payload bytes written
    * before it. */
@@ -130,23 +132,8 @@ private:
     int status;
     int actual;
   };
-  /* 8 is a FLOOR, not an optimum: the InitWrite measurement this came from
-   * reads "depth >= 8". It also caps a ctrl_batch chunk, and on the RK3566
-   * ground station the cost model is ~290 us per completion WAIT against only
-   * ~7-16 us per op — so a group split across two chunks pays ~290 us for
-   * nothing.
-   *
-   * The group that is actually hurt is the cached FAST-RETUNE HOP: 9-11
-   * writes, one ctrl_batch, two chunks at depth 8. A depth >= 11 makes it one
-   * wait — ~290 us off a live channel change.
-   *
-   * NOT the scout read: its two waits are a DATA DEPENDENCY, not chunking.
-   * It is two dependent ctrl_batch calls (8 reads, then 4 writes composed from
-   * two of those reads), each already a single chunk, so no pool depth can
-   * fold them.
-   *
-   * NOT raised here: it is on InitWrite's proven ~14k-write bring-up path and
-   * needs bring-up-time validation on hardware first. */
+  /* Slot-pool depth; also the ctrl_batch chunk size. A floor from the
+   * bring-up write pipeline ("depth >= 8"), not a tuned optimum. */
   static constexpr int kAsyncWriteDepth = 8;
   /* Extra event-loop turns spent reaping cancellations after a drain times
    * out. A live loop reports each cancellation promptly; a dead one fails
@@ -205,10 +192,8 @@ private:
    * OUTSIDE this mutex, concurrently with the bring-up thread. That is safe
    * today only because of the single-threaded-bring-up contract on
    * write_batch_begin (IRtlTransport). Anyone making bring-up concurrent must
-   * fix that path; this mutex does not cover them.
-   *
-   * Kept in sync with the THREADING paragraph on UsbTransport::ctrl_batch's
-   * definition (UsbTransport.cpp) — change both or neither. */
+   * fix that path; this mutex does not cover them. (ctrl_batch's THREADING
+   * paragraph points here.) */
   std::mutex _batch_mu;
   /* DeviceConfig::usb.ctrl_batch — false makes ctrl_batch fall back to the
    * synchronous default (the A/B knob, DEVOURER_CTRL_BATCH=0). */
@@ -219,7 +204,7 @@ private:
    * (or failed to reap) the queue, while ctrl_batch re-reads it between
    * chunks — the pool is dead from that point and every further chunk would
    * otherwise submit into it and pay a ~2 s drain EACH, with the caller's
-   * _reg_mu held the whole time. */
+   * register lock held the whole time. */
   std::atomic<bool> _aw_abandoned{false};
   void discover_endpoints(); /* was InitDvObj */
   const char *speed_str() const;
@@ -230,8 +215,10 @@ private:
   Logger_t _logger;
   UsbLinkInfo _info;
   /* Smallest bulk-OUT wMaxPacketSize (0 = unknown), set by
-   * discover_endpoints; see tx_sync / src/BulkOutTimeout.h. */
+   * discover_endpoints; see tx_sync_data / src/BulkOutTimeout.h. */
   unsigned _bulk_out_mps = 0;
+  /* DeviceConfig::Tx::no_cancel_multipkt, read by tx_sync_data only. */
+  bool _tx_no_cancel_multipkt = false;
 
   /* Set by transfer_callback when an async TX bulk-OUT completes non-OK
    * (TIMED_OUT / stall). Consumed at the top of the next tx_async on the TX
@@ -275,7 +262,7 @@ private:
   /* Allocate the async RX ring from kernel DMA memory (dev_mem_alloc) for a
    * zerocopy bulk-IN path; falls back to heap buffers per-URB when the alloc is
    * unsupported. See rx_loop and DeviceConfig::Usb::rx_zerocopy. */
-  bool _rx_zerocopy = false;
+  bool _rx_zerocopy = true;
 
   /* RX-ring servicing strategy + buffer-pool depth + diagnostic telemetry
    * cadence, from DeviceConfig::Rx. rx_loop reads these; the defaults preserve

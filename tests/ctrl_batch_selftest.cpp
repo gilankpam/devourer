@@ -1,44 +1,28 @@
-/* ctrl_batch_selftest.cpp — the SEMANTIC contract of
- * IRtlTransport::ctrl_batch (batched EP0 register transfers, mabur in-flight
- * hop 2026-09-14), pinned against a fake transport with no bus under it.
- *
- * What this file is for: the contract, not the plumbing. Every transport
- * implementing ctrl_batch — the synchronous default here, UsbTransport's
- * pipelined EP0 version, any future one — owes the caller all four of:
+/* Headless guard for the SEMANTIC contract of IRtlTransport::ctrl_batch
+ * (batched EP0 register transfers), pinned against a fake transport with no
+ * bus under it. The contract, not the plumbing: every implementation owes the
+ * caller all four of
  *
  *   1. ORDER. Ops execute in submission order, so a read placed after a
- *      write to the same address in one batch observes that write. (On USB
- *      this rests on EP0 completing URBs in submission order, the same
- *      property the pipelined write batch already relies on.)
+ *      write to the same address in one batch observes that write.
  *   2. IN-PLACE READS. Each read op's value lands in THAT op's `value`
- *      field. Not the next one's, not the k-th used slot's. This is the
- *      clause the UsbTransport implementation is most able to get subtly
- *      wrong: if the submit of op i fails mid-chunk and the completion loop
- *      then walks ops and slots with two independent cursors, every op after
- *      the failure silently receives its neighbour's register value — a
- *      wrong number, not an error. Case 2 below pins exactly that shape at
- *      the contract level (the USB implementation additionally makes it
- *      structurally impossible by pairing each op with its own slot pointer
- *      and copying inside the wait loop, which is also required for a second
- *      reason: async_write_cb returns the slot to the free pool the instant
- *      it completes, so a deferred copy pass reads buffers the pool already
- *      considers reusable).
+ *      field — not a neighbour's after a mid-group failure. Case 2 below pins
+ *      that shape; how UsbTransport keeps it is on UsbTransport::ctrl_batch.
  *   3. FAILURE IS REPORTED, NOT SWALLOWED. A single failed op makes the
  *      whole call return false...
  *   4. ...but does NOT abort the batch: the remaining ops still run. A hop's
  *      write group is a sequence the chip needs finished (a 3-wire bracket
- *      left open, a BB reset left asserted), so bailing out halfway is worse
- *      than finishing and reporting.
+ *      left open, a BB reset left asserted).
  *
- * ONE DELIBERATE DIVERGENCE, so case 2's "every op still ran" is not read as
- * a universal: clause 4 as written is what the SYNCHRONOUS default owes, and
- * that is what this file pins. UsbTransport::ctrl_batch attempts every op but
- * genuinely skips two classes — an op whose libusb_submit_transfer failed,
- * and the rest of a chunk after a completion wait gave up — because there is
- * no way to issue them. It still runs every LATER chunk, still finishes the
- * remainder synchronously if the pool dies, and still returns false. That is
- * intended: "attempted, and any failure reported" is the portable clause,
- * "executed" is the default's stronger guarantee.
+ * This file links RtlTransport.h only, so it exercises the synchronous
+ * default, never UsbTransport's pipelined version.
+ *
+ * ONE DELIBERATE DIVERGENCE: clause 4 as pinned here is the synchronous
+ * default's guarantee. UsbTransport::ctrl_batch skips an op whose submit
+ * failed and the rest of a chunk whose completion wait gave up (there is no
+ * way to issue them), still runs every later chunk, and still returns false.
+ * "Attempted, and any failure reported" is the portable clause; "executed" is
+ * the default's stronger one.
  */
 #include <cstdio>
 #include <cstdlib>

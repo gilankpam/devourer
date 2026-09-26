@@ -534,7 +534,10 @@ Generation-agnostic core in `src/` (always compiled; depends on no HAL):
 - `RtlAdapter` — the bus-neutral register/frame accessor; a copyable value
   type shared by every component, forwarding to the `IRtlTransport` it was
   built with (`UsbTransport` = libusb vendor control + bulk; `PcieTransport` =
-  BAR2 MMIO + DMA rings). `RtlUsbAdapter` is a deprecated alias.
+  BAR2 MMIO + DMA rings). `RtlUsbAdapter` is a deprecated alias. An RX
+  `on_data` callback can run on any thread that calls a batching register
+  method (`IRtlTransport::ctrl_batch`, `src/RtlTransport.h`), so nothing
+  reachable from `on_data` may take a device register lock.
 - `Radiotap.c` — radiotap iterator. TX buffers passed to `send_packet` **must**
   begin with a radiotap header; rate/MCS/VHT/STBC/LDPC/SGI/bandwidth are read
   from it.

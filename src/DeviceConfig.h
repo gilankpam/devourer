@@ -202,6 +202,21 @@ struct DeviceConfig {
     /* env: DEVOURER_TX_TIMEOUT_MS — TX bulk-OUT transfer timeout (unset =
      * USB_TIMEOUT). */
     std::optional<unsigned> timeout_ms;
+    /* env: DEVOURER_TX_NO_CANCEL_MULTIPKT=1 — USB: a synchronous data send
+     * (IRtlTransport::tx_sync_data) longer than one bulk packet gets no
+     * timeout; a single-packet one keeps its caller's. libusb cancels on
+     * timeout, and a multi-packet bulk-OUT cancelled after the chip took part
+     * of it leaves the endpoint wedged: with several sender threads queued,
+     * the next transfer streams in as the rest of the half-received packet,
+     * the TXDMA misparses it, and every later bulk-OUT is NAKed until re-init
+     * (observed on an 8822EU with 4 sender threads under a carrier-sense-free
+     * jam: `rc=-7 got 1536/4439`, then nothing). The cost: a frame the chip
+     * NAKs indefinitely blocks its sender indefinitely, and Stop() cannot
+     * interrupt it. Firmware download and reserved-page writes are never
+     * affected. Synchronous-TX generations only (Jaguar2/3, RTL8733B,
+     * Kestrel); Jaguar1 sends asynchronously and ignores it. Default off:
+     * every send uses its finite timeout. See src/BulkOutTimeout.h. */
+    bool no_cancel_multipkt = false;
     /* env: DEVOURER_TX_LEGACY_8812_DESC — 8814A: keep the legacy 8812-style
      * TX-descriptor bits instead of the 8814-native layout. */
     bool legacy_8812_desc = false;
@@ -523,37 +538,19 @@ struct DeviceConfig {
     std::string lock_dir;
     /* env: DEVOURER_RX_ZEROCOPY — allocate the async RX ring from kernel DMA
      * memory (libusb_dev_mem_alloc / USBDEVFS_ALLOC) so incoming frames DMA
-     * straight into the userspace buffer, eliminating the per-URB usbfs copy
-     * on reap. Linux + capable HCD only. DEFAULT OFF: intermittent
-     * zero-frame delivery observed on an xhci desktop host (same
-     * host/dongle/channel worked on one run, deaf on the next; the heap
-     * path was 100% reliable). Opt in with =1 until root-caused. */
-    bool rx_zerocopy = false;
+     * straight into the userspace buffer, eliminating the per-URB usbfs copy on
+     * reap. Linux + capable HCD only; the alloc falls back to heap buffers (the
+     * historical copy-on-reap path) when unsupported, so leaving it on is safe.
+     * 1 = on (default), 0 = force the heap path. */
+    bool rx_zerocopy = true;
     /* env: DEVOURER_CTRL_BATCH — batch a group of EP0 register accesses
-     * (IRtlTransport::ctrl_batch): submit up to kAsyncWriteDepth back to back
-     * and pay one completion wait per chunk instead of one host round trip per
-     * register. Used by the Jaguar3 channel-scout energy read and the cached
-     * FastRetune hop. DEFAULT ON; =0 falls the transport back to the
-     * synchronous default, which is the A/B knob for measuring what the batch
-     * actually buys (and the escape hatch on a host whose event pump
-     * misbehaves).
-     *
-     * MEASURED 2026-09-15, and the two hosts disagree completely:
-     *   - GROUND STATION (RK3566, the deployment target): the scout read goes
-     *     from a 3372 us median to 603 us — 5.6x, -2.77 ms per call. A FLOOR:
-     *     measured with no RX loop running, so no RX URBs were on the libusb
-     *     context for the scout's own event pump to absorb. Batching
-     *     removes 92-98% of the per-transfer cost there, because on that host
-     *     that cost is host turnaround, not wire time (~290 us per completion
-     *     WAIT plus only ~7-16 us per op).
-     *   - x86 xHCI bench host: exactly ZERO change — 375.0 us per transfer
-     *     either way, and the pre-existing bring-up write pipeline is no
-     *     better there either. That host overlaps nothing on EP0.
-     * Default ON for the target; =0 to A/B it. Numbers, the cost model and
-     * the follow-up lever (kAsyncWriteDepth >= 11 would make the cached hop's
-     * 9-11 writes one wait instead of two; it cannot help the scout, whose
-     * two waits are a data dependency) are in tests/scout_read_bench.cpp's
-     * header. */
+     * (IRtlTransport::ctrl_batch): submit them back to back and pay one
+     * completion wait per chunk instead of one host round trip per register.
+     * Used by the Jaguar3 channel-scout energy read and the cached FastRetune
+     * hop. Default on; =0 falls the transport back to the synchronous
+     * default (the A/B knob, and the escape hatch on a host whose event pump
+     * misbehaves). The benefit is host-dependent — see
+     * tests/scout_read_bench.cpp before quoting one. */
     bool ctrl_batch = true;
   } usb;
 

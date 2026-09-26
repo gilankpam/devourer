@@ -1,5 +1,5 @@
-/* scout_batch_fail_selftest.cpp — RtlJaguar3Device::GetRxEnergyScout must NOT
- * write a composed BB reset built out of a FAILED read.
+/* Headless guard: RtlJaguar3Device::GetRxEnergyScout must NOT write a
+ * composed BB reset built out of a FAILED read.
  *
  * WHY THIS TEST IS MANDATORY AND THE OTHERS ARE NOT. The scout's reset dwords
  * 0x1d2c (RX clock gate) and 0x1eb4 are read, bit-twiddled and written back as
@@ -135,7 +135,7 @@ int main() {
     CHECK(wrote(*fake, 3, 0x1d2c, k1d2c | (1u << 31)));
   }
 
-  /* ---- case 2 (C1): a failed read of EITHER reset register must produce NO
+  /* ---- case 2: a failed read of EITHER reset register must produce NO
    * writes at all. Not "a different write" — none. A composed dword built on
    * a zero that was never read is what bricks the receiver. */
   for (uint16_t bad : {uint16_t(0x1d2c), uint16_t(0x1eb4)}) {

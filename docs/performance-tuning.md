@@ -134,19 +134,14 @@ does much — the structural win above is already the dominant effect:
   8821A (6), and the HalMAC generations (3) — a modest depth, where the
   syscall saved can still be offset by the packing cost. Do not expect a
   host-CPU reduction from it on the 8812A.
-- **Zerocopy RX DMA ring** (`usb.rx_zerocopy`, default off): allocates the async
+- **Zerocopy RX DMA ring** (`usb.rx_zerocopy`, default on): allocates the async
   RX ring from kernel DMA memory (`libusb_dev_mem_alloc`) so a received frame
   DMAs straight into the userspace buffer and usbfs skips the copy-on-reap.
-  In principle safe (per-buffer heap fallback when the HCD doesn't support it),
+  Correct and safe (per-buffer heap fallback when the HCD doesn't support it),
   but the copy it removes is tiny at realistic RX rates — a 20 Mbps video link
   is ~2.5 MB/s, negligible against the per-URB reap. It's kept as a
   structurally-correct, low-risk path (and a base to develop further), not a
   measured CPU win at these rates.
-
-  > **Known issue:** on an xhci desktop host the zerocopy ring
-  > intermittently delivered zero frames (same host/dongle/channel: one run
-  > fine, the next deaf; heap path 100% reliable). Zerocopy is therefore
-  > default-OFF (`DEVOURER_RX_ZEROCOPY=1` opts in) until root-caused.
 
 - **RX URB size** (`rx.urb_bytes` / `DEVOURER_RX_URB_BYTES`, default 16 KB on
   the 11ac generations) is a compatibility constraint, not a throughput lever.

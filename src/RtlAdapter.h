@@ -94,11 +94,11 @@ public:
   void flush_writes() { _transport->flush_writes(); }
   /* Batched EP0 register transfers — see IRtlTransport::ctrl_batch for the
    * ordering / in-place-read / failure contract and the USB event-pump
-   * hazard. The caller owns serialization (RtlJaguar3Device's _reg_mu). */
+   * hazard. The caller owns serialization (its device register lock). */
   bool ctrl_batch(std::vector<devourer::CtrlOp> &ops) {
     /* debug.log_writes parity with rtw_write: a batched write is still a
-     * write, and tests/decode_wseq.py's golden diff must not develop a hole
-     * where the cached hop path used to emit wreg events. */
+     * write: keeps tests/decode_wseq.py's golden sequence identical whether
+     * or not a path batches. */
     if (_log_writes)
       for (const devourer::CtrlOp &op : ops)
         if (op.write)
@@ -158,6 +158,13 @@ public:
   int bulk_send_sync_ep(uint8_t ep, uint8_t *packet, size_t length,
                         int timeout_ms) {
     return _transport->tx_sync(ep, packet, length, timeout_ms);
+  }
+  /* bulk_send_sync_ep for a data frame (IRtlTransport::tx_sync_data): the
+   * send path DeviceConfig::Tx::no_cancel_multipkt applies to. Firmware
+   * download and reserved-page writes stay on bulk_send_sync_ep. */
+  int bulk_send_data_sync_ep(uint8_t ep, uint8_t *packet, size_t length,
+                             int timeout_ms) {
+    return _transport->tx_sync_data(ep, packet, length, timeout_ms);
   }
   void bulk_clear_halt(uint8_t ep) { _transport->clear_halt(ep); }
 
