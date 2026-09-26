@@ -29,7 +29,7 @@
  * NO reset behind that zero (valid_cck=false) — a caller that sums the OFDM
  * and CCK halves un-gated would silently undercount every scout-sourced
  * sample relative to a full-read sample, which is exactly what
- * src/chanmig/EvidenceStore.h and src/hopset/HopsetSense.h now gate on
+ * src/chanmig/EvidenceStore.h and src/hopset/HopsetSense.h gate on
  * valid_cck to avoid. The inverse also follows: because the scout skipped
  * the CCK reset during its dwell, the NEXT GetRxEnergy() call's fa_cck/
  * cca_cck is a delta since the last actual CCK reset (the last GetRxEnergy,
@@ -88,15 +88,17 @@ struct RxEnergy {
 
 /* One busy-airtime NHM window (IRtlDevice::ArmNhmBusy / ReadNhmBusy):
  * 12 buckets over devourer's absolute dBm table (nf::kNhmAbsThDbm), counted
- * with CCA-busy samples INCLUDED and our own TX EXCLUDED, so the upper
- * buckets' share is the fraction of the window the air carried energy above
- * that level. `period` is the period of the most recent arm on this device
- * (4 us units) -- a caller that armed a different period knows the result
- * is someone else's window. */
+ * with CCA-busy samples INCLUDED and our own TX EXCLUDED. Read the upper
+ * buckets' share as airtime above that level only after the frozen-estimate
+ * check in src/jaguar3/CLAUDE.md "Busy-airtime NHM" — a frozen BB power
+ * estimate fills one bucket regardless of the air. */
 struct NhmBusy {
-  bool valid = false;
-  uint8_t buckets[12] = {};
-  uint16_t duration = 0;
+  bool valid = false;        /* the window's ready bit was set */
+  uint8_t buckets[12] = {};  /* share of 255 samples; 11 thresholds -> 12 buckets */
+  uint16_t duration = 0;     /* measured window, 4 us units */
+  /* Period of the most recent arm on this device (4 us units) — a caller
+   * that armed a different period knows the result is someone else's
+   * window. */
   uint16_t period = 0;
 };
 

@@ -1,6 +1,11 @@
 /* Headless guard for the active idle-noise-floor math helpers
  * (src/NoiseFloorMath.h): the 10-bit sign conversion of the 0x0FA0 debug-port
- * I/Q and the 3*log2 pwdb approximation. Pure math; no hardware. */
+ * I/Q and the 3*log2 pwdb approximation (Jaguar1); the Jaguar3 NHM absolute
+ * floor (nf::nhm_abs_floor_dbm — bucket weighting, the sample/idle-time
+ * guards and the frozen-estimate peak-bucket guard); and the NhmReader.h
+ * read_nhm/read_nhm_absolute register recipe against a fake JGR3 BB, which
+ * pins the th[8..10] masked writes against the double-shift regression
+ * (values pre-shifted into the mask read back 0). Pure math; no hardware. */
 #include "NhmReader.h"
 #include "NoiseFloorMath.h"
 

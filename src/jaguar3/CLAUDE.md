@@ -35,7 +35,6 @@ narrowband dividers, RF18 encoding), strategy interfaces `Jaguar3Calibration`
 - The rtl8822e's hardware-bisected constraints (DPDT/pin-mux front end,
   single-path 1SS TX, spur channels, LCK, the 2.4 GHz TX kernel-parity
   limitation) live in `docs/8822e-quirks.md`.
-
 - **Absolute noise floor = NHM, not an idle-noise report.** The 8822C/E have
   no vendor idle-noise path (phydm_noisemonitor.c returns 0 for them; the
   vendor ACS never asks). `GetRxEnergy(with_nhm)` under
@@ -45,8 +44,8 @@ narrowband dividers, RF18 encoding), strategy interfaces `Jaguar3Calibration`
   −95/−96 dBm on 5 GHz once settled, but the BB's power estimate is FROZEN
   (one constant value, single-bucket histogram) for the first 1-7 s and for
   most of a 2.4 GHz session — rejected as null by the peak-bucket guard;
-  trigger unidentified. Beware the
-  masked BB write shifts the value to the mask: the NHM th[8..10] writes were
+  trigger unidentified. Beware the masked BB write shifts the value to the
+  mask: the NHM th[8..10] writes were
   double-shifted (read back 0) until the selftest pinned them.
 
 ## Bring-up cost and the pipelined register writes
@@ -61,8 +60,7 @@ a `write_batch_begin/end` scope and only reads (submitted behind the queue,
 waited on their own completion), bulk transfers and `flush_writes` wait.
 `InitWrite` runs its whole bring-up in one batch (RAII scope, ended before
 the coex thread starts): 1.30 → 0.65 s warm, 2.04 → ~0.7 s cold, one
-drone-side unit. **`Init` (RX-only) opens no batch yet** — not measured on a
-ground-station card.
+unit. **`Init` (RX-only) opens no batch yet** — its cost is not measured.
 `write_batch_begin/end` batches are single-threaded by contract (that is the
 bring-up scope only — the runtime `ctrl_batch` path below is a different,
 explicitly cross-thread animal). The ms-scale settle delays
@@ -101,19 +99,16 @@ callers, both holding `_reg_mu` across the whole group:
   wholesale, so the fast-path caches are dropped (`invalidate_fast_caches`)
   and the hop resyncs through the full `set_channel_bwmode`.
 
-Measured (`tests/scout_read_bench.cpp`, spare 8822EU, 2026-09-15), and the two
-hosts disagree completely: on the RK3566 ground station the 12-op scout read
-goes 3372 → 603 µs (5.6×), while on an x86 xHCI bench host batching buys
-**exactly nothing** — 375 µs/transfer either way, because there the per-transfer
-cost is wire time, not host turnaround. Both figures are **floors**: the bench
-runs with no RX loop, so nothing was reaping RX URBs on the context a real
-caller's event pump must also service. `DEVOURER_CTRL_BATCH=0`
-(`DeviceConfig::usb.ctrl_batch`, default on) is the A/B knob.
+The two hosts measured disagree completely — the 12-op scout read gets ~5.6×
+faster batched on an RK3566 aarch64 host and not at all on an x86 xHCI host
+(there the per-transfer cost is wire time, not host turnaround); both are
+floors taken with no RX loop. Numbers and method: `tests/scout_read_bench.cpp`.
+`DEVOURER_CTRL_BATCH=0` (`DeviceConfig::usb.ctrl_batch`, default on) is the
+A/B knob.
 
 Two costs recorded on that bench file and the `ctrl_batch` definition rather
-than fixed here: `tx_async`/`tx_sync` open with `flush_writes()`, which was a
-runtime no-op before this and now blocks a send landing mid-group; and an RX
-`on_data` callback can be reaped on the batching thread, so nothing reachable
+than fixed here: `tx_async`/`tx_sync` open with `flush_writes()`, so a send
+landing mid-group blocks on it; and an RX `on_data` callback can be reaped on the batching thread, so nothing reachable
 from it may take `_reg_mu` (`cfo_tick()` does — latent only because
 `DEVOURER_CFO_TRACK` defaults off).
 
@@ -154,11 +149,28 @@ same TSSI reshape as its offset slope).
 ## Busy-airtime NHM (ArmNhmBusy / ReadNhmBusy)
 
 Non-blocking NHM window for a caller that wants airtime, not a floor:
-cfg 0x3 (inc_cca ON so 802.11 frames count, inc_tx OFF), thresholds from
-`nf::kNhmAbsThDbm`, composed as full dwords in `NhmBusyMath.h`. Arm at the
-start of a window, read at the end; not-ready reads come back invalid, never
-block. `NhmBusy.period` is the LAST arm's period on this device — a caller
-compares it with its own to detect that someone else (a scout dwell) re-armed
-in between. The recipe cache is cleared by `GetRxEnergy(with_nhm)` (its
-IGI-relative and absolute-floor windows reprogram NHM), `SetMonitorChannel`
-and `InitWrite`. `read_nhm`/`read_nhm_absolute` are NOT built on this path.
+cfg 0x3 (inc_cca ON so 802.11 frames count, inc_tx OFF), the levels fixed to
+`nf::kNhmAbsThDbm` (no caller-chosen thresholds), composed as full dwords in
+`NhmBusyMath.h`. Arm at the start of a window, read at the end; not-ready
+reads come back invalid, never block. `NhmBusy.period` is the LAST arm's
+period on this device — a caller compares it with its own to detect that
+another caller re-armed in between. `read_nhm`/`read_nhm_absolute` are NOT
+built on this path. Unvalidated on air in this repo — no in-repo consumer.
+
+- **Recipe cache.** Valid only while `RtlJaguar3Device.cpp` is the sole
+  writer of `0x1e40`/`0x1e60`; cleared by `GetRxEnergy(with_nhm)` —
+  including via `GetRxQuality()` —, `SetMonitorChannel`, `Init` and
+  `InitWrite`. It survives `FastRetune` (the hop does not touch
+  `0x1e40`/`0x1e60`), so a window in flight across a hop spans both
+  channels — arm after the hop.
+- **Counter resets shorten a window silently.** Any `0x1eb4[25]` counter
+  reset clears an in-flight window without touching `period`:
+  `GetRxEnergy` (either mode, including via `GetRxQuality()`),
+  `GetRxEnergyScout`, and the coex thread's ~2 s `fa_stats` tick
+  (`PhydmRuntimeJaguar3.cpp`). The last cannot be avoided by the caller, so
+  ~one window per 2 s can come back short (reads LOW).
+- **Frozen power estimate.** The BB power estimate can be frozen (a
+  single-bucket histogram at a fixed level) after bring-up, after a
+  `FastRetune` and on 2.4 GHz, and `ReadNhmBusy` does not reject it. A
+  caller must apply the same peak-bucket test as `nf::nhm_abs_floor_dbm`
+  (`kNhmFrozenBucket`) before reading the buckets as airtime.

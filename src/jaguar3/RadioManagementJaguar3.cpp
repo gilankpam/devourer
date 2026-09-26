@@ -801,8 +801,8 @@ bool RadioManagementJaguar3::fast_retune(uint8_t channel,
    * _last_agc_key bucket keys all asserting values the chip never received,
    * and because the next hop only writes a bucket when its key MOVED, it
    * would then skip re-writing them — the radio can sit on a wrong or
-   * half-applied channel config indefinitely. On a hop path in a video link
-   * that is link loss.
+   * half-applied channel config indefinitely. On a hop path that is a silent
+   * channel mismatch.
    *
    * Note _cw_primed = false alone (the idiom the fw branch uses) is NOT
    * enough: re-priming re-reads the dwords but does not touch the bucket

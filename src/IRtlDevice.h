@@ -577,34 +577,31 @@ public:
    * INCLUDING valid_cck (see RxEnergy::valid_cck in RxSense.h: the scout
    * skips the CCK reset, so cca_cck/fa_cck are not comparable to a
    * GetRxEnergy sample and must not be summed with them un-gated).
-   * Jaguar3 overrides with an 8-read + 4-full-dword-write path issued as TWO
-   * batched EP0 groups (the reset writes are composed from two of the reads,
-   * so they cannot ride the same group) — MEASURED
-   * (tests/scout_read_bench.cpp, 8822EU, 2026-09-15) at 12 transfers/call
-   * against 24 for the full GetRxEnergy(false) on the same chip, and at
-   * 603 us median on the RK3566 ground station against 3372 us for the same
-   * path unbatched (5.6x; the x86 bench host shows no batching win at all —
-   * see that file's header before quoting either number). THOSE FIGURES ARE
-   * FLOORS: the bench runs with no RX loop, so nothing was reaping RX URBs on
-   * the libusb context that the scout's own event pump will have to service
-   * under live traffic. The default delegates to the full read so any caller
-   * can use it on any chip. */
+   * Jaguar3 overrides with a two-group batched EP0 path (12 transfers vs 24
+   * for GetRxEnergy(false)); the win is strongly host-dependent and the bench
+   * numbers are floors — see tests/scout_read_bench.cpp before quoting any.
+   * The default delegates to the full read so any caller can use it on any
+   * chip. */
   virtual RxEnergy GetRxEnergyScout() { return GetRxEnergy(false); }
 
   /* Busy-airtime NHM window, split so no call ever sleeps: ArmNhmBusy
    * programs the recipe (first call, or after anything else reprogrammed
    * NHM) and pulses the trigger for a `period_4us` window; ReadNhmBusy
    * returns the finished window, or valid=false if it has not finished.
-   * Arm again for the next window. Defaults: unsupported (false / invalid).
-   * Control-plane threading contract as GetRxEnergy. */
+   * Arm again for the next window. Jaguar3 only; every other generation
+   * returns false / valid=false. Control-plane threading contract as
+   * GetRxEnergy. Caveats (counter resets that silently shorten a window, the
+   * frozen power estimate): src/jaguar3/CLAUDE.md "Busy-airtime NHM". */
   virtual bool ArmNhmBusy(uint16_t period_4us) { (void)period_4us; return false; }
   virtual NhmBusy ReadNhmBusy() { return {}; }
 
-  /* The RF synthesizer's programmed channel (RF18[7:0] on path A, the CENTRAL
-   * channel: the pair centre at 40 MHz), read back from the chip — what the
-   * radio is actually tuned to, independent of any host-side channel state.
-   * -1 = unsupported / read failed. One register read under the control-plane
-   * lock. */
+  /* The RF synthesizer's programmed channel (RF18[7:0], path A only, the
+   * CENTRAL channel: the pair centre at 40 MHz, the block centre at 80 MHz),
+   * read back from the chip — what the radio is actually tuned to,
+   * independent of any host-side channel state. Jaguar3 only; others -1.
+   * -1 = unsupported or not brought up; a failed register read leaves by
+   * exception on USB (house idiom), never as -1. One register read under the
+   * control-plane lock. */
   virtual int ReadTunedCentral() { return -1; }
 
   /* Consolidated windowed RX link-quality snapshot (see RxQuality.h) — the

@@ -308,9 +308,9 @@ inline PhyStsFill parse_phy_sts_jgr3(const uint8_t *physts, uint16_t physts_len,
   a.ldpc = (f7 >> 5) & 1;
   a.stbc = (f7 >> 6) & 1;
   /* RX bandwidth from the active rxsc: legacy OFDM uses l_rxsc, HT/VHT uses
-   * ht_rxsc; rxsc 1-8 = 20, 9-12 = 40, >=13 = 80 MHz (phydm_rxsc_2_bw).
-   * phydm_rxsc_2_bw: RXSC 0 means the packet occupied the receiver's full
-   * configured bandwidth. Legacy OFDM remains 20 MHz; the full-width sentinel
+   * ht_rxsc; per phydm_rxsc_2_bw, rxsc 1-8 = 20, 9-12 = 40, >=13 = 80 MHz,
+   * and RXSC 0 means the packet occupied the receiver's full configured
+   * bandwidth. Legacy OFDM remains 20 MHz; the full-width sentinel
    * matters for HT, where an HT40 packet otherwise gets misreported as 20. */
   const uint8_t l_rxsc = physts[5] & 0x0f, ht_rxsc = (physts[5] >> 4) & 0x0f;
   const uint8_t rxsc = (a.data_rate >= 4 && a.data_rate <= 11) ? l_rxsc : ht_rxsc;

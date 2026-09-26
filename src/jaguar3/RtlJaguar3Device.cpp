@@ -490,6 +490,10 @@ void RtlJaguar3Device::coex_runtime_loop() {
     if (std::chrono::steady_clock::now() < next_tick)
       continue;
     next_tick += period;
+    /* A transient register/USB error must not kill the thread that sustains
+     * 5 GHz TX — log, retry next tick, and give up only after kMaxFailStreak
+     * consecutive failures (a chip that is really gone fails every tick). */
+    std::string fail_what; /* copied: e.what() dies with the exception */
     try {
       std::lock_guard<std::mutex> lk(_reg_mu);
       _hal.coex_run_5g();
@@ -1198,10 +1202,10 @@ RxEnergy RtlJaguar3Device::GetRxEnergy(bool with_nhm) {
   auto set_bb = [this](uint16_t a, uint32_t m, uint32_t v) {
     _device.phy_set_bb_reg(a, m, v);
   };
-  if (with_nhm)
+  if (with_nhm) {
     _nhm_busy_ready = false; /* the IGI-relative / absolute-floor windows below reprogram NHM */
-  if (with_nhm)
     devourer::read_nhm(devourer::nhm_regs_jgr3(), e.igi, rd, set_bb, e);
+  }
 
   /* DEVOURER_RX_NOISE_FLOOR — active/frame-free absolute floor. Jaguar3 has no
    * vendor idle-noise report (phydm_noisemonitor.c dispatches only to
@@ -1242,24 +1246,20 @@ RxEnergy RtlJaguar3Device::GetRxEnergy(bool with_nhm) {
   return e;
 }
 
-/* Minimal frame-free OFDM FA + CCA read for the in-session channel scout
- * (mabur 2026-09-14 spec §6). 12 EP0 transfers in TWO batched groups: 8 reads
+/* Minimal frame-free OFDM FA + CCA read for the in-session channel scout.
+ * 12 EP0 transfers in TWO batched groups: 8 reads
  * (0x2c08, the five OFDM FA words, and 0x1d2c/0x1eb4), then the 4-write OFDM
  * counter reset composed in memory from the two dwords just read — the writes
  * depend on those reads, so they cannot ride the same group. At
- * kAsyncWriteDepth = 8 that is two completion waits (see the follow-up note
- * at that constant).
+ * kAsyncWriteDepth = 8 that is two completion waits.
  * Composed full-dword writes, never phy_set_bb_reg — masked BB writes on JGR3
  * have the double-shift gotcha (jaguar3/CLAUDE.md) and cost a read-modify-
  * write each. Batched: see IRtlTransport::ctrl_batch.
  *
- * The reset dwords are read FRESH every call. An earlier revision cached them
- * behind a primed shadow to save those 2 reads; once the group was batched
- * the saving fell inside run-to-run noise on the ground station (+15 us on a
- * ~590 us call, with per-run ratios spanning both signs), so the cache and
- * its five hand-maintained invalidation points — one of them a firmware
- * branch that cannot be audited from the host at all — were deleted rather
- * than maintained. tests/scout_read_bench.cpp's header carries the numbers.
+ * The two reset dwords are read fresh inside the same batch every call; a
+ * host-side shadow buys nothing measurable once batched
+ * (tests/scout_read_bench.cpp) and would need invalidation on paths the host
+ * cannot see (firmware channel switch).
  *
  * ONE HARDWARE-BEHAVIOUR CHANGE batching introduces, recorded so a future
  * oddity has a documented suspect: pipelining narrows the 0x1eb4[25]
@@ -1283,8 +1283,10 @@ RxEnergy RtlJaguar3Device::GetRxEnergy(bool with_nhm) {
  * unverified — in both GetRxEnergy and PhydmRuntimeJaguar3::fa_stats() the
  * 0x1a2c toggles and the 0x1eb4[25] reset always run together — but that
  * does not affect correctness now that valid_cck makes the caller's
- * obligation explicit. 0x1eb4[25] also clears the NHM counters; the scout
- * never arms an NHM window, so that is moot.
+ * obligation explicit. 0x1eb4[25] also clears the NHM counters (vendor
+ * phydm_reset_bb_hw_cnt: "Reset all counter"), so a scout read inside an
+ * ArmNhmBusy window corrupts that window — read the busy window before the
+ * scout's reset, or re-arm after it.
  *
  * The OFDM FA/CCA delta is shared with PhydmRuntimeJaguar3::fa_stats() (the
  * coex thread's periodic ~2 s tick performs the identical 0x1d2c/0x1eb4
@@ -1322,8 +1324,7 @@ RxEnergy RtlJaguar3Device::GetRxEnergy(bool with_nhm) {
  * throw is pre-existing and is this codebase's house idiom for a dead
  * register bus (every other read path on this chip behaves the same), and
  * fast_retune's batch is all writes so the hop path is unaffected — changing
- * the idiom would be a broad change well outside this work. Noted, not
- * fixed.
+ * the idiom would touch every chip's read path.
  *
  * Under _reg_mu like every register access here. */
 RxEnergy RtlJaguar3Device::GetRxEnergyScout() {
@@ -1355,14 +1356,13 @@ RxEnergy RtlJaguar3Device::GetRxEnergyScout() {
   }
   const devourer::jgr3::ResetDwords r =
       devourer::jgr3::compose_reset(rd[6].value, rd[7].value);
-  /* KNOWN, pre-existing since the batching landed (b4c6e5a) and untouched by
-   * the read-side bail-out above: if THIS batch fails partway, it can leave
+  /* KNOWN, untouched by the read-side bail-out above: if THIS batch fails partway, it can leave
    * 0x1d2c[31] cleared — the RX clock gate off — because the ops that would
    * have restored it were skipped. Unlike the read-side bug that is NOT a
    * latch: the values here are composed from a fresh read each call, so the
    * next successful scout writes d1d2c_on = value | bit31 and the gate comes
    * back. One dwell of deafness, self-healing, versus the permanent corruption
-   * a failed READ would have caused. Recorded, not fixed here. */
+   * a failed READ would have caused. */
   std::vector<devourer::CtrlOp> wr = {
       {true, 0x1d2c, r.d1d2c_off}, {true, 0x1eb4, r.d1eb4_on},
       {true, 0x1eb4, r.d1eb4_off}, {true, 0x1d2c, r.d1d2c_on}};
@@ -1378,8 +1378,9 @@ RxEnergy RtlJaguar3Device::GetRxEnergyScout() {
  * registers the recipe shares bits with, compose full dwords
  * (NhmBusyMath.h), write thresholds + cfg + period, pulse the trigger --
  * one read batch, one write batch. Later calls: period + trigger pulse
- * only, composed from the cached dwords (nothing else writes them while
- * the cache is live; see the invalidations in GetRxEnergy/SetMonitorChannel/
+ * only, composed from the cached dwords. The cache is valid only while this
+ * file is the sole writer of 0x1e40/0x1e60; every other CCX arm path must
+ * clear _nhm_busy_ready (GetRxEnergy(with_nhm), SetMonitorChannel, Init,
  * InitWrite). A failed read never composes a write (scout-read rule). */
 bool RtlJaguar3Device::ArmNhmBusy(uint16_t period_4us) {
   std::lock_guard<std::mutex> lk(_reg_mu);

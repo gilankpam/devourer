@@ -78,7 +78,8 @@ inline void nhm_abs_thresholds(uint8_t th[11]) {
  * permanently, reporting a FROZEN power estimate — one constant value, so
  * 241..255 of the 255 samples land in a single 3 dB bucket (a fixed −85 dBm,
  * 7-10 dB above the passive floor) — whereas a live noise estimate always
- * spreads over neighbouring buckets (max bucket <= 220 observed). See
+ * spreads over neighbouring buckets (max bucket <= 220 observed on two
+ * 8812EU units — a thin 21-sample margin to the frozen 241). See
  * docs/rx-spectrum-sensing.md. The idle-time guard is inert on Jaguar3,
  * which reports the full window as duration. */
 constexpr int kNhmFrozenBucket = 236;

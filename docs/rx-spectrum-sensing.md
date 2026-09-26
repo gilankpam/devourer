@@ -76,7 +76,7 @@ Two noise floors are exposed on `GetRxQuality()`:
     bucket width (3 dB below −80, 5 dB above). phydm's own 11k table bottoms
     out at −92 dBm, which would clip a real 20 MHz floor — hence the lower
     devourer table (phydm's NHM_DBG 1-dB mode shows the thresholds are free).
-    **On-air 2026-09-13, two 8812EU on a ground station, ch36/44/100/136/149:**
+    **On-air, two 8812EU units, ch36/44/100/136/149:**
     −95…−96 dBm on both cards on every 5 GHz channel, flat for 60 s once
     settled, and within 1 dB card-to-card; the passive floor where frames
     existed (ch36, −87…−92) sits within 4…9 dB. The adversarial half: for the

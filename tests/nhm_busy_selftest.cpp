@@ -19,8 +19,10 @@ static int fails = 0;
 
 int main() {
   using namespace devourer::jgr3;
+  CHECK(kNhmBusyCfg == 0x3); /* ccx_en|inc_cca, inc_tx off */
   const uint8_t th[11] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11};
-  // Neighbour bits set everywhere so a composer that zeroes them fails.
+  // Neighbour bits set outside the fields (the q vector below covers the
+  // fields starting set) so a composer that zeroes them fails.
   const uint32_t c40 = 0x0000abcd, c5c = 0xff00ffff, c60 = 0x0000f0fd;
   const NhmProgram p = compose_nhm_program(c40, c5c, c60, th, kNhmBusyCfg, 0x1234);
   CHECK(p.w1e40 == 0x1234abcdu);                 // period [31:16], low half kept
@@ -28,7 +30,7 @@ int main() {
   CHECK(p.w1e48 == 0x08070605u);                 // th4..7
   CHECK(p.w1e5c == 0xff09ffffu);                 // th8 in [23:16], rest kept
   // ctrl: th10<<24 | th9<<16 | cfg<<8 | low bits kept except trigger [1] and [11:8]
-  CHECK(p.w1e60 == ((11u << 24) | (10u << 16) | (0x3u << 8) | (c60 & 0xf0fdu & ~0x2u)));
+  CHECK(p.w1e60 == ((11u << 24) | (10u << 16) | (0x3u << 8) | (c60 & 0xf0fdu)));
   CHECK((p.w1e60 & 0x2u) == 0);                  // trigger left low by the program
   CHECK(nhm_with_period(0x1234abcd, 0xffff) == 0xffffabcdu);
   CHECK(nhm_trigger_low(0xffffffff) == 0xfffffffdu);

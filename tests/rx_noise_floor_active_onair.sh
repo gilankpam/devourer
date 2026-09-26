@@ -20,7 +20,8 @@
 #     wedge-free by nature; 3 dB bucket resolution near the floor. The BB
 #     reports a frozen (single-bucket) estimate for the first seconds and on
 #     2.4 GHz, rejected as null; use a 5 GHz channel and a run long enough
-#     to settle (DUR >= 10 s). Validated 2026-09-13: -95/-96 dBm, two cards.
+#     to settle (DUR >= 10 s). On-air: -95/-96 dBm on 5 GHz, two 8812EU units
+#     (see docs/rx-spectrum-sensing.md for the frozen-estimate caveat).
 #
 # Two checks (a monotonic-vs-injected-noise sweep is NOT included: the bench B210
 # is too weakly coupled to the RTL front ends to move the floor above the

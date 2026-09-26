@@ -192,13 +192,16 @@ public:
    * writes are composed from two of the reads, so they cannot share a
    * group; at kAsyncWriteDepth = 8 that is two completion waits). The two
    * reset dwords (0x1d2c/0x1eb4) are read fresh inside the same batch every
-   * call: an earlier revision cached them behind a primed shadow, but once
-   * the group was batched the two reads it saved were inside run-to-run
-   * noise, so the cache and its five invalidation points were deleted. Fills
-   * only valid_fa/fa_ofdm/cca_ofdm; see ScoutEnergyMath.h and the .cpp doc
+   * call; a host-side shadow buys nothing measurable once batched
+   * (tests/scout_read_bench.cpp) and would need invalidation on paths the
+   * host cannot see (firmware channel switch). Fills only
+   * valid_fa/fa_ofdm/cca_ofdm; see ScoutEnergyMath.h and the .cpp doc
    * comment. */
   RxEnergy GetRxEnergyScout() override;
 
+  /* Busy-airtime NHM window and RF18 channel readback — contracts on
+   * IRtlDevice, caveats (counter-reset collisions, frozen estimate, recipe
+   * cache invalidation) in jaguar3/CLAUDE.md "Busy-airtime NHM". */
   bool ArmNhmBusy(uint16_t period_4us) override;
   NhmBusy ReadNhmBusy() override;
   int ReadTunedCentral() override;
@@ -255,7 +258,7 @@ public:
 
 private:
   /* Maps ChannelWidth_t to the devourer RX bw code (0/1/2 = 20/40/80 MHz),
-   * for _rx_bw_code above. Explicit switch rather than a cast: the enum's
+   * for _rx_bw_code below. Explicit switch rather than a cast: the enum's
    * numeric values happen to line up today (CHANNEL_WIDTH_20/40/80 = 0/1/2)
    * but that is not a contract this code should rely on, and the narrowband
    * 5/10 MHz widths have no RX-bw-code equivalent (fold to 20). */
@@ -294,7 +297,7 @@ private:
   SelectedChannel _channel{};
   /* Mirrors _channel.ChannelWidth as a devourer bw code (0/1/2 = 20/40/80 MHz)
    * so the RX completion handler can read the currently-tuned width without
-   * taking _reg_mu — same relaxed-atomic-mirror pattern as _txpkt_img above.
+   * taking _reg_mu — same relaxed-atomic-mirror pattern as _txpkt_img below.
    * parse_phy_sts_jgr3 needs it on every frame to resolve rxsc 0 ("full
    * configured bandwidth", phydm_rxsc_2_bw) to an actual width. Written
    * wherever _channel.ChannelWidth is set (Init, InitWrite, SetMonitorChannel,

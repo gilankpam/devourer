@@ -586,12 +586,14 @@ target_link_libraries(reglat PUBLIC devourer PRIVATE PkgConfig::libusb)
 
 # scout_read_bench — USB transfer-count + latency bench for
 # IRtlDevice::GetRxEnergyScout() vs the full GetRxEnergy(false) (Jaguar3
-# channel-scout, mabur 2026-09-14 spec §6). Needs a live Jaguar3 card and an
+# channel-scout read). Needs a live Jaguar3 card and an
 # InitWrite bring-up, so it uses DeviceSession/WiFiDriver like the doctor
 # demo, not reglat's bare RtlAdapter path — see its header.
-add_executable(scout_read_bench tests/scout_read_bench.cpp)
-target_include_directories(scout_read_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/examples/common)
-target_link_libraries(scout_read_bench PUBLIC devourer PRIVATE PkgConfig::libusb)
+if(DEVOURER_JAGUAR3)
+    add_executable(scout_read_bench tests/scout_read_bench.cpp)
+    target_include_directories(scout_read_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/examples/common)
+    target_link_libraries(scout_read_bench PUBLIC devourer PRIVATE PkgConfig::libusb)
+endif()
 
 add_executable(rxdemo
     examples/rx/main.cpp
@@ -820,8 +822,10 @@ target_link_libraries(ReceiptSelftest PRIVATE devourer)
 add_test(NAME receipt_roundtrip COMMAND ReceiptSelftest)
 
 # Headless guard for the active idle-noise-floor math (src/NoiseFloorMath.h): the
-# phydm sign/pwdb helpers the Jaguar1 0x0FA0 debug-port measurement uses. Pure
-# math, header-only.
+# phydm sign/pwdb helpers the Jaguar1 0x0FA0 debug-port measurement uses, and
+# the Jaguar3 NHM absolute floor (nf::nhm_abs_floor_dbm incl. the frozen-
+# estimate guard) with the read_nhm/read_nhm_absolute recipe against a fake BB
+# (the th[8..10] double-shift regression). Pure math, header-only.
 add_executable(NoiseFloorMathSelftest tests/noise_floor_math_selftest.cpp)
 target_include_directories(NoiseFloorMathSelftest PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -1037,15 +1041,11 @@ add_executable(NhmBusySelftest tests/nhm_busy_selftest.cpp)
 target_link_libraries(NhmBusySelftest PRIVATE devourer)
 add_test(NAME nhm_busy_math COMMAND NhmBusySelftest)
 
-# Headless guard for the batched-EP0 CONTRACT (IRtlTransport::ctrl_batch):
-# submission order, each read's value landing in its OWN op, failure reported
-# without aborting the rest of the batch. Pinned against a fake transport, so
-# it exercises the SYNCHRONOUS DEFAULT ONLY — it includes RtlTransport.h and
-# never reaches UsbTransport. The USB implementation has no headless guard;
-# its check is on-hardware, via tests/scout_read_bench.cpp's
-# counter-plausibility tripwire.
+# Headless guard for the IRtlTransport::ctrl_batch contract against a fake
+# transport (synchronous default only).
 add_executable(CtrlBatchSelftest tests/ctrl_batch_selftest.cpp)
-target_link_libraries(CtrlBatchSelftest PRIVATE devourer)
+target_include_directories(CtrlBatchSelftest PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src)
 add_test(NAME ctrl_batch_semantics COMMAND CtrlBatchSelftest)
 
 # Headless guard for the ONE silent-corruption path on the batched scout read:
@@ -1053,9 +1053,11 @@ add_test(NAME ctrl_batch_semantics COMMAND CtrlBatchSelftest)
 # read. Unlike ctrl_batch_semantics this drives the real RtlJaguar3Device over
 # a fake transport, because the bug is at that level and has no observable
 # symptom short of a permanently deaf receiver.
-add_executable(ScoutBatchFailSelftest tests/scout_batch_fail_selftest.cpp)
-target_link_libraries(ScoutBatchFailSelftest PRIVATE devourer)
-add_test(NAME scout_batch_fail COMMAND ScoutBatchFailSelftest)
+if(DEVOURER_JAGUAR3)
+    add_executable(ScoutBatchFailSelftest tests/scout_batch_fail_selftest.cpp)
+    target_link_libraries(ScoutBatchFailSelftest PRIVATE devourer)
+    add_test(NAME scout_batch_fail COMMAND ScoutBatchFailSelftest)
+endif()
 
 # Headless guard for the adapter-health classifier + EFUSE-stability probe
 # loop (src/AdapterHealth.h) — the verdict mapping behind examples/doctor,
@@ -1097,6 +1099,8 @@ target_link_libraries(AdapterCapsSelftest PRIVATE devourer)
 
 add_test(NAME adapter_caps_derive COMMAND AdapterCapsSelftest)
 
+# Headless guard for the pre-open device probe (src/DeviceProbe.h): its
+# id dispatch must stay in step with WiFiDriver::CreateRtlDevice.
 add_executable(DeviceProbeSelftest
     tests/device_probe_selftest.cpp
 )
