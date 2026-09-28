@@ -162,9 +162,9 @@ public:
    * (USB: bulk completion; PCIe: hardware read-pointer / BCN kick). Returns
    * bytes submitted or a negative error. */
   virtual int tx_sync(uint8_t ep, uint8_t *buf, size_t len, int timeout_ms) = 0;
-  /* tx_sync for a DATA frame (never firmware download or a reserved-page
-   * write): the one bulk-OUT a transport may send with a relaxed timeout
-   * policy (USB: DeviceConfig::Tx::no_cancel_multipkt). Default: tx_sync. */
+  /* tx_sync for a DATA frame — the send path DeviceConfig::Tx::
+   * no_cancel_multipkt applies to (UsbTransport overrides it; firmware
+   * download and reserved-page writes stay on tx_sync). Default: tx_sync. */
   virtual int tx_sync_data(uint8_t ep, uint8_t *buf, size_t len,
                            int timeout_ms) {
     return tx_sync(ep, buf, len, timeout_ms);

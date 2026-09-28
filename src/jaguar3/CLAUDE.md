@@ -47,30 +47,76 @@ narrowband dividers, RF18 encoding), strategy interfaces `Jaguar3Calibration`
   trigger unidentified. Beware the masked BB write shifts the value to the
   mask: the NHM th[8..10] writes were
   double-shifted (read back 0) until the selftest pinned them.
+- **PROTOCOL_EN must be set before the LLT init.** halmac writes
+  `MAC_TRX_ENABLE = 0xFF` to `REG_CR` just before the auto-LLT init; this port
+  wrote the DMA-only `0x0F`. Without PROTOCOL_EN (bit 4) at that moment the
+  TX page allocator never terminates the data ring at `rsvd_boundary`: a
+  sustained load runs into the reserved region and overwrites the beacon
+  page, and the next TBTT latches `TXDMA_STATUS` `BIT_TXPKTBUF_REQ_ERR` - TX
+  dead for the life of the process. Bisected on an 8812CU: `0x1F` (DMA +
+  PROTOCOL) clean; `0x2F` (+SCHEDULE) and `0xCF` (+MACTX/MACRX) fault. The
+  later full-CR write (`0x06FF`) is too late. The code uses the vendor's full
+  `0xFF`; the 8822E was fixed with it (its `0x0F` control faulted at 172
+  frames, `0xFF` ran 4000/4000) and not bisected. With it the hardware
+  writes `LLT[rsvd_boundary - 1] = 0` itself by the end of a run past one
+  traversal; the LLT reads `0x792` at init either way (8822C and 8822E, and
+  the vendor driver's chip too), so an init-time LLT read proves nothing -
+  inject past a wrap with a beacon armed (the `txdemo`
+  `DEVOURER_TX_BEACON_TU` command in `docs/jaguar3-tx-ring.md` - it needs
+  data-sized frames and the RX thread) and read it after
+  (`IRtlRadio::ReadPacketBuffer`, sel 1). Found by diffing the vendor's
+  usbmon register writes against ours from the TRX enable to the LLT init:
+  `REG_CR` was the one difference. Plain injection never showed it - no
+  beacon engine reads the page. `GENERAL_INFO`/`PHYDM_INFO` H2C packets were
+  ruled out as the mechanism (sent byte-exact, consumed by the firmware, no
+  effect on the LLT).
+  Record: `docs/jaguar3-tx-ring.md`.
+- **Data frames leave the HIGH queue.** The QSEL order, the queue ->
+  endpoint map and its endpoint-count rule are `TxQueueMap.h`'s contract;
+  the send-path split and the `DEVOURER_TX_EP` override are
+  `RtlJaguar3Device.h`'s (`peek_tx_qsel`, `tx_ep_for_qsel`); which frames
+  A-MPDU applies to is `src/AmpduMode.h`'s. Measured, on an 8812CU (bulk-OUT
+  HIGH 0x05, NORMAL 0x06, LOW 0x08): QSEL and endpoint must agree - moving
+  QSEL alone changed nothing (HIGH still drained 64 -> 0); the endpoint alone
+  was not run (a reviewer predicted `TXDMA_STATUS`'s `EP_QSEL_DIFF` bit).
+  2026-09-27: `DEVOURER_TX_EP=0x06` put every send on EP 6 with 0 failed; the
+  aggregated path (`DEVOURER_TX_BATCH=4` + `DEVOURER_TX_USB_AGG=4`) and
+  A-MPDU over QoS data ran with 0 failed. Unmeasured: 1-, 2- and 4-endpoint
+  parts.
 
 ## Bring-up cost and the pipelined register writes
 
-`InitWrite` is ~14k USB control transfers and nothing else (stage timing:
-`InitTimer` events `j3hal.*` / `j3init.*`, each carrying both `ms` and the
-`xfers` it spent; `bench_init.py` parses these events but reports only `ms`).
-Synchronous, a transfer costs 76–80 µs on an embedded host (ssc338q) and
-~27 µs pipelined 8-deep — EP0 completes URBs
-in submission order, so `UsbTransport` queues writes asynchronously inside
-a `write_batch_begin/end` scope and only reads (submitted behind the queue,
-waited on their own completion), bulk transfers and `flush_writes` wait.
-`InitWrite` runs its whole bring-up in one batch (RAII scope, ended before
-the coex thread starts): 1.30 → 0.65 s warm, 2.04 → ~0.7 s cold, one
-unit. **`Init` (RX-only) opens no batch yet** — its cost is not measured.
-`write_batch_begin/end` batches are single-threaded by contract (that is the
-bring-up scope only — the runtime `ctrl_batch` path below is a different,
-explicitly cross-thread animal). The ms-scale settle delays
-(`write_bb` 0xfc–0xfe, `rf_writer` 0xffe, `Halrf8822e::delay_ms`, the efuse
-power-cut) flush first.
+`InitWrite` is ~14k USB register transfers and nothing else. The stage
+timing shows it: `init.timing` events under the `j3hal.*` (HAL bring-up)
+and `j3init.*` (`InitWrite`) scopes, field schema in `src/InitTimer.h` /
+`docs/logging.md`; `bench_init.py` parses them but reports only `ms`. The
+batching contract itself — ordering, what waits, single-threadedness,
+failure propagation — is documented once, at `ITransport::write_batch_begin`
+(`src/Transport.h`) and in `UsbTransport`; this file carries only how
+Jaguar3 uses it:
+
+- `InitWrite` runs its whole bring-up inside one `WriteBatchScope`
+  (`RtlJaguar3Device.cpp`), ended before the coex thread starts because that
+  thread shares the transport. A queued write that completed failed or
+  short fails the batch close, and `InitWrite` throws there rather than
+  start the coex thread over an incompletely programmed chip. `Init`
+  (RX-only) opens no batch yet — not measured on a ground-station card.
+- Every settle delay drains the queue first, µs ones included, on both
+  dies: the `write_bb` / `rf_writer` table delay markers, `delay_us` and
+  `delay_ms` on `Halrf8822c` and `Halrf8822e`, the efuse power-cut. A settle
+  that sleeps while its writes are still queued is no settle; the drain is
+  free on an empty queue and bounded by its depth otherwise.
+- Measured: 1.30 → 0.65 s warm, 2.04 → ~0.7 s cold on one drone-side
+  8812EU (ssc338q host). The transfer-count reduction is deterministic; the
+  wall-clock figure is one unit, one host.
 
 The RF radio-table load is write-only: bits [31:20] of the direct window
-(`0x3c00`/`0x4c00 + addr*4`) read back 0 for all 1540 entries, cold and
-warm (one 8812EU unit), so the vendor's `MASK20BITS` read-modify-write
-preserved nothing at the price of a synchronous read per entry.
+(`0x3c00`/`0x4c00 + addr*4`) are not storage, so the vendor's `MASK20BITS`
+read-modify-write preserved nothing at the price of a synchronous read per
+entry. Scope of that claim (`tests/j3_rf_window_readback.sh`): every one of
+the 512 window words (both paths) poked with the high 12 bits set read back
+0, on one 8812CU and one 8812EU; the post-bring-up histogram (all 512 words
+0) is only a control, since the write-only load itself clears those bits.
 
 ## Runtime batched EP0 (`ctrl_batch`) — the scout read and the cached hop
 
@@ -111,40 +157,6 @@ than fixed here: `tx_async`/`tx_sync` open with `flush_writes()`, so a send
 landing mid-group blocks on it; and an RX `on_data` callback can be reaped on the batching thread, so nothing reachable
 from it may take `_reg_mu` (`cfo_tick()` does — latent only because
 `DEVOURER_CFO_TRACK` defaults off).
-
-## Bring-up cost and the pipelined register writes
-
-`InitWrite` is ~14k USB register transfers and nothing else. The stage
-timing shows it: `init.timing` events under the `j3hal.*` (HAL bring-up)
-and `j3init.*` (`InitWrite`) scopes, field schema in `src/InitTimer.h` /
-`docs/logging.md`; `bench_init.py` parses them but reports only `ms`. The
-batching contract itself — ordering, what waits, single-threadedness,
-failure propagation — is documented once, at `ITransport::write_batch_begin`
-(`src/Transport.h`) and in `UsbTransport`; this file carries only how
-Jaguar3 uses it:
-
-- `InitWrite` runs its whole bring-up inside one `WriteBatchScope`
-  (`RtlJaguar3Device.cpp`), ended before the coex thread starts because that
-  thread shares the transport. A queued write that completed failed or
-  short fails the batch close, and `InitWrite` throws there rather than
-  start the coex thread over an incompletely programmed chip. `Init`
-  (RX-only) opens no batch yet — not measured on a ground-station card.
-- Every settle delay drains the queue first, µs ones included, on both
-  dies: the `write_bb` / `rf_writer` table delay markers, `delay_us` and
-  `delay_ms` on `Halrf8822c` and `Halrf8822e`, the efuse power-cut. A settle
-  that sleeps while its writes are still queued is no settle; the drain is
-  free on an empty queue and bounded by its depth otherwise.
-- Measured: 1.30 → 0.65 s warm, 2.04 → ~0.7 s cold on one drone-side
-  8812EU (ssc338q host). The transfer-count reduction is deterministic; the
-  wall-clock figure is one unit, one host.
-
-The RF radio-table load is write-only: bits [31:20] of the direct window
-(`0x3c00`/`0x4c00 + addr*4`) are not storage, so the vendor's `MASK20BITS`
-read-modify-write preserved nothing at the price of a synchronous read per
-entry. Scope of that claim (`tests/j3_rf_window_readback.sh`): every one of
-the 512 window words (both paths) poked with the high 12 bits set read back
-0, on one 8812CU and one 8812EU; the post-bring-up histogram (all 512 words
-0) is only a control, since the write-only load itself clears those bits.
 
 ## TX power
 

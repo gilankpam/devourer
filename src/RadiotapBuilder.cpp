@@ -24,13 +24,6 @@ constexpr uint32_t kPresentHe       = 1u << 23;
 
 constexpr uint16_t kTxFlagsNoAck = 0x0008;
 
-/* TX_FLAGS: always NoAck (broadcast injection), plus the devourer-private
- * no-aggregation bit when the mode asks for it. */
-uint16_t tx_flags(const TxMode& cfg) {
-  return static_cast<uint16_t>(kTxFlagsNoAck |
-                               (cfg.no_agg ? kRadiotapTxFlagNoAgg : 0));
-}
-
 void emit_u8(std::vector<uint8_t>& v, uint8_t x) { v.push_back(x); }
 void emit_u16_le(std::vector<uint8_t>& v, uint16_t x) {
   v.push_back(static_cast<uint8_t>(x & 0xFF));
@@ -43,7 +36,7 @@ void emit_u32_le(std::vector<uint8_t>& v, uint32_t x) {
   v.push_back(static_cast<uint8_t>((x >> 24) & 0xFF));
 }
 
-std::vector<uint8_t> build_legacy(const TxMode& cfg) {
+std::vector<uint8_t> build_legacy(const TxMode& cfg, uint16_t tx_flags) {
   /* 13-byte legacy-OFDM radiotap. Byte 8 (RATE) carried from cfg; length stays
    * 13 so send_packet's vht-detection heuristic keeps this on the legacy path. */
   std::vector<uint8_t> r;
@@ -54,12 +47,12 @@ std::vector<uint8_t> build_legacy(const TxMode& cfg) {
   emit_u32_le(r, kPresentRate | kPresentTxFlags);         /* it_present */
   emit_u8(r, cfg.legacy_rate_500kbps);                    /* RATE */
   emit_u8(r, 0);                                          /* pad (TX_FLAGS u16 align) */
-  emit_u16_le(r, tx_flags(cfg));                          /* TX_FLAGS */
+  emit_u16_le(r, tx_flags);                               /* TX_FLAGS */
   emit_u8(r, 0);                                          /* trailing pad to 13 */
   return r;
 }
 
-std::vector<uint8_t> build_ht(const TxMode& cfg) {
+std::vector<uint8_t> build_ht(const TxMode& cfg, uint16_t tx_flags) {
   /* 13-byte HT radiotap: presence = TX_FLAGS | MCS, no RATE field. Length stays
    * 13 so send_packet keeps rate_id=8 (HT, not VHT).
    *
@@ -84,14 +77,14 @@ std::vector<uint8_t> build_ht(const TxMode& cfg) {
   emit_u8(r, 0);
   emit_u16_le(r, 13);
   emit_u32_le(r, kPresentTxFlags | kPresentMcs);
-  emit_u16_le(r, tx_flags(cfg));
+  emit_u16_le(r, tx_flags);
   emit_u8(r, known);
   emit_u8(r, flags);
   emit_u8(r, cfg.ht_mcs <= 31 ? cfg.ht_mcs : 0);
   return r;
 }
 
-std::vector<uint8_t> build_vht(const TxMode& cfg) {
+std::vector<uint8_t> build_vht(const TxMode& cfg, uint16_t tx_flags) {
   /* 22-byte VHT radiotap: header(8) + TX_FLAGS(2) + VHT info(12). Length > 13
    * triggers send_packet's vht=true branch (rate_id=9). */
   uint8_t bw_code;
@@ -116,7 +109,7 @@ std::vector<uint8_t> build_vht(const TxMode& cfg) {
   emit_u8(r, 0);
   emit_u16_le(r, 22);
   emit_u32_le(r, kPresentTxFlags | kPresentVht);
-  emit_u16_le(r, tx_flags(cfg));
+  emit_u16_le(r, tx_flags);
   emit_u16_le(r, known);
   emit_u8(r, vht_flags);
   emit_u8(r, bw_code);
@@ -145,7 +138,7 @@ void he_giltf_to_radiotap(uint8_t gi_ltf, uint8_t* gi, uint8_t* ltf) {
   }
 }
 
-std::vector<uint8_t> build_he(const TxMode& cfg) {
+std::vector<uint8_t> build_he(const TxMode& cfg, uint16_t tx_flags) {
   /* 22-byte HE radiotap: header(8) + TX_FLAGS(2) + HE info(12, data1..data6).
    * The Kestrel send_packet HE parser reads MCS/coding/STBC (data3), BW+GI+LTF
    * (data5) and NSTS (data6) and maps them to the AX descriptor rate. */
@@ -191,7 +184,7 @@ std::vector<uint8_t> build_he(const TxMode& cfg) {
   emit_u8(r, 0);
   emit_u16_le(r, 22);
   emit_u32_le(r, kPresentTxFlags | kPresentHe);
-  emit_u16_le(r, tx_flags(cfg));
+  emit_u16_le(r, tx_flags);
   emit_u16_le(r, data1);
   emit_u16_le(r, data2);
   emit_u16_le(r, data3);
@@ -300,12 +293,20 @@ bool parse_rate_token(const std::string& s, TxMode* cfg) {
 }  // namespace
 
 std::vector<uint8_t> build_stream_radiotap(const TxMode& cfg) {
+  return build_stream_radiotap(cfg, /*no_ack=*/true);
+}
+
+std::vector<uint8_t> build_stream_radiotap(const TxMode& cfg, bool no_ack) {
+  /* NoAck unless the caller wants an ACK, plus the devourer-private
+   * no-aggregation bit when the mode asks for it. */
+  const uint16_t tx_flags = static_cast<uint16_t>(
+      (no_ack ? kTxFlagsNoAck : 0) | (cfg.no_agg ? kRadiotapTxFlagNoAgg : 0));
   switch (cfg.mode) {
-    case TxMode::Mode::HT:  return build_ht(cfg);
-    case TxMode::Mode::VHT: return build_vht(cfg);
-    case TxMode::Mode::HE:  return build_he(cfg);
+    case TxMode::Mode::HT:  return build_ht(cfg, tx_flags);
+    case TxMode::Mode::VHT: return build_vht(cfg, tx_flags);
+    case TxMode::Mode::HE:  return build_he(cfg, tx_flags);
     case TxMode::Mode::Legacy:
-    default:                return build_legacy(cfg);
+    default:                return build_legacy(cfg, tx_flags);
   }
 }
 

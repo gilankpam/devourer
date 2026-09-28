@@ -317,9 +317,9 @@ UsbTransport::UsbTransport(libusb_device_handle *dev_handle, Logger_t logger,
                            bool rx_zerocopy, RxMode rx_mode, int pool_spare,
                            int ring_ms, PoolExhaust pool_exhaust,
                            bool ctrl_batch_enabled, bool tx_no_cancel_multipkt)
-    : _dev_handle{dev_handle}, _ctx{ctx}, _logger{std::move(logger)},
-      _cfg_ctrl_batch{ctrl_batch_enabled},
-      _tx_no_cancel_multipkt{tx_no_cancel_multipkt},
+    : _cfg_ctrl_batch{ctrl_batch_enabled},
+      _tx_no_cancel_multipkt{tx_no_cancel_multipkt}, _dev_handle{dev_handle},
+      _ctx{ctx}, _logger{std::move(logger)},
       _rx_zerocopy{rx_zerocopy}, _rx_mode{rx_mode}, _pool_spare{pool_spare},
       _ring_ms{ring_ms}, _pool_exhaust{pool_exhaust},
       _usb_lock{std::move(usb_lock)} {

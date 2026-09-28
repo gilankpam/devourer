@@ -6,7 +6,8 @@ facts live in nested `CLAUDE.md` files, auto-loaded when working there:
 `src/{jaguar1,jaguar2,jaguar3,kestrel,rtl8733b}/` for per-generation registers,
 descriptors and per-chip mechanisms; `src/hopset/` for keyed FHSS and the
 adaptive hopset; `src/chanmig/` for channel migration; `src/sensing/` for the
-device-touching survey executor. Add new facts to the
+device-touching survey executor; `src/sta/` for the device-free 802.11
+station core. Add new facts to the
 narrowest file that covers them.
 
 Two standing rules for this file: never duplicate what a header already
@@ -269,6 +270,10 @@ those are the ones listed below.
   unbounded). Exits through the ordinary `Stop()` path once N frames have been
   submitted, so first-light and regression captures get a clean teardown
   instead of a killed timed flood.
+- `DEVOURER_TX_BEACON_TU=N` — txdemo arms a hardware TBTT beacon at N TU
+  before injecting, on Jaguar2/3 only (unset/`0` = off); contract at its
+  comment in
+  `examples/tx/main.cpp`, reproducer use in `docs/jaguar3-tx-ring.md`.
 - `DEVOURER_USB_DEBUG=1` — libusb DEBUG log level (~7 MB / 15 s, has filled
   `/tmp` mid-capture; adds 0.5–0.8 s to init).
 - `DEVOURER_THERMAL_POLL_MS=N` — emit `thermal` events from the RF 0x42 meter,
