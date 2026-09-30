@@ -297,8 +297,6 @@ std::vector<uint8_t> build_stream_radiotap(const TxMode& cfg) {
 }
 
 std::vector<uint8_t> build_stream_radiotap(const TxMode& cfg, bool no_ack) {
-  /* NoAck unless the caller wants an ACK, plus the devourer-private
-   * no-aggregation bit when the mode asks for it. */
   const uint16_t tx_flags = static_cast<uint16_t>(
       (no_ack ? kTxFlagsNoAck : 0) | (cfg.no_agg ? kRadiotapTxFlagNoAgg : 0));
   switch (cfg.mode) {
@@ -319,7 +317,7 @@ TxMode parse_tx_mode_str(const std::string& spec) {
   const std::string s = to_upper_stripped(spec.c_str());
 
   /* Split on '/': first token = rate, rest = bandwidth (numeric) or modifier
-   * flags (SGI / LDPC / STBC). */
+   * flags (SGI / LDPC / STBC / NOAGG). */
   std::vector<std::string> tokens;
   size_t start = 0;
   while (start <= s.size()) {
@@ -344,6 +342,7 @@ TxMode parse_tx_mode_str(const std::string& spec) {
     if (t == "SGI")       cfg.sgi = true;
     else if (t == "LDPC") cfg.ldpc = true;
     else if (t == "STBC") cfg.stbc = true;
+    else if (t == "NOAGG") cfg.no_agg = true;
     else if (t == "ER" || t == "ER106" || t == "DCM") {
       /* HE ER SU / DCM are 802.11ax-only modifiers (Kestrel). */
       if (cfg.mode != TxMode::Mode::HE) {

@@ -76,10 +76,11 @@ constexpr size_t RXDESC_SIZE_8822C = 24; /* RX_DESC_SIZE_88XX */
  * to aggregate co-queued same-RA/TID frames into an A-MPDU (spike knobs
  * DEVOURER_TX_AMPDU / DEVOURER_TX_QSEL; see DeviceConfig debug section). */
 #define SET_TX_DESC_AGG_EN_8822C(d, v)        SET_BITS_TO_LE_4BYTE((d) + 0x08, 12, 1, v)
-/* BK (halmac SET_TX_DESC_BK, dword2[16]): break — this frame is not merged
- * into an A-MPDU with its queue neighbours. The vendor rtl8822eu xmit path
- * writes AGG_EN=0 + BK=1 for frames that must air alone (EAPOL/ARP/DHCP);
- * devourer does the same for a TxMode::no_agg frame (RadiotapTxFlags.h). */
+/* BK (halmac SET_TX_DESC_BK, dword2[16]): break - the MAC does not merge this
+ * frame into an A-MPDU with its queue neighbours. The vendor rtl8822eu xmit
+ * path writes AGG_EN=0 + BK=1 for every data frame it does not aggregate
+ * (EAPOL/ARP/DHCP included); devourer does the same for a TxMode::no_agg
+ * frame (RadiotapTxFlags.h). */
 #define SET_TX_DESC_BK_8822C(d, v)            SET_BITS_TO_LE_4BYTE((d) + 0x08, 16, 1, v)
 #define SET_TX_DESC_MAX_AGG_NUM_8822C(d, v)   SET_BITS_TO_LE_4BYTE((d) + 0x0C, 17, 5, v)
 #define SET_TX_DESC_AMPDU_DENSITY_8822C(d, v) SET_BITS_TO_LE_4BYTE((d) + 0x08, 20, 3, v)
@@ -308,9 +309,9 @@ inline PhyStsFill parse_phy_sts_jgr3(const uint8_t *physts, uint16_t physts_len,
   a.ldpc = (f7 >> 5) & 1;
   a.stbc = (f7 >> 6) & 1;
   /* RX bandwidth from the active rxsc: legacy OFDM uses l_rxsc, HT/VHT uses
-   * ht_rxsc; per phydm_rxsc_2_bw, rxsc 1-8 = 20, 9-12 = 40, >=13 = 80 MHz,
-   * and RXSC 0 means the packet occupied the receiver's full configured
-   * bandwidth. Legacy OFDM remains 20 MHz; the full-width sentinel
+   * ht_rxsc; rxsc 1-8 = 20, 9-12 = 40, >=13 = 80 MHz (phydm_rxsc_2_bw).
+   * phydm_rxsc_2_bw: RXSC 0 means the packet occupied the receiver's full
+   * configured bandwidth. Legacy OFDM remains 20 MHz; the full-width sentinel
    * matters for HT, where an HT40 packet otherwise gets misreported as 20. */
   const uint8_t l_rxsc = physts[5] & 0x0f, ht_rxsc = (physts[5] >> 4) & 0x0f;
   const uint8_t rxsc = (a.data_rate >= 4 && a.data_rate <= 11) ? l_rxsc : ht_rxsc;

@@ -2058,6 +2058,8 @@ devourer::AdapterCaps RtlJaguar3Device::GetAdapterCaps() {
    * measured — responder matrix + retry-knob A/B + the arq_e2e ledgers. */
   c.ack_responder_ok = true;
   c.tx_retry_limit_ok = true;
+  /* TxMode::no_agg: AGG_EN=0 + BK=1 in build_tx_block. */
+  c.tx_no_agg_ok = true;
   /* Per-packet TX power: the TXPWR_OFSET_TYPE bank selector + programmable
    * 0x1e70 offset banks (SetTxPacketPowerOffsetQdb / radiotap DBM_TX_POWER;
    * TxPktPwrBanks.h). Continuous in step_qdb units, ±63/-64 index travel, 2
@@ -2820,6 +2822,7 @@ size_t RtlJaguar3Device::build_tx_block(const uint8_t *packet, size_t length,
     ldpc = tp.ldpc ? 1 : 0;
     stbc = tp.stbc ? 1 : 0;
     bwidth = static_cast<ChannelWidth_t>(tp.bwidth);
+    no_agg = no_agg || _tx_mode_default->no_agg;
   }
 
   /* DEVOURER_TX_NDPA=N — beamforming-sounding probe: mark injected frames as
