@@ -32,15 +32,18 @@ option(DEVOURER_8733B         "RTL8731BU / RTL8733BU USB support"               
 # src/kestrel/CLAUDE.md).
 option(DEVOURER_KESTREL_8852B "RTL8852BU / 8832BU (Kestrel 11ax, G6)"           ON)
 option(DEVOURER_KESTREL_8852C "RTL8852CU / 8832CU (Kestrel 11ax, G6)"           ON)
-# PCIe transport (vfio-pci). Linux-only. The transport implements the HalMAC-
-# generation (Jaguar2/3) 88xx buffer-descriptor DMA rings; the RTL8821CE is
-# the only chip with a PCIe bring-up implemented + hardware-validated so far,
-# hence the DEVOURER_JAGUAR2_8821C requirement below. Other HalMAC PCIe parts
-# (RTL8822BE / RTL8822CE) could ride the same rings with per-chip HAL gates;
-# Jaguar1 PCIe parts (RTL8812AE/8821AE) CANNOT — they are pre-HalMAC silicon
-# with the older rtlwifi-style own-bit descriptor DMA, a different engine.
+# PCIe transport (vfio-pci). Linux-only. One transport, two DMA planes chosen
+# by PCI device id: the HalMAC-generation 88xx buffer-descriptor rings (the
+# RTL8821CE on the Jaguar2 HAL) and the AX HAXI TXBD/WD-page + RXQ/RPQ rings
+# (the RTL8852CE on the Kestrel HAL). Each plane compiles with its chip group,
+# so DEVOURER_PCIE=ON needs at least one of DEVOURER_JAGUAR2_8821C /
+# DEVOURER_KESTREL_8852C. Other HalMAC PCIe parts (RTL8822BE / RTL8822CE)
+# could ride the 88xx rings with per-chip HAL gates; the RTL8852BE is refused
+# (its PCIe power sequence and single-BDRAM table are unported); Jaguar1 PCIe
+# parts (RTL8812AE/8821AE) CANNOT — pre-HalMAC silicon with the older
+# rtlwifi-style own-bit descriptor DMA, a different engine.
 # OFF by default — libusb-only builds are bit-identical.
-option(DEVOURER_PCIE          "PCIe transport via vfio-pci (Linux; RTL8821CE)"  OFF)
+option(DEVOURER_PCIE          "PCIe transport via vfio-pci (Linux; RTL8821CE, RTL8852CE)"  OFF)
 # MediaTek MT7612U / MT7662U — the first non-Realtek part. Compiles the
 # src/mt7612u subtree (its own C++ library with a C ABI, landed unwired in #412)
 # into libdevourer along with Mt7612uRadio, the IRadio backend WiFiDriver
@@ -110,17 +113,17 @@ if(DEVOURER_PCIE)
     if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
         message(FATAL_ERROR "DEVOURER_PCIE=ON requires Linux (vfio-pci).")
     endif()
-    if(NOT DEVOURER_JAGUAR2_8821C)
+    if(NOT DEVOURER_JAGUAR2_8821C AND NOT DEVOURER_KESTREL_8852C)
         message(FATAL_ERROR
-            "DEVOURER_PCIE=ON requires DEVOURER_JAGUAR2_8821C=ON: the RTL8821CE "
-            "(Jaguar2 8821C) is currently the only chip with a PCIe bring-up "
-            "implemented and hardware-validated, so a PCIe build without it has "
-            "no usable chip. Not an architectural limit for the HalMAC families "
-            "— RTL8822BE (Jaguar2) / RTL8822CE (Jaguar3) could reuse the same "
-            "buffer-descriptor ring transport with per-chip HAL gates. Jaguar1 "
-            "PCIe parts (RTL8812AE/8821AE) are out of reach of this transport: "
-            "pre-HalMAC silicon with rtlwifi-style own-bit descriptor DMA, a "
-            "different engine entirely.")
+            "DEVOURER_PCIE=ON requires DEVOURER_JAGUAR2_8821C=ON (RTL8821CE, the "
+            "88xx buffer-descriptor DMA plane) or DEVOURER_KESTREL_8852C=ON "
+            "(RTL8852CE, the AX HAXI DMA plane) — a PCIe build without either "
+            "has no usable chip. Not an architectural limit for the HalMAC "
+            "families — RTL8822BE (Jaguar2) / RTL8822CE (Jaguar3) could reuse "
+            "the 88xx rings with per-chip HAL gates. Jaguar1 PCIe parts "
+            "(RTL8812AE/8821AE) are out of reach of this transport: pre-HalMAC "
+            "silicon with rtlwifi-style own-bit descriptor DMA, a different "
+            "engine entirely.")
     endif()
 endif()
 
@@ -237,6 +240,7 @@ add_library(devourer
     src/hopset/HopsetState.h
     src/hopset/HopsetTypes.h
     src/hopset/HopsetWire.h
+    src/StreamTelemetry.h
     src/hopset/HopsetAuthority.h
     src/hopset/HopsetFollower.h
     src/hopset/HopsetPolicy.h
@@ -388,12 +392,14 @@ if(DEVOURER_MT7612U)
         src/mt7612u/phy.cpp
         src/mt7612u/radiotap.cpp
         src/mt7612u/rx.cpp
+        src/mt7612u/station.cpp
         src/mt7612u/tx.cpp
         src/mt7612u/usb.cpp
         src/mt7612u/Mt7612uRadio.cpp src/mt7612u/Mt7612uRadio.h
         src/mt7612u/Mt7612uMapping.h
         src/mt7612u/Mt7612uRxQueue.h
         src/mt7612u/Mt7612uTsfRead.h
+        src/mt7612u/StationIdentity.h
         src/mt7612u/internal.h
         src/mt7612u/regs.h
         src/mt7612u/initvals.h
@@ -411,7 +417,14 @@ endif()
 # --- PCIe transport (vfio-pci; see src/PcieTransport.h) ---
 if(DEVOURER_PCIE)
     target_sources(devourer PRIVATE
-        src/PcieTransport.cpp src/PcieTransport.h)
+        src/PcieTransport.cpp src/PcieTransport.h src/PcieDmaPlane.h
+        src/PcieDmaUtil.h)
+    if(DEVOURER_JAGUAR2_8821C)
+        target_sources(devourer PRIVATE src/PcieDma88xx.cpp src/PcieDma88xx.h)
+    endif()
+    if(DEVOURER_KESTREL_8852C)
+        target_sources(devourer PRIVATE src/PcieDmaAx.cpp src/PcieDmaAx.h)
+    endif()
     target_compile_definitions(devourer PUBLIC DEVOURER_HAVE_PCIE=1)
 endif()
 
@@ -604,8 +617,8 @@ if(DEVOURER_KESTREL)
 endif()
 
 
-# pcieprobe — staged PCIe bring-up driver for the RTL8821CE milestones
-# (chip-id/MMIO sanity -> power-on + EFUSE -> firmware DLFW). rxdemo's
+# pcieprobe — staged PCIe bring-up driver for the RTL8821CE / RTL8852CE
+# milestones (id/MMIO sanity -> power-on + EFUSE -> firmware download). rxdemo's
 # DEVOURER_PCIE_BDF branch is the full-RX consumer; this probe validates the
 # layers below it one at a time. Linux/vfio only.
 if(DEVOURER_PCIE)
@@ -613,6 +626,24 @@ if(DEVOURER_PCIE)
         examples/pcieprobe/main.cpp
     )
     target_link_libraries(pcieprobe PUBLIC devourer)
+endif()
+
+# kestrel_tbtt_probe — bench probe for the AX beacon TBTT vs port-TSF semantics
+# (two RTL8852CEs: one beacons, the other reads the on-air egress TSF). The
+# ground truth behind Kestrel's PinBeaconTbtt.
+if(DEVOURER_PCIE AND DEVOURER_KESTREL_8852C)
+    add_executable(kestrel_tbtt_probe
+        tests/kestrel_tbtt_probe.cpp
+    )
+    target_link_libraries(kestrel_tbtt_probe PUBLIC devourer)
+endif()
+# pcie_ptp_tsf_discipline — the AP-beacon → PTP loop for TSF-locked-TBTT parts
+# (actuator = the TSF itself); sibling of tests/pcie_ptp_beacon.cpp.
+if(DEVOURER_PCIE)
+    add_executable(pcie_ptp_tsf_discipline
+        tests/pcie_ptp_tsf_discipline.cpp
+    )
+    target_link_libraries(pcie_ptp_tsf_discipline PUBLIC devourer)
 endif()
 
 # kestrelprobe — staged USB bring-up prober for the Kestrel (RTL8852B/C):
@@ -985,6 +1016,19 @@ if(DEVOURER_MT7612U)
         ${CMAKE_CURRENT_SOURCE_DIR}/src/mt7612u/include)
 
     add_test(NAME mt7612u_tsf_api COMMAND Mt7612uTsfApiSelftest)
+
+    # The async RX ring's completion callback, driven with hand-filled
+    # transfers through a test hook: the parse runs under the ring lock, and a
+    # parser that counts an invalid PHY under that lock self-deadlocks. The
+    # cell fails itself after 2 s; TIMEOUT is the backstop.
+    add_executable(Mt7612uRxRingSelftest tests/mt7612u_rx_ring_selftest.cpp)
+    target_link_libraries(Mt7612uRxRingSelftest PRIVATE devourer
+                          PkgConfig::libusb Threads::Threads)
+    target_include_directories(Mt7612uRxRingSelftest PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/mt7612u
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/mt7612u/include)
+    add_test(NAME mt7612u_rx_ring COMMAND Mt7612uRxRingSelftest)
+    set_tests_properties(mt7612u_rx_ring PROPERTIES TIMEOUT 10)
 endif()
 
 # --- src/sta/: the device-free 802.11 station core -------------------------
@@ -1057,6 +1101,27 @@ if(OpenSSL_FOUND)
     target_link_libraries(CcmpSelftest PRIVATE OpenSSL::Crypto)
     target_compile_features(CcmpSelftest PRIVATE cxx_std_20)
     add_test(NAME ccmp_framing COMMAND CcmpSelftest)
+
+    # tests/sta_client.cpp - the station client over IRadio + src/sta: scan,
+    # join, the WPA2-PSK four-way, CCMP and a TAP data plane. Built under its
+    # real name for tests/sta_client_onair.sh; the target name ends in
+    # "Selftest" so the `selftests` aggregate collects it, and `--self-test`
+    # runs its headless cells before libusb is touched (no adapter, no root).
+    # Linux-only: the data plane is a TAP device (<linux/if_tun.h>).
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        add_executable(StaClientSelftest
+            tests/sta_client.cpp
+            examples/common/env_config.cpp
+            examples/common/usb_select.cpp)
+        set_target_properties(StaClientSelftest PROPERTIES OUTPUT_NAME sta_client)
+        target_link_libraries(StaClientSelftest PUBLIC devourer
+                              PRIVATE OpenSSL::Crypto)
+        target_include_directories(StaClientSelftest PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests
+            ${CMAKE_CURRENT_SOURCE_DIR}/examples/common)
+        add_test(NAME sta_client_headless COMMAND StaClientSelftest --self-test)
+    endif()
 else()
     # Said out loud: without OpenSSL the station's crypto ACCEPTANCE cells are
     # not built, and a green ctest here has run none of them.
@@ -1064,11 +1129,12 @@ else()
         message(FATAL_ERROR "OpenSSL not found, and "
                             "DEVOURER_REQUIRE_STA_CRYPTO_TESTS=ON: the station "
                             "crypto selftests (supplicant, station_sm, "
-                            "ccmp_framing) cannot be built")
+                            "ccmp_framing, sta_client_headless) cannot be "
+                            "built")
     endif()
     message(WARNING "OpenSSL not found: the station crypto selftests "
-                    "(supplicant, station_sm, ccmp_framing) are NOT built "
-                    "on this host")
+                    "(supplicant, station_sm, ccmp_framing, "
+                    "sta_client_headless) are NOT built on this host")
 endif()
 
 # tests/ccmp_vectors.h is GENERATED by tests/ccmp_gen_vectors.py; --check
@@ -1110,6 +1176,22 @@ target_include_directories(BssTableSelftest PRIVATE
 target_compile_features(BssTableSelftest PRIVATE cxx_std_20)
 add_test(NAME bss_table COMMAND BssTableSelftest)
 
+# The MT7612U station-identity decision and the ownership hand-off
+# (src/mt7612u/StationIdentity.h), in the style of
+# tests/ack_responder_selftest.cpp. The policy is split from the register I/O
+# so it can run here: its failure modes (a failed read that fails open, a
+# failed read-back taken for a moved identity) are decisions, not writes, and
+# are not visible in a register trace. Hardware coverage is
+# `mt7612uprobe staid`. Header-only and pure, so it needs no link against the
+# library.
+if(DEVOURER_MT7612U)
+    add_executable(Mt7612uStationSelftest tests/mt7612u_station_selftest.cpp)
+    target_include_directories(Mt7612uStationSelftest PRIVATE
+                               ${CMAKE_CURRENT_SOURCE_DIR}/src/mt7612u)
+    target_compile_features(Mt7612uStationSelftest PRIVATE cxx_std_20)
+    add_test(NAME mt7612u_station_identity COMMAND Mt7612uStationSelftest)
+endif()
+
 # Headless guard for the TX quiesce seam (ITransport::quiesce_tx via
 # RtlAdapter): the explicit "stop TX and wait it out" call every device makes
 # before anything is released. UsbTransport's cancel/drain is validated on
@@ -1132,6 +1214,19 @@ add_executable(AckResponderSelftest
 target_link_libraries(AckResponderSelftest PRIVATE devourer PkgConfig::libusb)
 
 add_test(NAME ack_responder_recipe COMMAND AckResponderSelftest)
+
+# Headless guard for the Realtek station arm (src/StationArm.h over the
+# AckResponder.h station recipe) - the Jaguar1/2/3 half of
+# IRadio::SetStationIdentity: the exact registers armed and restored, every
+# refusal writing nothing, and readback catching a write that did not land.
+# Built only when a backend that uses it is. Silicon behaviour is on-air only:
+# tests/realtek_station_onair.sh.
+if(DEVOURER_JAGUAR1 OR DEVOURER_JAGUAR2_8822B OR DEVOURER_JAGUAR2_8821C OR
+   DEVOURER_JAGUAR3_8822C OR DEVOURER_JAGUAR3_8822E)
+    add_executable(StationArmSelftest tests/station_arm_selftest.cpp)
+    target_link_libraries(StationArmSelftest PRIVATE devourer PkgConfig::libusb)
+    add_test(NAME station_arm COMMAND StationArmSelftest)
+endif()
 
 # Headless guard for the windowed RX-receipt primitives (src/cell/RxReceipt.h):
 # TLV round-trip, ring eviction, late accounting, ledger merge idempotence,
@@ -1346,6 +1441,12 @@ add_test(NAME hopset_schedule_math COMMAND HopsetScheduleSelftest)
 add_executable(HopsetWireSelftest tests/hopset_wire_selftest.cpp)
 target_link_libraries(HopsetWireSelftest PRIVATE devourer)
 add_test(NAME hopset_wire_kat COMMAND HopsetWireSelftest)
+
+# Headless guard for src/StreamTelemetry.h (the addr3 per-frame field + the
+# timing marker IE): known-answer bytes, version rejection, TSF unwrap, latency.
+add_executable(StreamTelemetrySelftest tests/stream_telemetry_selftest.cpp)
+target_link_libraries(StreamTelemetrySelftest PRIVATE devourer)
+add_test(NAME stream_telemetry_kat COMMAND StreamTelemetrySelftest)
 
 add_executable(HopsetProtoSelftest tests/hopset_proto_selftest.cpp)
 target_link_libraries(HopsetProtoSelftest PRIVATE devourer)

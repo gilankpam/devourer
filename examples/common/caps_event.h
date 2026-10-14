@@ -82,6 +82,7 @@ inline void emit_adapter_caps(EventSink &sink, IRadio *dev) {
       .f("narrowband", c.narrowband_ok ? 1 : 0)
       .f("fastretune", c.fastretune_ok ? 1 : 0)
       .f("ack_responder", c.ack_responder_ok ? 1 : 0)
+      .f("station_mode", c.station_mode_ok ? 1 : 0)
       .f("tx_retry_limit", c.tx_retry_limit_ok ? 1 : 0)
       .f("tx_no_agg", c.tx_no_agg_ok ? 1 : 0)
       .f("he_er_su", c.he_er_su_ok ? 1 : 0)
@@ -89,6 +90,7 @@ inline void emit_adapter_caps(EventSink &sink, IRadio *dev) {
       .f("hw_rx_tsf", c.hw_rx_timestamp ? 1 : 0)
       .f("hw_beacon_txtsf", c.hw_beacon_txtsf ? 1 : 0)
       .f("tsf_write", c.tsf_write_ok ? 1 : 0)
+      .f("tbtt_follows_tsf", c.tbtt_follows_tsf ? 1 : 0)
       .f("xtal_cap_max", c.xtal_cap_max)
       .f("xtal_cap_default", c.xtal_cap_default);
 }

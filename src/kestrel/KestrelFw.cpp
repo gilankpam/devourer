@@ -1,12 +1,11 @@
 #include "KestrelFw.h"
 
-#include <chrono>
 #include <cstring>
-#include <thread>
 #include <utility>
 
 #include "KestrelLe.h"
 #include "MacRegAx.h"
+#include "PreciseDelay.h"
 #include "SignalStop.h" /* g_devourer_should_stop — set by demo signal handlers */
 #if defined(DEVOURER_HAVE_KESTREL_8852B)
 #include "hal8852b_fw.h"
@@ -20,9 +19,7 @@ namespace kestrel {
 namespace {
 namespace r = kestrel::reg;
 
-void delay_us(uint32_t us) {
-  std::this_thread::sleep_for(std::chrono::microseconds(us));
-}
+void delay_us(uint32_t us) { devourer::precise_delay_us(us); }
 
 /* le32 / put_le32 now live in KestrelLe.h (shared with KestrelFwSched.cpp);
  * pull them into this anonymous namespace so existing unqualified uses below
@@ -35,9 +32,17 @@ using kestrel::put_le32;
 KestrelFw::KestrelFw(RtlAdapter device, Logger_t logger, ChipVariant variant)
     : _device{std::move(device)}, _logger{std::move(logger)},
       _variant{variant} {
-  /* CH12 (H2C/FWDL) endpoint = BULKOUTID2 = the 3rd bulk-OUT in descriptor
-   * order (vendor RtOutPipe[2]); on the 8852BU that is 0x07. */
-  _ch12_ep = _device.nth_bulk_out_ep(r::BULKOUTID_H2C);
+  /* CH12 (H2C/FWDL) queue: on USB the BULKOUTID2 endpoint = the 3rd bulk-OUT
+   * in descriptor order (vendor RtOutPipe[2]; 0x07 on the 8852BU); on PCIe the
+   * AX DMA channel 12 itself (the FWCMD TXBD ring). */
+  _pcie = !_device.is_usb();
+  if (_pcie) {
+    _ch12_q = r::MAC_AX_DMA_H2C;
+    _ch12_ready = true;
+  } else {
+    _ch12_q = _device.nth_bulk_out_ep(r::BULKOUTID_H2C);
+    _ch12_ready = _ch12_q != 0;
+  }
 }
 
 void KestrelFw::set32(uint16_t reg, uint32_t bits) {
@@ -178,11 +183,14 @@ bool KestrelFw::hfc_init_dlfw() {
   const uint16_t page_ctrl = c ? r::R_AX_CH_PAGE_CTRL_V1 : r::R_AX_CH_PAGE_CTRL;
   /* set_fc_func_en(0, 0): clear FC_EN + CH12_EN. */
   clr32(fc_ctrl, r::B_AX_HCI_FC_EN | r::B_AX_HCI_FC_CH12_EN);
-  /* set_fc_h2c: CH_PAGE_CTRL = h2c_prec<<16; HCI_FC_CTRL CH12_FULL_COND=X2. */
+  /* set_fc_h2c: CH_PAGE_CTRL = h2c_prec<<16; HCI_FC_CTRL CH12_FULL_COND=X2.
+   * The 8852C PCIe DLFW pre-cost is 256 pages (hfc_preccfg_pcie_dlfw_8852c),
+   * the USB one 32. */
+  const uint16_t h2c_prec =
+      _pcie ? r::HFC_PCIE_DLFW_H2C_PREC_8852C : r::HFC_USB_H2C_PREC_8852B;
   _device.rtw_write32(
-      page_ctrl,
-      (static_cast<uint32_t>(r::HFC_USB_H2C_PREC_8852B & r::B_AX_PREC_PAGE_CH12_MSK)
-       << r::B_AX_PREC_PAGE_CH12_SH));
+      page_ctrl, (static_cast<uint32_t>(h2c_prec & r::B_AX_PREC_PAGE_CH12_MSK)
+                  << r::B_AX_PREC_PAGE_CH12_SH));
   _device.rtw_write32(
       fc_ctrl,
       r::set_clr_word(_device.rtw_read32(fc_ctrl), r::HFC_FULL_COND_X2,
@@ -203,12 +211,12 @@ bool KestrelFw::dmac_pre_init() {
     funcen |= r::B_AX_H_AXIDMA_EN;
   set32(r::R_AX_DMAC_FUNC_EN, funcen);
   if (_variant == ChipVariant::C8852C) {
-    /* dmac_func_pre_en_8852c HAXI setup (init_8852c.c): DMA mode = USB,
-     * un-stop the AXI master + TX/RX HCI, un-stop the DMA channels, enable the
-     * AXIDMA in the platform. */
+    /* dmac_func_pre_en_8852c HAXI setup (init_8852c.c): DMA mode by bus
+     * (USB, or PCIE_1B on the 8852CE), un-stop the AXI master + TX/RX HCI,
+     * un-stop the DMA channels, enable the AXIDMA in the platform. */
     uint32_t v = _device.rtw_read32(r::R_AX_HAXI_INIT_CFG1);
-    v = r::set_clr_word(v, r::DMA_MOD_USB, r::B_AX_DMA_MODE_MSK,
-                        r::B_AX_DMA_MODE_SH);
+    v = r::set_clr_word(v, _pcie ? r::DMA_MOD_PCIE_1B : r::DMA_MOD_USB,
+                        r::B_AX_DMA_MODE_MSK, r::B_AX_DMA_MODE_SH);
     v = (v & ~r::B_AX_STOP_AXI_MST) | r::B_AX_TXHCI_EN_V1 | r::B_AX_RXHCI_EN_V1;
     _device.rtw_write32(r::R_AX_HAXI_INIT_CFG1, v);
     clr32(r::R_AX_HAXI_DMA_STOP1, r::HAXI_DMA_STOP1_CHANS);
@@ -333,12 +341,12 @@ bool KestrelFw::send_fwdl_packet(const uint8_t *payload, uint32_t payload_len,
 
   /* tx_sync returns bytes-transferred on success (>=0), negative libusb rc on
    * error. */
-  int rc = _device.bulk_send_sync_ep(_ch12_ep, _txbuf.data(),
+  int rc = _device.bulk_send_sync_ep(_ch12_q, _txbuf.data(),
                                      _txbuf.size(), 1000);
   if (rc < 0 || static_cast<size_t>(rc) != _txbuf.size()) {
-    _logger->error("Kestrel FWDL: bulk-out to ep 0x{:02x} failed (rc={}, "
+    _logger->error("Kestrel FWDL: CH12 send ({} 0x{:02x}) failed (rc={}, "
                    "wanted {})",
-                   _ch12_ep, rc, _txbuf.size());
+                   _pcie ? "dma-ch" : "ep", _ch12_q, rc, _txbuf.size());
     return false;
   }
   return true;
@@ -408,6 +416,29 @@ bool KestrelFw::fw_role_maintain(uint8_t macid, uint8_t self_role,
   return ok;
 }
 
+bool KestrelFw::fw_join_info(uint8_t macid, uint8_t net_type, uint8_t self_role,
+                             uint8_t wifi_role, uint8_t port, uint8_t band,
+                             bool connect) {
+  /* One dword; OP is "disconnect", so connect sends OP=0. The HE/UL-OFDMA
+   * fields (WMM/TGR/ISHESTA/DLBW/TF_MAC_PAD/DL_T_PE) stay 0. */
+  uint8_t content[4] = {0};
+  const uint32_t op = connect ? 0u : 1u;
+  const uint32_t w0 = (static_cast<uint32_t>(macid) & 0xff) | (op << 8) |
+                      ((static_cast<uint32_t>(band) & 0x1) << 9) |
+                      ((static_cast<uint32_t>(port) & 0x7) << 21) |
+                      ((static_cast<uint32_t>(net_type) & 0x3) << 24) |
+                      ((static_cast<uint32_t>(wifi_role) & 0xf) << 26) |
+                      ((static_cast<uint32_t>(self_role) & 0x3) << 30);
+  put_le32(content + 0, w0);
+  bool ok = send_h2c_cmd(r::FWCMD_H2C_CAT_MAC, r::FWCMD_H2C_CL_MEDIA_RPT,
+                         r::FWCMD_H2C_FUNC_JOININFO, content, sizeof(content));
+  _logger->info("Kestrel: join_info (macid={} op={} net_type={} self={} wifi={} "
+                "port={} band={}) -> {}",
+                macid, op, net_type, self_role, wifi_role, port, band,
+                ok ? "sent" : "FAILED");
+  return ok;
+}
+
 bool KestrelFw::fw_upd_addr_cam(uint8_t macid, const uint8_t self_mac[6],
                                 uint8_t net_type, uint8_t addr_cam_idx,
                                 uint8_t bssid_cam_idx) {
@@ -464,6 +495,51 @@ bool KestrelFw::fw_upd_addr_cam(uint8_t macid, const uint8_t self_mac[6],
                 macid, net_type, addr_cam_idx, bssid_cam_idx, self_mac[0],
                 self_mac[1], self_mac[2], self_mac[3], self_mac[4], self_mac[5],
                 ok ? "sent" : "FAILED");
+  return ok;
+}
+
+bool KestrelFw::fw_upd_addr_cam_sta(uint8_t macid, const uint8_t sma[6],
+                                    const uint8_t tma[6], uint8_t net_type,
+                                    uint8_t addr_cam_idx, uint8_t bssid_cam_idx) {
+  /* Field layout as fw_upd_addr_cam (rtw89 cam.h), with the station values the
+   * vendor driver uses: SHORT length, separate SMA/TMA hashes, the BSSID CAM
+   * index in dword3, macid plus the vendor's bit 14 in dword8, and an embedded
+   * valid BSSID CAM entry carrying tma. */
+  uint8_t sma_hash = 0, tma_hash = 0;
+  for (int i = 0; i < 6; i++) {
+    sma_hash ^= sma[i];
+    tma_hash ^= tma[i];
+  }
+  uint8_t c[60] = {0};
+  auto sw = [](uint32_t v, uint32_t msk, uint32_t sh) {
+    return (v & msk) << sh;
+  };
+  put_le32(c + 4, sw(addr_cam_idx, 0xff, 0) | sw(0, 0xff, 8) |
+                      sw(r::ADDR_CAM_ENT_SHORT_SIZE, 0xff, 16));
+  put_le32(c + 8, 0x1u | sw(net_type, 0x3, 1) | sw(r::MAC_AX_NO_MSK, 0x3, 14) |
+                      sw(sma_hash, 0xff, 16) | sw(tma_hash, 0xff, 24));
+  put_le32(c + 12, sw(bssid_cam_idx, 0x3f, 0));
+  put_le32(c + 16, sw(sma[0], 0xff, 0) | sw(sma[1], 0xff, 8) |
+                       sw(sma[2], 0xff, 16) | sw(sma[3], 0xff, 24));
+  put_le32(c + 20, sw(sma[4], 0xff, 0) | sw(sma[5], 0xff, 8) |
+                       sw(tma[0], 0xff, 16) | sw(tma[1], 0xff, 24));
+  put_le32(c + 24, sw(tma[2], 0xff, 0) | sw(tma[3], 0xff, 8) |
+                       sw(tma[4], 0xff, 16) | sw(tma[5], 0xff, 24));
+  put_le32(c + 32, sw(macid, 0xff, 0) | (1u << 14));
+  put_le32(c + 48, sw(bssid_cam_idx, 0xff, 0) | sw(0, 0xff, 8) |
+                       sw(r::BSSID_CAM_ENT_SIZE, 0xff, 16));
+  put_le32(c + 52, 0x1u | sw(r::MAC_AX_NO_MSK, 0x3f, 2) | sw(0, 0x3f, 8) |
+                       sw(tma[0], 0xff, 16) | sw(tma[1], 0xff, 24));
+  put_le32(c + 56, sw(tma[2], 0xff, 0) | sw(tma[3], 0xff, 8) |
+                       sw(tma[4], 0xff, 16) | sw(tma[5], 0xff, 24));
+  bool ok = send_h2c_cmd(r::FWCMD_H2C_CAT_MAC, r::FWCMD_H2C_CL_ADDR_CAM_UPDATE,
+                         r::FWCMD_H2C_FUNC_ADDRCAM_INFO, c, sizeof(c));
+  _logger->info("Kestrel: upd_addr_cam_sta (macid={} net_type={} a_idx={} "
+                "b_idx={} sma={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} "
+                "tma={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}) -> {}",
+                macid, net_type, addr_cam_idx, bssid_cam_idx, sma[0], sma[1],
+                sma[2], sma[3], sma[4], sma[5], tma[0], tma[1], tma[2], tma[3],
+                tma[4], tma[5], ok ? "sent" : "FAILED");
   return ok;
 }
 
@@ -653,11 +729,11 @@ bool KestrelFw::send_h2c_cmd(uint8_t cat, uint8_t h2c_class, uint8_t func,
   put_le32(hdr + 4, data_len << r::H2C_HDR_TOTAL_LEN_SH);
   std::memcpy(hdr + r::FWCMD_HDR_LEN, content, len);
 
-  int rc = _device.bulk_send_sync_ep(_ch12_ep, _txbuf.data(), _txbuf.size(), 1000);
+  int rc = _device.bulk_send_sync_ep(_ch12_q, _txbuf.data(), _txbuf.size(), 1000);
   if (rc < 0 || static_cast<size_t>(rc) != _txbuf.size()) {
-    _logger->error("Kestrel H2C: bulk-out to ep 0x{:02x} failed (rc={}, class={}"
+    _logger->error("Kestrel H2C: CH12 send ({} 0x{:02x}) failed (rc={}, class={}"
                    " func={})",
-                   _ch12_ep, rc, h2c_class, func);
+                   _pcie ? "dma-ch" : "ep", _ch12_q, rc, h2c_class, func);
     return false;
   }
   return true;
@@ -943,7 +1019,7 @@ bool KestrelFw::fw_pre_init() {
   /* mac_hal_init pre-FWDL: hci_func_en (init.c:406) + dmac_pre_init (DLFW
    * DLE/HFC, init.c:414). The caller runs usb_pre_init (intf_pre_init) after
    * this, then download_firmware — vendor order. */
-  if (_ch12_ep == 0) {
+  if (!_ch12_ready) {
     _logger->error("Kestrel FWDL: no CH12 bulk-OUT endpoint (need >=3 bulk-out; "
                    "found {})",
                    _device.bulk_out_ep_count());
@@ -991,8 +1067,8 @@ bool KestrelFw::download_firmware(uint8_t cut, uint8_t mss_idx, bool is_sec_ic) 
     _logger->error("Kestrel FWDL: no firmware image for this variant/build");
     return false;
   }
-  _logger->info("Kestrel FWDL: image {} ({} bytes) via ep 0x{:02x}", img, len,
-                _ch12_ep);
+  _logger->info("Kestrel FWDL: image {} ({} bytes) via {} 0x{:02x}", img, len,
+                _pcie ? "dma-ch" : "ep", _ch12_q);
 
   /* mac_hal_init WDT block (init.c:470, right before the CPU enable): no
    * WDT wake on USB/PCIE (SYS_CFG5), WDT platform-reset disabled

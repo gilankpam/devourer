@@ -4,7 +4,9 @@
 #include <atomic>
 #include <cstdint>
 #include <cstring>
+#include <mutex>
 #include <optional>
+#include <span>
 #include <thread>
 
 #include "TxMode.h"
@@ -67,8 +69,10 @@ public:
    * demo shutdown). The destructor joins too, but the demos destroy the
    * device object after libusb_exit, so Stop() is the ordered join point. */
   void Stop() override {
+    _ack_disarm_thread = {}; /* cancel + join a pending test disarm */
     _rx_stop = true;
     stop_wp_drain();
+    pcie_quiesce();
   }
   void SetMonitorChannel(SelectedChannel channel) override;
   /* Disable / restore the MAC carrier-sense gate (R_AX_CCA_CFG_0 all-CCA-EN:
@@ -76,6 +80,38 @@ public:
    * (EnableTxScheduler clears these gates), so this is a runtime toggle, not the
    * co-channel-deferral fix it is on Jaguar. */
   void SetCcaMode(bool disabled) override;
+  /* The two halves of R_AX_CCA_CFG_0's gate field: "primary" = CCA_EN +
+   * SEC20/40/80 (bits 0-3, the preamble/sub-channel carrier sense), "edcca" =
+   * EDCCA_EN (bit 4, raw in-band energy). Post-bring-up only, per the
+   * IRtlRadio contract; SetCcaMode(d) == SetCcaGates(d, d). */
+  bool SetCcaGates(bool primary_disabled, bool edcca_disabled) override;
+  bool GetCcaGates(bool &primary_disabled, bool &edcca_disabled) override;
+  /* Hardware ACK responder (IRadio contract). The AX MAC has no Jaguar-style
+   * port identity register to retarget: the RMAC answers for an address only
+   * once the firmware has COMMITTED a valid ADDR_CAM entry for it, and it does
+   * that only for a station registered the way a real association registers
+   * one (HalKestrel::register_infra_sta). The arm programs that station with
+   * `mac` as its own address, clears the response-abort CCA gates, and is
+   * verified by reading the physical CAM entry back -- false when the entry
+   * did not commit, which is the 8852C today. Post-bring-up only. Clear puts
+   * macid 0 back to the bring-up NO_LINK entry and verifies the CAM no
+   * longer holds `mac`; an address still held after a failed clear (or a
+   * failed retarget, which checks the old address too) stays recorded, so a
+   * later ClearAckResponder retries it. Arm and clear are serialized.
+   *
+   * The responder shares macid 0 / ADDR_CAM entry 0 with injection: while
+   * armed, injected frames (whose WD carries macid 0) go out under the
+   * station context the arm registered, and clear restores the bring-up
+   * entry. A second macid for the responder is untested: whether the
+   * firmware commits an entry other than 0 has not been measured. */
+  bool SetAckResponder(const devourer::MacAddr &mac) override;
+  void ClearAckResponder() override;
+  /* rxdemo's live-disarm measurement hook (DEVOURER_ACK_DISARM_AFTER_MS): the
+   * delay starts once Init has finished the bring-up, including a configured
+   * SetAckResponder, never from process start. */
+  void ScheduleAckResponderDisarmForTest(uint32_t delay_ms) {
+    _ack_disarm_after_ms = delay_ms;
+  }
   bool send_packet(const uint8_t *packet, size_t length) override;
   devourer::TxStats GetTxStats() override { return _device.GetTxStats(); }
   SelectedChannel GetSelectedChannel() override { return _channel; }
@@ -124,6 +160,19 @@ public:
   /* 64-bit free-running MAC TSF (band-0 port-0). mac_get_tsf (twt.c). */
   uint64_t ReadTsf() override;
 
+  /* Bare band-0 port-0 TSF write (LOW then HIGH). On the AX MAC the beacon
+   * TBTT is hardware-locked to this TSF grid (bench, RTL8852CE: a +30 ms TSF
+   * step left the on-air beacon phase at TSF%interval unchanged; toggling
+   * BCNTX_EN / PORT_FUNC_EN re-latches nothing) — so a write moves an active
+   * beacon's TBTT with it, the Jaguar1 model. PCIe-measured only. */
+  bool WriteTsf(uint64_t tsf) override;
+
+  /* Jaguar1 semantics (see IRadio): the AX TBTT already sits on the TSF grid,
+   * so offset 0 holds natively and a nonzero TSF-preserving pin is physically
+   * unavailable — refused with a one-time warning. Discipline the TSF itself
+   * (WriteTsf) to steer the TBTT. */
+  int32_t PinBeaconTbtt(int32_t offset_us) override;
+
   /* Lean intra-band 20 MHz retune (frequency hopping) — RF channel only, skips
    * the BB bandwidth config + RX-DCK. Falls back to SetMonitorChannel on a band
    * change or a non-20 MHz width. */
@@ -154,6 +203,7 @@ public:
    * prior InitWrite. `beacon` is a full 802.11 beacon; the MAC airs it every
    * `interval_tu` TU with the live TSF inserted. */
   bool StartBeacon(const uint8_t *beacon, size_t len, int interval_tu) override;
+  int _bcn_interval_tu = 0; /* >0 while a HW beacon is armed (StartBeacon) */
 
   /* 802.11ax scheduled UL: air an HE Basic Trigger (UL-OFDMA grant), program
    * TWT agreements + STA binds, and the fw-autonomous trigger cadence
@@ -240,8 +290,39 @@ private:
   volatile bool _wp_drain_stop = true;
   void start_wp_drain();
   void stop_wp_drain();
-  uint8_t _tx_mgmt_ep = 0; /* band-0 mgmt bulk-OUT ep (BULKOUTID0), 0=TX not up */
-  uint8_t _tx_data_ep = 0; /* AC0 data bulk-OUT ep (BULKOUTID3) */
+  /* PCIe: stop the HAXI DMA engine + clear the ring indices (HalKestrel::
+   * pcie_deinit) exactly once, from Stop() or the destructor, whichever comes
+   * first — an RX-only session has the RXQ DMA live too, and the transport
+   * unmaps the slab right after the device goes away. No-op on USB. */
+  void pcie_quiesce();
+  bool _pcie_quiesced = false;
+  /* True while StartRxLoop's reap loop runs; pcie_quiesce waits for it to
+   * clear (bounded) so the DMA stop never races a reap in progress. */
+  std::atomic<bool> _rx_running{false};
+  /* TX queue handles, bus-neutral: on USB the bulk-OUT endpoint (B0MG =
+   * BULKOUTID0, ACH0 = BULKOUTID3), on PCIe the AX DMA channel itself (8, 0).
+   * ACH0 is channel 0, so "TX is up" is its own flag, not a non-zero handle. */
+  bool _tx_up = false;
+  bool _brought_up = false; /* Init/InitWrite completed the MAC bring-up */
+  /* Armed ACK responder address, and the R_AX_TRXPTCL_RESP_0 value the arm
+   * replaced (restored by ClearAckResponder). */
+  std::optional<devourer::MacAddr> _ack_responder;
+  uint32_t _ack_resp0_saved = 0;
+  /* Serializes SetAckResponder/ClearAckResponder: the test disarm below
+   * calls ClearAckResponder from its own thread. */
+  std::mutex _ack_mutex;
+  /* Rewrite macid 0 to the NO_LINK entry, restore RESP_0 and poll the CAM
+   * until it holds none of `held`. Returns the address still held on
+   * timeout, nullopt once gone. Caller holds _ack_mutex. */
+  std::optional<devourer::MacAddr>
+  disarm_ack_locked(std::span<const devourer::MacAddr> held);
+  std::optional<uint32_t> _ack_disarm_after_ms;
+  std::jthread _ack_disarm_thread;
+  /* DEVOURER_ACK_RESPONDER: arm at the end of bring-up, throw if refused. */
+  void arm_configured_ack_responder();
+  uint8_t _tx_mgmt_q = 0;
+  uint8_t _tx_data_q = 0;
+  bool _tx_data_ok = false; /* data frames may use _tx_data_q */
   uint16_t _tx_seq = 0;    /* rolling 12-bit wifi sequence for injected frames */
   std::optional<devourer::TxMode> _tx_mode_default; /* SetTxMode default */
   int16_t _sess_pwr_qdb = 0; /* offset applied by SetTxPowerOffsetQdb — the

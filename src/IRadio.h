@@ -13,6 +13,9 @@
 #include "RxQuality.h"
 #include "SelectedChannel.h"
 #include "ThermalStatus.h"
+#include "TxReport.h"
+#include <condition_variable>
+#include <mutex>
 #include "Sounding.h"
 #include "TriggerTwt.h"
 #include "TxCaps.h"
@@ -60,7 +63,30 @@ public:
    * StopRxLoop() is called or the global stop flag is set; it is restartable
    * after it returns. This is the piece that lets one process bring up once
    * (InitWrite) and then run TX and RX concurrently on the same claimed handle
-   * — Init is the RX-only convenience wrapper (bring-up + StartRxLoop). */
+   * — Init is the RX-only convenience wrapper (bring-up + StartRxLoop).
+   *
+   * WHICH THREAD THE CALLBACK RUNS ON IS BACKEND- AND MODE-SPECIFIC. In the
+   * Realtek USB backends' default RxMode::Async ring it runs on the thread
+   * that drives libusb's event handling; under RxMode::SpscFat it runs on the
+   * ring's consumer thread; on the MT7612U it runs on the thread that called
+   * StartRxLoop while a C-layer thread pumps libusb. Keep to the lock rule
+   * below on every backend regardless: where the callback is not on the
+   * event thread the deadlock does not form, but a callback parked on the
+   * caller's lock still stalls the receive path behind it, and the mode is a
+   * configuration detail a caller should not have to track. In the Async
+   * case a synchronous USB transfer made from any other thread (every register
+   * read or write behind a control call - SetStationIdentity, the TX-power
+   * setters, SetMonitorChannel, ...) waits for that thread to come back out
+   * of it. So never make a device call while holding a lock the callback
+   * takes: the callback blocks on the lock, the call blocks on the callback,
+   * and neither returns. The mechanism is libusb's: a synchronous transfer
+   * completes only when some thread handles libusb events, and in the Async
+   * case the thread that handles them IS the RX thread - which is inside the
+   * callback, waiting for the caller's lock. How many transfers a call makes
+   * only changes how often it loses the race: a call that makes almost none
+   * hides the deadlock in testing rather than avoiding it. The same holds
+   * inside a backend: a callback path that takes a lock some other thread
+   * holds across USB I/O must try_lock rather than block. */
   virtual void StartRxLoop(Action_ParsedRadioPacket packetProcessor) = 0;
 
   /* Ask a running StartRxLoop to exit (sets a flag; the caller then joins
@@ -219,6 +245,87 @@ public:
   }
   virtual void ClearAckResponder() {}
 
+  /* --- 802.11 infrastructure station (client) identity ---------------------
+   *
+   * Program the MAC for the STATION half of an infrastructure BSS: this
+   * adapter is `own`, the AP it has joined is `bssid`. Arms whatever the
+   * silicon needs to receive that BSS's traffic addressed to `own` and to
+   * auto-ACK it. `ClearStationIdentity` returns to the pre-arm state.
+   *
+   * WHY THIS IS NOT SetAckResponder(bssid). The two look interchangeable and
+   * are not, at least on MT7612U, where the auto-response engine matches
+   * address 1 against the port identity register. Arming an ACK responder
+   * there *retargets* that register, so `SetAckResponder(bssid)` on a station
+   * would move the port identity to the AP's address and break ACK for the
+   * station's own traffic - the exact opposite of what a station needs. A
+   * station's port identity is its OWN address, which is where MAC bring-up
+   * already leaves it, so a correct implementation on that part must write
+   * the BSSID somewhere else and leave the port identity alone. Backends
+   * where one register genuinely serves both may implement this in terms of
+   * the other; they must not assume it.
+   *
+   * ORDERING. Call after the RX loop is running, not before. This is not a
+   * style preference: a backend may program the receive filter when the RX
+   * loop starts and overwrite anything an earlier call wrote (MT7612U's RX
+   * loop start rewrites the filter, though it keeps an armed station's - see
+   * Mt7612uRadio::SetStationIdentity). An implementation that
+   * cannot detect being called too early must say so at its declaration;
+   * one that can should refuse and log rather than arm something that will
+   * be silently undone.
+   *
+   * `own` and `bssid` must both be unicast (I/G clear) and must differ.
+   * Returns false when unsupported, when the arguments are refused, or when
+   * the arm cannot be read back. As with SetAckResponder, false is not proof
+   * of passive state: an implementation that cannot verify its own rollback
+   * logs that rather than claiming it. Clear is a non-throwing best effort
+   * and does not promise the MAC stops responding - a die that matches on an
+   * address alone will answer for whatever address is left programmed.
+   *
+   * A LATER PORT-0 CLAIMANT IS BACKEND-SPECIFIC, and a caller must not assume
+   * either rule. SetAckResponder, ClearAckResponder and StartBeacon all want
+   * the same port identity a station holds. A backend may REFUSE them while a
+   * station is armed (return false, station stays armed), or let them proceed
+   * and drop the station arm. The MT7612U does the latter: a verified move of
+   * the port identity drops the station arm with a WARN (a write that leaves
+   * it where it was drops nothing; a StartBeacon that fails and unwinds it
+   * back restores the arm), SetAckResponder returns true,
+   * and the station stops being acknowledged until it is re-armed - and under
+   * the managed receive filter stops receiving too (measured there: reception
+   * goes to zero). So after any of those calls on a live station, re-check
+   * the station arm (re-arm, or ClearStationIdentity) rather than inferring
+   * it from the call's return value.
+   *
+   * TRANSMISSION IS NOT PART OF THE ARM. This covers what the MAC receives
+   * and acknowledges. A station's own unicast (management, EAPOL, data) must
+   * request an ACK in its radiotap - build_stream_radiotap(mode, false),
+   * the no_ack argument; the default stream radiotap is NOACK, which never
+   * retries - and the hardware retransmits an unacknowledged frame only
+   * DeviceConfig::tx.retry_limit times, whose default is 0. A station
+   * session sets a nonzero limit explicitly; left at the default it sends
+   * each unicast frame once.
+   *
+   * Gate this on AdapterCaps::station_mode_ok rather than on a nullptr check;
+   * the default here returns false for every backend that has not ported it,
+   * which is all of them until a backend says otherwise. */
+  virtual bool SetStationIdentity(const devourer::MacAddr &own,
+                                  const devourer::MacAddr &bssid) {
+    (void)own;
+    (void)bssid;
+    return false;
+  }
+  /* Returns whether the pre-arm state was restored AND verified. On a
+   * backend whose arm wrote nothing there is nothing to undo and this is
+   * trivially true; on one that moved a filter or a MACID, a false return is
+   * the only way a caller learns the rollback could not be confirmed - the
+   * same contract SetAckResponder's clear half carries. It is not `void` for
+   * exactly that reason: a void clear would make an unverifiable rollback
+   * unreportable on the backends where rollback is real.
+   *
+   * The not-ported default returns TRUE: its SetStationIdentity arms nothing,
+   * so there is nothing to undo - the "trivially true" case above. A false
+   * here would report an unverified rollback for a port nothing touched. */
+  virtual bool ClearStationIdentity() { return true; }
+
   /* 802.11 A-MPDU TX mode (src/AmpduMode.h): the first-class bundle of the
    * recipe the spike + pacing sweep proved on-air. When enabled, every data
    * frame is marked aggregatable (data QSEL + AGG_EN + MAX_AGG_NUM +
@@ -370,7 +477,8 @@ public:
    * air-time — a separate per-port timer drives the TBTT (bench-proven). On
    * Jaguar1 the TBTT is recorded as hardware-locked to the TSF grid
    * (PinBeaconTbtt, bench on all three dies), so expect a write there to move
-   * an active beacon's TBTT with it; neither that nor whether the beacon keeps
+   * an active beacon's TBTT with it — on Kestrel over PCIe that is measured on
+   * air (the TBTT follows the write within one beacon); neither that nor whether the beacon keeps
    * airing without the steer's re-download was measured through this call. To
    * steer the hardware-timed beacon (the uplink timing-advance actuator) use
    * AdjustBeaconTiming.
@@ -532,7 +640,10 @@ public:
    * Jaguar1 — offset 0 only (arm/re-derive): its TBTT is hardware-locked to
    * the TSF grid, so a nonzero TSF-preserving pin cannot hold (refused); the
    * flip side is that steering/disciplining the J1 TSF steers the TBTT with
-   * it in hardware, no actuator needed. Base is a no-op. */
+   * it in hardware, no actuator needed. Kestrel (RTL8852CE, PCIe) — the same
+   * model, measured on air: offset 0 is the native state, nonzero refused;
+   * discipline via WriteTsf (tests/pcie_ptp_tsf_discipline.cpp). Base is a
+   * no-op. */
   virtual int32_t PinBeaconTbtt(int32_t offset_us) {
     (void)offset_us;
     return 0;
@@ -551,6 +662,22 @@ public:
    * silently go on-air at 1 Mbps. */
   virtual void SetTxMode(const devourer::TxMode & /*mode*/) {}
   virtual void ClearTxMode() {}
+
+  /* Per-frame CCX TX reports (TxReport.h, DeviceConfig tx.report) handed to
+   * the caller as they decode, in addition to the `tx.report` event. The sink
+   * runs on whichever thread drains C2H for this generation (the RX worker,
+   * or Jaguar3's coex thread), so it must be cheap and thread-safe; set it
+   * before the RX/coex path starts. On the HalMAC dies a report's sw_define
+   * is the tag IRtlRadio::NextTxReportTag() gave the frame, which is how a
+   * caller joins a report to the frame it sent. An empty function clears it. */
+  void SetTxReportSink(std::function<void(const devourer::TxReport &)> sink) {
+    std::unique_lock<std::mutex> lk(_tx_report_sink_mu);
+    _tx_report_sink = std::move(sink);
+    /* Returns only once no earlier sink is still executing, so a caller may
+     * destroy what its sink captured right after. Never call this from
+     * inside the sink itself. */
+    _tx_report_sink_cv.wait(lk, [this] { return _tx_report_inflight == 0; });
+  }
 
   /* TX submission health snapshot (see TxStats.h) — the driver-side drop /
    * congestion signal an adaptive-link controller uses to detect a full TX FIFO
@@ -652,6 +779,33 @@ public:
    * Init/InitWrite). On Jaguar1 a failed FW boot does not abort bring-up —
    * this is the only place the failure is visible to a caller. */
   virtual devourer::FwBootStatus GetFwBootStatus() { return {}; }
+
+
+protected:
+  /* Emit the `tx.report` event and hand the report to the sink, if any. */
+  void DeliverTxReport(devourer::EventSink &events, const devourer::TxReport &r,
+                       const char *fmt) {
+    devourer::emit_tx_report(events, r, fmt);
+    std::function<void(const devourer::TxReport &)> sink;
+    {
+      std::lock_guard<std::mutex> lk(_tx_report_sink_mu);
+      if (!_tx_report_sink) return;
+      sink = _tx_report_sink;
+      ++_tx_report_inflight;
+    }
+    sink(r);
+    {
+      std::lock_guard<std::mutex> lk(_tx_report_sink_mu);
+      --_tx_report_inflight;
+    }
+    _tx_report_sink_cv.notify_all();
+  }
+
+private:
+  std::mutex _tx_report_sink_mu;
+  std::condition_variable _tx_report_sink_cv;
+  int _tx_report_inflight = 0;
+  std::function<void(const devourer::TxReport &)> _tx_report_sink;
 
 };
 

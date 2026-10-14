@@ -35,6 +35,14 @@
  * it, and it saves five identical per-backend overrides. */
 class IRtlRadio : public IRadio {
 public:
+  /* The SW_DEFINE tag the NEXT send_packet's descriptor will carry, on the
+   * HalMAC dies with DeviceConfig tx.report on (the report echoes it, so a
+   * caller that reads this right before each send can join every TxReport
+   * to its frame). nullopt where there is no tag echo (Jaguar1, Kestrel,
+   * RTL8733B, MT7612U) or reports are off. Single-sender semantics: the tag
+   * advances once per frame the device builds a data descriptor for. */
+  virtual std::optional<uint8_t> NextTxReportTag() const { return std::nullopt; }
+
   /* Crystal (XTAL) load-capacitance trim — the CFO lever. Writes the AFE
    * crystal-cap field (a per-chip register), pulling the chip's reference
    * oscillator a few ppm to align a marginal TX/RX crystal pair; the payoff
@@ -202,10 +210,11 @@ public:
    *     armed it latched and the part transmitted nothing more for the life
    *     of the process, while the receiver worked on (the 8812BU's wedge
    *     read 0x10, then 0x15 - bits not decoded);
-   *   - bit 13, BIT_PAYLOAD_OVF_8822C (0x00002000), latches under host-side
-   *     max-duty backpressure while TX continues - an 8812CU on USB2 at
-   *     DEVOURER_TX_GAP_US=0 read it from the first sample and still
-   *     completed every frame. A poller must not treat it as the wedge.
+   *   - bit 13, BIT_PAYLOAD_OVF_8822C (0x00002000), can latch under
+   *     host-side max-duty backpressure while TX continues - an 8812CU on
+   *     USB2 at DEVOURER_TX_GAP_US=0 read it from the first sample and still
+   *     completed every frame (a later such run did not latch it). A poller
+   *     must not treat it as the wedge.
    * Other bits are undecoded. Records: docs/jaguar3-tx-ring.md.
    *
    * NOT FOR THE SEND PATH. This is a register read over USB - see the

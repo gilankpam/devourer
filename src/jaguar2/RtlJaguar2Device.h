@@ -12,6 +12,7 @@
 #include "IRtlRadio.h"
 #include "TxMode.h"
 #include "RtlAdapter.h"
+#include "StationArm.h"
 #include "SelectedChannel.h"
 #include "CfoTracker.h"
 #include "HalJaguar2.h"
@@ -52,6 +53,10 @@ public:
    * runs this on its own std::thread next to the TX loop. Starts (and on exit
    * stops) the DIG thread — TX-only sessions stay DIG-free. */
   void StartRxLoop(Action_ParsedRadioPacket packetProcessor) override;
+  std::optional<uint8_t> NextTxReportTag() const override {
+    if (!_cfg.tx.report) return std::nullopt;
+    return static_cast<uint8_t>(_tx_rpt_tag.load(std::memory_order_relaxed) & 0xff);
+  }
   void StopRxLoop() override { _rx_stop = true; }
   void SetMonitorChannel(SelectedChannel channel) override;
   /* Lean frequency-hop retune (the Jaguar2 port of the Jaguar1 FastRetune —
@@ -75,6 +80,17 @@ public:
   /* Hardware ACK responder (IRadio contract; src/AckResponder.h). */
   bool SetAckResponder(const devourer::MacAddr &mac) override;
   void ClearAckResponder() override;
+  /* Station identity (IRadio contract; src/StationArm.h): MACID = own,
+   * BSSID = the AP, net_type = Infra, under _reg_mu, read back; Clear
+   * restores and reads back the pre-arm MACID/BSSID/net_type. Refused until
+   * Init/InitWrite has made its last port-0 write (_station_ready) and while
+   * a beacon or an ACK responder owns port 0; while
+   * armed, SetAckResponder, ClearAckResponder and StartBeacon are refused in
+   * turn. Order-independent of the RX loop: StartRxLoop writes no port-0
+   * register here. */
+  bool SetStationIdentity(const devourer::MacAddr &own,
+                          const devourer::MacAddr &bssid) override;
+  bool ClearStationIdentity() override;
   /* A-MPDU TX mode (IRadio contract; src/AmpduMode.h). Programs the
    * 8822B pacing regs (0x455 max-time, 0x4BC burst-mode) under _reg_mu and
    * records the descriptor state the TX path reads. */
@@ -362,6 +378,14 @@ private:
    * FastRetune / the TX-power setters / GetThermalStatus by _reg_mu (the RF
    * read window is a multi-transfer sequence that must not tear). */
   std::mutex _reg_mu;
+  devourer::StationArm _station; /* under _reg_mu */
+  /* The station arm's readiness gate, committed late: false from the top of
+   * Init/InitWrite until that bring-up has made its last port-0 write (the
+   * BF beamformee identity into MACID, the configured ACK responder), and
+   * left false by a bring-up that throws. Not _brought_up: that flag goes
+   * true mid-bring-up because the tail's own setters apply live only once it
+   * is set. Under the station lock. */
+  bool _station_ready = false;
   std::thread _pwrtrack_thread;
   std::atomic<bool> _pwrtrack_stop{false};
   void start_pwrtrack();

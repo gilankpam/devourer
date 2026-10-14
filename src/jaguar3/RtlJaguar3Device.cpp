@@ -87,7 +87,7 @@ void RtlJaguar3Device::Init(Action_ParsedRadioPacket packetProcessor,
                             SelectedChannel channel) {
   _nhm_busy_ready = false;
   /* A new session has sent no wide frame: a re-bring-up must not inherit the
-   * previous session's 8822C wide IGI floor (_wide_tx_seen). */
+   * previous session's wide-TX IGI floor (_wide_tx_seen). */
   _wide_tx_seen.store(false, std::memory_order_relaxed);
   /* A window armed before a (re-)bring-up describes a chip state that no
    * longer exists; leaving it armed would make the next unrelated
@@ -95,6 +95,14 @@ void RtlJaguar3Device::Init(Action_ParsedRadioPacket packetProcessor,
   {
     std::lock_guard<std::mutex> ccx(busy_window_mutex());
     busy_window_reset();
+  }
+  /* Likewise a station arm: a re-Init of a live session clears an arm this
+   * object holds before the bring-up below; one whose clear does not verify
+   * stays recorded for ClearStationIdentity (StationArm::retire). */
+  {
+    std::lock_guard<std::mutex> lk(_reg_mu);
+    _station_ready = false;
+    _station.retire(_device, _logger, "Jaguar3");
   }
   _channel = channel;
   _rx_bw_code.store(channel_width_to_bw_code(channel.ChannelWidth),
@@ -128,6 +136,8 @@ void RtlJaguar3Device::Init(Action_ParsedRadioPacket packetProcessor,
     _radioManagement.set_channel_bwmode(channel.Channel, channel.ChannelOffset,
                                         channel.ChannelWidth);
   _hal.enable_rx_path(); /* RF into RX mode (IGI toggle) — must follow channel set */
+  /* _wide_tx_seen was just cleared, so this never arms a floor: it only drops
+   * one a previous session left in _phydm. */
   apply_igi_floor_locked(channel.Channel, channel.ChannelWidth);
   _hal.config_rfe(channel.Channel); /* 8822e RFE/PAPE antenna-switch pins */
   _hal.config_channel_8822e(channel.Channel); /* 8822e band TX scaling/backoff + shaping */
@@ -193,6 +203,10 @@ void RtlJaguar3Device::Init(Action_ParsedRadioPacket packetProcessor,
       _logger->info("BBDUMP 0x{:04x} 0x{:08x} 0x{:08x} 0x{:08x} 0x{:08x}", a,
                     _device.rtw_read32(a), _device.rtw_read32(a + 4),
                     _device.rtw_read32(a + 8), _device.rtw_read32(a + 12));
+  }
+  {
+    std::lock_guard<std::mutex> lk(_reg_mu);
+    _station_ready = true; /* every port-0 write of this bring-up is done */
   }
   StartRxLoop(std::move(packetProcessor));
 }
@@ -302,6 +316,17 @@ void RtlJaguar3Device::StartRxLoop(Action_ParsedRadioPacket packetProcessor) {
       return;
     if (std::chrono::steady_clock::now() < cfo_next)
       return;
+    /* NON-BLOCKING, and taken BEFORE the tracker steps, because this runs on
+     * the RX thread - the thread that drives libusb's event handling. A
+     * _reg_mu holder doing synchronous USB I/O (the coex tick,
+     * SetStationIdentity, any setter) waits for this thread, so blocking here
+     * would deadlock both (IRadio's StartRxLoop lock rule). On a busy lock
+     * the tracker is not stepped - its samples keep accumulating and the next
+     * completion tries again - so a skipped tick cannot feed its polarity
+     * detection a step that was never written. */
+    std::unique_lock<std::mutex> lk(_reg_mu, std::try_to_lock);
+    if (!lk.owns_lock())
+      return;
     cfo_next += std::chrono::seconds(2);
     double avg_khz = 0;
     const int cur = _xtal_cap < 0 ? 0x20 : _xtal_cap;
@@ -312,7 +337,6 @@ void RtlJaguar3Device::StartRxLoop(Action_ParsedRadioPacket packetProcessor) {
       const uint32_t field = static_cast<uint32_t>(nc) |
                              (static_cast<uint32_t>(nc) << 7); /* 14-bit */
       try {
-        std::lock_guard<std::mutex> lk(_reg_mu);
         _device.rtw_write<uint32_t>(0x1040,
                                     reg1040_base | ((field << 10) & 0x00FFFC00u));
         _xtal_cap = nc;
@@ -320,6 +344,7 @@ void RtlJaguar3Device::StartRxLoop(Action_ParsedRadioPacket packetProcessor) {
         return;
       }
     }
+    lk.unlock();
     if (nc >= 0) /* log only on an actual step, not every idle tick */
       _logger->info("Jaguar3 cfo.track: cfo~{} (raw*2.5) xtal_cap=0x{:02x}",
                     static_cast<int>(avg_khz), _xtal_cap);
@@ -363,9 +388,9 @@ void RtlJaguar3Device::StartRxLoop(Action_ParsedRadioPacket packetProcessor) {
          * C2H pkt 0xFF/0x0F carries per-frame delivery + retry count —
          * decode + emit tx.report (src/TxReport.h). */
         if (is_c2h && devourer::is_ccx_halmac(f.frame, f.frame_len))
-          devourer::emit_tx_report(
-              _logger->events(),
-              devourer::parse_ccx_halmac(f.frame, f.frame_len), "halmac");
+          DeliverTxReport(_logger->events(),
+                          devourer::parse_ccx_halmac(f.frame, f.frame_len),
+                          "halmac");
         /* Decode the jgr3 PHY-status report (per-frame RSSI/SNR/EVM), which
          * sits immediately after the 24-byte descriptor inside the drvinfo
          * area (monitor_rx_cfg enables APP_PHYSTS + RX_DRVINFO_SZ=4).
@@ -410,13 +435,33 @@ void RtlJaguar3Device::StartRxLoop(Action_ParsedRadioPacket packetProcessor) {
           if (fb[24] == 0x15 && fb[25] == 0x00 &&
               std::memcmp(fb + 10, _bf_peer, 6) == 0) {
             _bf_cbr_count.fetch_add(1, std::memory_order_relaxed);
-            if (!_bf_apply_on.load(std::memory_order_relaxed)) {
-              std::lock_guard<std::mutex> lk(_reg_mu);
-              devourer::bf::apply_vmatrix(
-                  _device, true, static_cast<uint8_t>(_channel.ChannelWidth));
-              _bf_apply_on.store(true, std::memory_order_relaxed);
-              _logger->info("Jaguar3 BF: CBR from peer ingested — TXBF apply "
-                            "ENABLED (steering subsequent TX)");
+            /* try_lock for the reason cfo_tick gives: this is the RX
+             * thread. Busy -> _bf_apply_on stays false, and the next CBR
+             * from the peer retries the apply. */
+            std::unique_lock<std::mutex> lk(_reg_mu, std::defer_lock);
+            const bool want = !_bf_apply_on.load(std::memory_order_relaxed);
+            if (want && !lk.try_lock()) {
+              DVR_DEBUG(_logger, "Jaguar3 BF: CBR ingested but _reg_mu busy "
+                                 "- apply skipped, the next CBR retries");
+            }
+            if (want && lk.owns_lock()) {
+              /* Caught for the reason cfo_tick is: apply_vmatrix is a
+               * register read + write, and a failed transfer throws - which
+               * must not unwind through the extern "C" libusb callback. A
+               * throw leaves _bf_apply_on false, so the next CBR retries. */
+              try {
+                devourer::bf::apply_vmatrix(
+                    _device, true, static_cast<uint8_t>(_channel.ChannelWidth));
+                _bf_apply_on.store(true, std::memory_order_relaxed);
+                _logger->info("Jaguar3 BF: CBR from peer ingested — TXBF "
+                              "apply ENABLED (steering subsequent TX)");
+              } catch (const std::exception &e) {
+                DVR_DEBUG(_logger, "Jaguar3 BF: TXBF apply failed ({}) - "
+                                   "the next CBR retries", e.what());
+              } catch (...) {
+                DVR_DEBUG(_logger, "Jaguar3 BF: TXBF apply failed - the next "
+                                   "CBR retries");
+              }
             }
           }
         }
@@ -467,6 +512,14 @@ RtlJaguar3Device::~RtlJaguar3Device() {
   _coex_stop = true;
   if (_coex_thread.joinable())
     _coex_thread.join();
+  /* Safety net: a station arm the caller did not clear ends with the
+   * device, not with whatever state the chip is left in. */
+  try {
+    std::lock_guard<std::mutex> lk(_reg_mu);
+    if (_station.armed())
+      (void)_station.clear(_device, _logger, "Jaguar3");
+  } catch (...) {
+  }
 }
 
 void RtlJaguar3Device::coex_runtime_loop() {
@@ -499,9 +552,9 @@ void RtlJaguar3Device::coex_runtime_loop() {
                                          static_cast<size_t>(n) - off, f)) {
             if ((buf[off + 11] & 0x10) &&
                 devourer::is_ccx_halmac(f.frame, f.frame_len))
-              devourer::emit_tx_report(
-                  _logger->events(),
-                  devourer::parse_ccx_halmac(f.frame, f.frame_len), "halmac");
+              DeliverTxReport(_logger->events(),
+                              devourer::parse_ccx_halmac(f.frame, f.frame_len),
+                              "halmac");
             if (f.next_offset == 0)
               break;
             off += f.next_offset;
@@ -811,7 +864,18 @@ void RtlJaguar3Device::Stop() {
   _coex_stop = true;
   if (_coex_thread.joinable())
     _coex_thread.join();
-  /* The 8822C wide IGI floor is earned by this session's TX; a later Init on
+  /* A station arm ends with the session, not with whatever the de-init
+   * below leaves: restored first (best effort; a failure is logged by the
+   * clear), so the port stops answering for the station even where the
+   * power-down does not complete. A new arm is refused until the next
+   * bring-up. */
+  {
+    std::lock_guard<std::mutex> lk(_reg_mu);
+    _station_ready = false;
+    if (_station.armed())
+      (void)_station.clear(_device, _logger, "Jaguar3");
+  }
+  /* The wide-TX IGI floor is earned by this session's TX; a later Init on
    * the same device must not inherit it (Init/InitWrite clear it too, for a
    * re-bring-up without a Stop). */
   _wide_tx_seen.store(false, std::memory_order_relaxed);
@@ -825,7 +889,7 @@ void RtlJaguar3Device::Stop() {
 void RtlJaguar3Device::InitWrite(SelectedChannel channel) {
   _nhm_busy_ready = false;
   /* A new session has sent no wide frame: a re-bring-up must not inherit the
-   * previous session's 8822C wide IGI floor (_wide_tx_seen). */
+   * previous session's wide-TX IGI floor (_wide_tx_seen). */
   _wide_tx_seen.store(false, std::memory_order_relaxed);
   /* A window armed before a (re-)bring-up describes a chip state that no
    * longer exists; leaving it armed would make the next unrelated
@@ -833,6 +897,14 @@ void RtlJaguar3Device::InitWrite(SelectedChannel channel) {
   {
     std::lock_guard<std::mutex> ccx(busy_window_mutex());
     busy_window_reset();
+  }
+  /* Likewise a station arm: a re-Init of a live session clears an arm this
+   * object holds before the bring-up below; one whose clear does not verify
+   * stays recorded for ClearStationIdentity (StationArm::retire). */
+  {
+    std::lock_guard<std::mutex> lk(_reg_mu);
+    _station_ready = false;
+    _station.retire(_device, _logger, "Jaguar3");
   }
   _channel = channel;
   _rx_bw_code.store(channel_width_to_bw_code(channel.ChannelWidth),
@@ -899,6 +971,7 @@ void RtlJaguar3Device::InitWrite(SelectedChannel channel) {
                                         channel.ChannelWidth);
   if (want_rx)
     _hal.enable_rx_path(); /* RF into RX mode — same slot as the Init path */
+  /* Clear-only, as in Init: _wide_tx_seen was just reset. */
   apply_igi_floor_locked(channel.Channel, channel.ChannelWidth);
   _hal.dpk_force_bypass_8822e(); /* 8822e rfe 21/22: kernel bypasses DPK (after IQK) */
   _hal.config_rfe(channel.Channel); /* 8822e RFE/PAPE antenna-switch pins (PA enable) */
@@ -1115,6 +1188,10 @@ void RtlJaguar3Device::InitWrite(SelectedChannel channel) {
         "Jaguar3: configured ACK responder could not be armed");
   if (_cfg.tx.ampdu)
     SetAmpduMode(*_cfg.tx.ampdu); /* DEVOURER_TX_AMPDU_MODE */
+  {
+    std::lock_guard<std::mutex> lk(_reg_mu);
+    _station_ready = true; /* every port-0 write of this bring-up is done */
+  }
   _logger->info("Jaguar3: ready for TX (monitor inject)");
 }
 
@@ -1738,6 +1815,11 @@ void RtlJaguar3Device::FastRetune(uint8_t channel, bool cache_rf) {
     if (band_change && _brought_up &&
         (_tx_pwr_offset_steps != 0 || _tx_pwr_override >= 0))
       apply_tx_power_current(/*full=*/true);
+    /* No apply_igi_floor_locked here, deliberately: the lean hop keeps the
+     * width and leaves IGI (0x1d70) where it found it, and the floor's value
+     * does not depend on the channel's DFS-ness — whatever floor the previous
+     * tune applied is still the right one. (dig() clamps to the floor on
+     * every tick regardless.) */
     return;
   }
   /* Fast path declined (band change / never tuned) — full channel set at the
@@ -1786,10 +1868,7 @@ void RtlJaguar3Device::apply_igi_floor_locked(uint8_t channel,
                                               bool wide_tx_seen) {
   const bool wide = width == CHANNEL_WIDTH_40 || width == CHANNEL_WIDTH_80;
   _phydm.set_igi_floor(
-      (_variant == jaguar3::ChipVariant::C8822C && wide && wide_tx_seen)
-          ? jaguar3::DIG_MIN_8822C_WIDE
-          : 0,
-      channel);
+      (wide && wide_tx_seen) ? _cfg.tuning.wide_tx_igi_floor : 0, channel);
 }
 
 /* Re-program TXAGC from the current knob state (see header). Both TXAGC
@@ -2085,6 +2164,10 @@ devourer::AdapterCaps RtlJaguar3Device::GetAdapterCaps() {
    * measured — responder matrix + retry-knob A/B + the arq_e2e ledgers. */
   c.ack_responder_ok = true;
   c.tx_retry_limit_ok = true;
+  /* station_mode_ok: the 8822C die only - both halves measured on one
+   * RTL8812CU by tests/realtek_station_onair.sh (numbers and limits at the
+   * AdapterCaps declaration). The 8822E runs the same code with no cell. */
+  c.station_mode_ok = _variant == jaguar3::ChipVariant::C8822C;
   /* TxMode::no_agg: AGG_EN=0 + BK=1 in build_tx_block. */
   c.tx_no_agg_ok = true;
   /* Per-packet TX power: the TXPWR_OFSET_TYPE bank selector + programmable
@@ -2113,6 +2196,7 @@ devourer::AdapterCaps RtlJaguar3Device::GetAdapterCaps() {
   c.narrowband_ok = true; /* 5/10 MHz baseband re-clock — Jaguar3 only */
   c.hw_rx_timestamp = true;  /* FrameParserJaguar3 fills RxAtrib.tsfl */
   c.hw_beacon_txtsf = true;  /* StartBeacon: MAC inserts the egress TSF into beacons */
+  c.hw_injected_mgmt_txtsf = true; /* bench 8812CU + 8812EU: injected 0x50/0x80 stamped, 38–41 µs spread */
   c.tsf_write_ok = true;     /* WriteTsf: REG_TSFTR (8822C readback) */
   c.xtal_cap_max = 0x7f;   /* 7-bit AFE crystal-cap trim (0x1040) */
   c.xtal_cap_default = 0x20;
@@ -2911,8 +2995,9 @@ size_t RtlJaguar3Device::build_tx_block(const uint8_t *packet, size_t length,
   uint8_t pwr_type = _txpkt_dflt_type.load(std::memory_order_relaxed);
   if (radiotap_pkt_pwr_db != INT_MIN)
     pwr_type = txpkt_type_for_idx(txpkt_idx_for_qdb(radiotap_pkt_pwr_db * 4));
-  /* 8822C, the session's first >= 40 MHz frame: record it (_wide_tx_seen) and
-   * apply the IGI floor (DIG_MIN_8822C_WIDE) for the CURRENT tune before the
+  /* Either die, the session's first >= 40 MHz frame: record it
+   * (_wide_tx_seen) and apply the IGI floor (DeviceConfig::Tuning::
+   * wide_tx_igi_floor; 0 = off, no arm) for the CURRENT tune before the
    * frame is queued — on a quiet channel the MAC would otherwise hold it
    * forever. Whether the floor is on follows the tuned width, which is read
    * under _reg_mu here and by every retune (apply_igi_floor_locked), so a
@@ -2923,7 +3008,7 @@ size_t RtlJaguar3Device::build_tx_block(const uint8_t *packet, size_t length,
   const bool wide_frame =
       bwidth == CHANNEL_WIDTH_40 || bwidth == CHANNEL_WIDTH_80;
   const bool c_die = _variant == jaguar3::ChipVariant::C8822C;
-  if (c_die && wide_frame &&
+  if (wide_frame && _cfg.tuning.wide_tx_igi_floor != 0 &&
       !_wide_tx_seen.load(std::memory_order_acquire)) {
     std::lock_guard<std::mutex> lk(_reg_mu);
     if (!_wide_tx_seen.load(std::memory_order_relaxed)) {
@@ -3088,8 +3173,14 @@ bool RtlJaguar3Device::SetAckResponder(const devourer::MacAddr &mac) {
   /* Hardware ACK responder (src/AckResponder.h): port identity + net_type so
    * the MAC auto-ACKs unicast frames to `mac`. Same registers the proven
    * StartBeacon/AP path programs, minus the beacon machinery. Serialized on
-   * _reg_mu like every other register-touching control call. */
+   * _reg_mu like every other register-touching control call, the station
+   * check included, so no SetStationIdentity can land between the two. */
   std::lock_guard<std::mutex> lk(_reg_mu);
+  if (_station.armed()) {
+    _logger->error("Jaguar3: ACK responder refused: a station identity owns "
+                   "port 0 (ClearStationIdentity first)");
+    return false;
+  }
   if (!devourer::ack::enable(_device, mac.data())) {
     if (!devourer::ack::disable_verified(_device)) {
       _logger->error("Jaguar3: ACK responder arm failed and rollback did "
@@ -3106,8 +3197,47 @@ bool RtlJaguar3Device::SetAckResponder(const devourer::MacAddr &mac) {
   return true;
 }
 
+bool RtlJaguar3Device::SetStationIdentity(const devourer::MacAddr &own,
+                                          const devourer::MacAddr &bssid) {
+  std::lock_guard<std::mutex> lk(_reg_mu);
+  if (!_station_ready) {
+    _logger->error("Jaguar3: station identity refused until bring-up "
+                   "(Init/InitWrite) has finished");
+    return false;
+  }
+  /* The beacon's own record, not net_type: a ClearAckResponder can close the
+   * gate under a live beacon, and net_type alone would then read "free". */
+  if (_bcn_interval_tu > 0) {
+    _logger->error("Jaguar3: station identity refused: the beacon owns port "
+                   "0 (StopBeacon first)");
+    return false;
+  }
+  /* A StartBeacon whose rollback did not land leaves the beacon enables set
+   * with no beacon recorded; the StopBeacon that retires them writes
+   * net_type. */
+  if (_bcn_hw_touched) {
+    _logger->error("Jaguar3: station identity refused: a beacon's hardware "
+                   "state is still set (StopBeacon first)");
+    return false;
+  }
+  return _station.arm(_device, own, bssid, _cfg.tx.retry_limit, _logger,
+                      "Jaguar3");
+}
+
+bool RtlJaguar3Device::ClearStationIdentity() {
+  std::lock_guard<std::mutex> lk(_reg_mu);
+  return _station.clear(_device, _logger, "Jaguar3");
+}
+
 void RtlJaguar3Device::ClearAckResponder() {
   std::lock_guard<std::mutex> lk(_reg_mu);
+  /* The gate this closes is the station's too: a clear here would leave the
+   * station deaf to its AP while it still reads as armed. */
+  if (_station.armed()) {
+    _logger->error("Jaguar3: ACK responder clear refused: port 0 belongs to "
+                   "a station identity (ClearStationIdentity instead)");
+    return;
+  }
   if (!devourer::ack::disable_verified(_device)) {
     _logger->error("Jaguar3: ACK responder disarm did not latch");
     return;
@@ -3150,6 +3280,11 @@ void RtlJaguar3Device::ClearAmpduMode() { SetAmpduMode(devourer::AmpduMode{}); }
 bool RtlJaguar3Device::StartBeacon(const uint8_t *beacon, size_t len,
                                       int interval_tu) {
   std::lock_guard<std::mutex> lk(_reg_mu);
+  if (_station.armed()) {
+    _logger->error("beacon-tbtt(J3): refused: a station identity owns port 0 "
+                   "(ClearStationIdentity first)");
+    return false;
+  }
   /* The caller may pass [radiotap][802.11 MPDU]; the rsvd-page beacon must be the
    * RAW 802.11 MPDU (the TX descriptor carries the PHY, not a radiotap header).
    * radiotap it_len is bytes [2:3] LE. Strip it. */
@@ -3266,8 +3401,11 @@ bool RtlJaguar3Device::disable_beacon_locked() {
   ok = _device.rtw_write<uint32_t>(0x0420,
                                    txq & ~(1u << 22) /* BIT_EN_BCNQ_DL */) &&
        ok;
-  uint8_t nt = _device.rtw_read8(0x0102);
-  ok = _device.rtw_write8(0x0102, static_cast<uint8_t>(nt & ~0x03u)) && ok;
+  /* net_type belongs to a station arm while one is held: leave it. */
+  if (!_station.armed()) {
+    uint8_t nt = _device.rtw_read8(0x0102);
+    ok = _device.rtw_write8(0x0102, static_cast<uint8_t>(nt & ~0x03u)) && ok;
+  }
   return ok;
 }
 

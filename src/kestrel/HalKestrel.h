@@ -3,6 +3,7 @@
 
 #include <array>
 #include <cstdint>
+#include <cstring>
 
 #include "ChipVariant.h"
 #include "KestrelFw.h"
@@ -25,6 +26,8 @@ struct EfuseInfo {
   uint8_t thermal_a = 0x22;
   uint8_t thermal_b = 0x22;
   bool autoload_ok = false; /* header parsed to a plausible MAC */
+  uint16_t pci_vid = 0;     /* PCIe only: efuse copy of the PCI ids */
+  uint16_t pci_did = 0;
 };
 
 /* HalKestrel owns the low-level MAC bring-up for the Kestrel (G6) generation:
@@ -64,9 +67,29 @@ public:
    * FWDL -> set_enable_bb_rf -> THIS -> trx init. */
   void mac_sys_init();
 
-  /* intf_init (usb_init_8852b): LFPS filter, RX bulk size, per-endpoint NUMP.
+  /* intf_init: usb_init_8852{b,c} (LFPS filter, RX bulk size, per-endpoint
+   * NUMP) on USB; pcie_init (LTR + DMA channel enable + IO release) on PCIe.
    * Vendor order: runs AFTER trx init (+ feat_init, host-side no-op). */
+  void intf_init();
   void usb_intf_init() { usb_init(); }
+
+  /* ---- PCIe (RTL8852CE) host-interface bring-up, mirroring the vendor
+   * intf_pre_init / intf_init / intf_deinit slots with rtw89's
+   * mac_pre_init_ax / mac_post_init_ax / ops_deinit as the register-level
+   * source (the USB vendor drop lacks the generic _pcie.c). All MAC
+   * registers; the ring memory itself is the transport's (hci_setup). ---- */
+  /* intf_pre_init, after dmac_pre_init and before FWDL: PHY EQ/deglitch/LDO/
+   * wake glue, IO-recovery watchdogs, stop the HAXI DMA + poll idle, clear
+   * every ring index, mode_op (RXBD_PKT, bursts, tag count, WD intervals),
+   * program the rings (RtlAdapter::hci_setup), reset the BDRAM, then re-enable
+   * DMA with only the FWCMD channel (CH12) open. False on a poll timeout. */
+  bool pcie_pre_init();
+  /* intf_init: LTR (hardware-decided, 500 us space, 3.2 ms idle timer), open
+   * every TX DMA channel, release the WPDMA / PCIe IO stops. */
+  void pcie_init();
+  /* intf_deinit: LTR off, HAXI DMA stopped, ring indices cleared — run before
+   * the transport's DMA slab is unmapped. */
+  void pcie_deinit();
 
   /* The DMAC half of mac_trx_init: re-init the DLE to the NIC-mode (SCC)
    * quota, station scheduler, MPDU processor, security engine. Must run after
@@ -241,6 +264,55 @@ public:
                                /*bmc=*/false) &&
          ok;
     return ok;
+  }
+
+  /* Register `own` as an associated INFRA station of `bssid` -- what makes the
+   * firmware COMMIT the physical ADDR_CAM entry, which add_self_sta's NO_LINK
+   * entry never gets (accepted over H2C, reads back valid=0). Two commands, in
+   * the order the vendor Windows driver sends them on a real association
+   * (captured over USBPcap): join_info(INFRA, connect), THEN the station
+   * addr_cam (SMA=own, TMA=bssid, SHORT entry, BSSID CAM at index 1). The
+   * join is the step that matters: without it the entry never commits. The
+   * vendor's surrounding commands (role CLIENT, macid unpause, CMAC and DMAC
+   * tables) were each dropped on the 8852B with no change in the commit or the
+   * ACK rate, so they are not sent. The commit is asynchronous; callers verify
+   * with addr_cam_holds(). The 8852C firmware accepts both commands and does
+   * not commit. */
+  bool register_infra_sta(const uint8_t own[6], const uint8_t bssid[6],
+                          uint8_t macid = 0, uint8_t band = 0, uint8_t port = 0) {
+    bool ok = _fw.fw_join_info(macid, reg::MAC_AX_NET_TYPE_INFRA,
+                               reg::MAC_AX_SELF_ROLE_CLIENT,
+                               reg::MAC_AX_WIFI_ROLE_STATION, port, band,
+                               /*connect=*/true);
+    ok = _fw.fw_upd_addr_cam_sta(macid, own, bssid, reg::MAC_AX_NET_TYPE_INFRA,
+                                 /*addr_cam_idx=*/0, /*bssid_cam_idx=*/1) &&
+         ok;
+    return ok;
+  }
+
+  /* One dword of the MAC's internal table SRAM (rtw89 mac_mem_read): the
+   * internal address goes to R_AX_FILTER_MODEL_ADDR, the data comes back
+   * through the R_AX_INDIR_ACCESS_ENTRY window (0x40000, a 32-bit-address
+   * access). */
+  uint32_t read_mac_mem32(uint32_t internal_addr) {
+    _device.rtw_write32(reg::R_AX_FILTER_MODEL_ADDR, internal_addr);
+    return _device.rtw_read32_wide(reg::R_AX_INDIR_ACCESS_ENTRY);
+  }
+
+  /* Whether the PHYSICAL address-CAM entry `idx` is valid and carries `sma` --
+   * what the RMAC actually matches A1 against, as opposed to what an H2C asked
+   * the firmware to write. Layout (rtw89 cam.h): word0 bit0 = VALID, then
+   * SMA[0..3] in word2 and SMA[4..5] in the low half of word3. */
+  bool addr_cam_holds(uint8_t idx, const uint8_t sma[6]) {
+    const uint32_t base = reg::ADDR_CAM_MEM_BASE + idx * reg::ADDR_CAM_ENT_LONG_SIZE;
+    if (!(read_mac_mem32(base) & 0x1u))
+      return false;
+    const uint32_t w2 = read_mac_mem32(base + 8);
+    const uint32_t w3 = read_mac_mem32(base + 12);
+    const uint8_t got[6] = {static_cast<uint8_t>(w2), static_cast<uint8_t>(w2 >> 8),
+                            static_cast<uint8_t>(w2 >> 16), static_cast<uint8_t>(w2 >> 24),
+                            static_cast<uint8_t>(w3), static_cast<uint8_t>(w3 >> 8)};
+    return std::memcmp(got, sma, 6) == 0;
   }
 
   /* Register an associated peer STA (an AP-mode client we schedule UL for):
@@ -430,6 +502,22 @@ private:
 
   bool usb_pre_init();
   void usb_init(); /* runtime USB init (endpoint NUMP/burst) — usb_init_8852b */
+  /* pcie_pre_init pieces (rtw89 pci.c, 8852C branches only). */
+  void pcie_disable_eq();
+  void pcie_ctrl_dma_all(bool enable);
+  bool pcie_poll_dma_idle();
+  void pcie_clr_idx_all();
+  void pcie_mode_op();
+  bool pcie_rst_bdram();
+  void pcie_ctrl_txdma_ch(bool enable);
+  bool pcie_ltr_set(bool enable);
+  /* LTR fully off with no message sent: HW_EN and the HW/FW/driver decision
+   * enables cleared, no driver request. pcie_ltr_set(false) is NOT this — the
+   * rtw89 disable path requests an idle LTR (REQ_DRV), which is itself a
+   * message. Used when the host has not enabled LTR (ltr_allowed() false).
+   * Returns false, writing nothing, if the LTR block reads back as
+   * unreachable (the same sentinels pcie_ltr_set refuses). */
+  bool pcie_ltr_silence();
   /* BB/RF channel helpers (all over the wIndex=1 window). */
   void bb_rmw(uint32_t addr, uint32_t mask, uint32_t val); /* masked BB write */
   uint32_t bb_read(uint32_t addr, uint32_t mask); /* masked+shifted BB read */
@@ -489,6 +577,8 @@ public:
   Logger_t _logger;
   ChipVariant _variant;
   KestrelFw _fw; /* persistent: owns the CH12 H2C transport + IO-offload */
+  bool _pcie = false; /* !_device.is_usb(); declared after _device on purpose:
+                       * the mem-initializer reads it */
   int16_t _txpwr_dbm_q2 = 20 * 4; /* fixed BB TX power, s(9,2); 20 dBm default */
   int16_t _txpwr_offset_qdb = 0;  /* runtime offset (quarter-dB), sticky */
   bool _cca_on = false; /* carrier-sense TX default (8852C) / forced on */

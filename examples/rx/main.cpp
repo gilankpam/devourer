@@ -1,6 +1,7 @@
 #include <atomic>
 #include <cassert>
 #include <cerrno>
+#include <cmath>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -27,9 +28,12 @@
 #include "RadiotapBuilder.h"
 #include "LinkHealth.h"
 #include "RxPacket.h"
+#include "StreamTelemetry.h"
 #include "SweepSpec.h"
+#include "tsf_linfit.h"
 #include "TriggerParse.h"
 #include "caps_event.h"
+#include "station_arm_env.h"
 #if defined(DEVOURER_HAVE_JAGUAR1)
 #include "jaguar1/RtlJaguarDevice.h"
 #endif
@@ -41,6 +45,9 @@
 #endif
 #if defined(DEVOURER_HAVE_8733B)
 #include "rtl8733b/Rtl8733bDevice.h"
+#endif
+#if defined(DEVOURER_HAVE_KESTREL)
+#include "kestrel/RtlKestrelDevice.h"
 #endif
 #include "RtlAdapter.h"
 #include "SignalStop.h"
@@ -108,6 +115,9 @@ static constexpr uint16_t kRealtekProductIds[] = {
 /* Written on the RX callback thread, read by the main thread and the pollers
  * as the "bring-up produced a frame" signal, so atomic. */
 static std::atomic<int> g_rx_count{0};
+/* Set when a worker-thread Init (the hop and sweep paths) has returned or
+ * thrown: RX is no longer running, so DEVOURER_STA_IDENTITY must not arm. */
+static std::atomic<bool> g_rx_ended{false};
 #if defined(DEVOURER_HAVE_JAGUAR1)
 static RtlJaguarDevice *g_rtl_device = nullptr;
 #endif
@@ -115,6 +125,15 @@ static RtlJaguarDevice *g_rtl_device = nullptr;
 /* Event sink for the demo's own JSONL emissions (packetProcessor is a free
  * function) — points at the main() Logger's sink, set before Init(). */
 static devourer::EventSink *g_ev = nullptr;
+/* Canonical-SA hits, for the final `rx.txhit` summary the harnesses read
+ * (the in-loop event only fires for the first 10 and every 100th hit). */
+static std::atomic<int> g_txhits{0};
+static void emit_txhit_final() {
+  devourer::Ev(*g_ev, "rx.txhit")
+      .f("hits", g_txhits.load())
+      .f("total_rx", g_rx_count.load())
+      .f("final", 1);
+}
 static std::unique_ptr<devourer::HopSchedule> g_hop_schedule;
 static uint64_t g_hop_slot_us = 0;
 static std::atomic<long long> g_hop_anchor_us{0};
@@ -637,6 +656,38 @@ static RxAgg g_rxagg;
  * rx.txhit matcher and the "canon" aggregate filter below. */
 static const uint8_t kTxSa[6] = {0x57, 0x42, 0x75, 0x05, 0xd6, 0x00};
 
+/* Stream timing (src/StreamTelemetry.h): the transmitter's clock, fitted from
+ * hardware egress pairs only — its TBTT beacons (FC 0x80) always, its injected
+ * probe-response markers (FC 0x50) once a marker has said this part stamps
+ * them. local = this receiver's reconstructed 64-bit tsfl of canonical-SA
+ * frames; remote = the transmitter's TSF. Never fed from a software stamp
+ * (that would fold the mean latency into the offset). */
+static tsffit::Recon g_rt_recon;
+static tsffit::LinFit g_rt_fit;
+static bool g_rt_presp_stamped = false;
+/* Which frames are the clock, as the transmitter's marker declares: its
+ * probe responses when it says they are stamped, a beacon only when it says
+ * one carries the clock. Before any marker both are taken. A beacon with the
+ * canonical SA is not proof of anything by itself — another devourer
+ * transmitter's hardware beacon can outlive the process that armed it. */
+static bool g_rt_marker_seen = false, g_rt_beacon_ok = true;
+static uint64_t g_rt_pairs = 0, g_rt_resets = 0;
+static double g_rt_resid_us = 0;
+/* The receiver's side of the fit is its hardware RX stamp; a part that does
+ * not fill tsfl (AdapterCaps::hw_rx_timestamp false — the MT7612U) has no
+ * local clock and must not fit, let alone report a latency. Set from the
+ * caps in main before the RX loop starts. */
+static bool g_rt_hw_tsfl = false;
+/* The previous pair, so a TSF jump is caught from the second pair on, not
+ * only once the fit is ready: with Δremote ≠ Δlocal by more than the
+ * discontinuity bound the transmitter's clock restarted between them. */
+static bool g_rt_have_last = false;
+static int64_t g_rt_last_remote = 0, g_rt_last_local = 0;
+/* A transmitter that restarts resets its TSF (InitWrite zeroes it): the next
+ * egress pair lands seconds off the line. Anything past this is a new clock,
+ * not jitter (a marker's own spread is tens of µs), so the fit starts over. */
+static constexpr double kRtDiscontinuityUs = 50000.0;
+
 /* DEVOURER_RX_AGG_SA: restrict the per-frame aggregate to frames whose SA
  * matches — the active-sounding filter, so ambient traffic doesn't pollute the
  * per-bin link stats (a sweep dwell hears everything on the bin; H(f) wants
@@ -1106,9 +1157,72 @@ static void packetProcessor(const Packet &packet) {
     static const bool keep_corrupted =
         std::getenv("DEVOURER_RX_KEEP_CORRUPTED") != nullptr;
     const bool corrupted = packet.RxAtrib.crc_err || packet.RxAtrib.icv_err;
+    /* Stream timing: the transmitter's clock from its egress-stamped frames,
+     * and its periodic marker as an event of its own. */
+    int64_t rt_local = 0;
+    if (sa_canon && !corrupted && packet.Data.size() >= 24) {
+      if (g_rt_hw_tsfl) rt_local = g_rt_recon(packet.RxAtrib.tsfl);
+      const uint8_t fc0 = packet.Data[0];
+      devourer::stream_timing::TimingMarker mk;
+      if (fc0 == 0x50 &&
+          devourer::stream_timing::TimingMarker::decode(
+              packet.Data.data() + 24, packet.Data.size() - 24, mk)) {
+        g_rt_presp_stamped = mk.flags & devourer::stream_timing::kMkPrespStamped;
+        g_rt_beacon_ok = mk.flags & devourer::stream_timing::kMkBeaconRunning;
+        g_rt_marker_seen = true;
+        devourer::Ev(*g_ev, "rx.timing")
+            .f("frames", mk.frames)
+            .f("tq_p50_us", mk.t_queue_p50_10 * 10)
+            .f("tq_max_us", mk.t_queue_max_10 * 10)
+            .f("tw_p50_us", mk.t_write_p50_10 * 10)
+            .f("tw_max_us", mk.t_write_max_10 * 10)
+            .f("c2s_p50_us", mk.c2s_p50_10 * 10)
+            .f("c2s_max_us", mk.c2s_max_10 * 10)
+            .f("depth_max", mk.depth_max)
+            .f("captured", mk.captured)
+            .f("tsf_pred", (unsigned long long)mk.tsf_pred_us)
+            .f("tx_fit_ppm", mk.fit_ppm_x100 / 100.0)
+            .f("tx_fit_n", mk.fit_n)
+            .f("presp_stamped", g_rt_presp_stamped ? 1 : 0)
+            .f("beacon", (mk.flags & devourer::stream_timing::kMkBeaconRunning) ? 1 : 0)
+            .f("tx_async", (mk.flags & devourer::stream_timing::kMkTxAsync) ? 1 : 0)
+            .f("tsfl", packet.RxAtrib.tsfl)
+            .f("pairs", (unsigned long long)g_rt_pairs)
+            .f("rx_fit_ppm", g_rt_fit.ready() ? g_rt_fit.ppm() : 0.0)
+            .f("rx_resid_us", g_rt_resid_us)
+            .f("rx_resets", (unsigned long long)g_rt_resets);
+      }
+      const bool clock_frame =
+          fc0 == 0x80 ? (g_rt_beacon_ok || !g_rt_marker_seen)
+                      : (fc0 == 0x50 && g_rt_presp_stamped);
+      if (g_rt_hw_tsfl && clock_frame) {
+        if (auto tx = packet.TxEgressTsf()) {
+          const int64_t remote = static_cast<int64_t>(*tx);
+          bool jump = false;
+          if (g_rt_fit.ready()) {
+            g_rt_resid_us = static_cast<double>(remote) -
+                            g_rt_fit.at(static_cast<double>(rt_local));
+            jump = std::fabs(g_rt_resid_us) > kRtDiscontinuityUs;
+          } else if (g_rt_have_last) {
+            const double d = static_cast<double>((remote - g_rt_last_remote) -
+                                                 (rt_local - g_rt_last_local));
+            jump = std::fabs(d) > kRtDiscontinuityUs;
+          }
+          if (jump) {
+            g_rt_fit = tsffit::LinFit{};
+            g_rt_pairs = 0;
+            ++g_rt_resets;
+          }
+          g_rt_fit.add(static_cast<double>(rt_local), static_cast<double>(remote));
+          ++g_rt_pairs;
+          g_rt_last_remote = remote;
+          g_rt_last_local = rt_local;
+          g_rt_have_last = true;
+        }
+      }
+    }
     if (sa_canon) {
-      static int hits = 0;
-      ++hits;
+      const int hits = ++g_txhits;
       if (hits <= 10 || hits % 100 == 0) {
         /* rate/bw/ldpc/stbc mirror the rx.frame fields: for encoding-matrix
          * runs the txhit event alone must prove what encoding was decoded
@@ -1268,6 +1382,36 @@ static void packetProcessor(const Packet &packet) {
       /* sa: the transmitter address the stream gate matched on — lets a
        * multi-source consumer attribute frames when the gate is "any". */
       ev.hex("sa", packet.Data.data() + 10, 6);
+      /* a3: addr3 verbatim, and its decode when it is the per-frame timing
+       * field (src/StreamTelemetry.h): depth behind the frame on the TX host,
+       * capture->send (cap=1: from the producer's stamp, else from the stdin
+       * read), and — once this receiver has the transmitter's clock —
+       * lat_us = submit->arrival one-way, c2a_us = capture->arrival. */
+      ev.f("fc0", packet.Data[0]);
+      if (packet.Data.size() >= 24) {
+        ev.hex("a3", packet.Data.data() + 16, 6);
+        devourer::stream_timing::FrameTiming ft;
+        if (devourer::stream_timing::FrameTiming::decode(packet.Data.data() + 16, ft)) {
+          ev.f("tel", 1)
+              .f("depth", ft.depth)
+              .f("c2s_us", ft.c2s10 * 10)
+              .f("cap", ft.has_capture ? 1 : 0);
+          /* addr1 extension: per-frame stdin-read→send and the previous
+           * frame's send_packet wall time, plus the TX frame counter. */
+          devourer::stream_timing::FrameTimingExt fx;
+          if (devourer::stream_timing::FrameTimingExt::decode(packet.Data.data() + 4, fx))
+            ev.f("tq_us", fx.t_queue10 * 10)
+                .f("tw_us", fx.t_write_prev10 * 10)
+                .f("ctr", fx.ctr);
+          devourer::stream_timing::FrameLatency fl;
+          if (g_rt_hw_tsfl && sa_canon && !corrupted && g_rt_fit.ready() &&
+              devourer::stream_timing::latency(
+                  ft, static_cast<int64_t>(g_rt_fit.at(static_cast<double>(rt_local))), fl)) {
+            ev.f("lat_us", (long long)fl.submit_to_air_us);
+            if (fl.has_capture) ev.f("c2a_us", (long long)fl.capture_to_air_us);
+          }
+        }
+      }
       /* tx_tsf: the sender's hardware TX-egress TSF (beacons / probe responses
        * only). Pair with tsfl — the local hardware RX timestamp above — for
        * one-way hardware time sync with no host-clock jitter on either end. */
@@ -1347,7 +1491,18 @@ int main(int argc, char **argv) {
         .f("stage", "demo.create_device")
         .f("ms", ms_since_start());
     devourer::emit_adapter_caps(*g_ev, dev);
+    if (const char *sta = std::getenv("DEVOURER_STA_IDENTITY");
+        sta != nullptr && *sta != '\0') {
+      logger->error("DEVOURER_STA_IDENTITY is wired on the USB path only - "
+                    "refusing rather than running an unarmed station");
+      return 1;
+    }
     int pch = 36;
+    /* DEVOURER_BAND=6 -> 6 GHz (the RTL8852CE is tri-band like the 8852CU);
+     * the band cannot be inferred from the channel number. */
+    uint8_t pband = 0;
+    if (const char *b = std::getenv("DEVOURER_BAND"))
+      pband = static_cast<uint8_t>(std::atoi(b));
     if (const char *ch_env = std::getenv("DEVOURER_CHANNEL"))
       pch = std::atoi(ch_env);
     ChannelWidth_t pwidth = CHANNEL_WIDTH_20;
@@ -1397,7 +1552,8 @@ int main(int argc, char **argv) {
       dev->Init(packetProcessor,
                 SelectedChannel{.Channel = static_cast<uint8_t>(pch),
                                 .ChannelOffset = poff,
-                                .ChannelWidth = pwidth});
+                                .ChannelWidth = pwidth,
+                                .Band = pband});
     } catch (const std::exception &e) {
       logger->error("PCIe bring-up failed: {}", e.what());
       if (pcie_la_thread.joinable())
@@ -1407,6 +1563,7 @@ int main(int argc, char **argv) {
     if (pcie_la_thread.joinable())
       pcie_la_thread.join();
     dev->Stop();
+    emit_txhit_final();
     return 0;
   }
 #endif /* DEVOURER_HAVE_PCIE */
@@ -1500,10 +1657,20 @@ int main(int argc, char **argv) {
    * (and its in-flight TX) dies before libusb does. */
   session.adopt_device(std::move(owned_device));
   IRadio *const rtlDevice = session.device();
+  /* The stream-timing clock fit needs this receiver's hardware RX stamp; set
+   * once here, ahead of every RX-loop entry point below. */
+  g_rt_hw_tsfl = rtlDevice->GetAdapterCaps().hw_rx_timestamp;
   devourer::Ev(*g_ev, "init.timing")
       .f("stage", "demo.create_device")
       .f("ms", ms_since_start());
   devourer::emit_adapter_caps(*g_ev, rtlDevice);
+  /* DEVOURER_STA_IDENTITY (examples/common/station_arm_env.h). Parsed here so
+   * a malformed value stops the run before bring-up: a station measured
+   * unarmed must never be reported as armed. */
+  bool sta_bad = false;
+  const auto sta_req = devourer::station_arm_request_from_env(logger, sta_bad);
+  if (sta_bad)
+    return 1;
   /* Backend-scoped measurement hook. Scheduling belongs to each measured
    * concrete backend so the delay starts after its arm/bring-up rather than
    * racing Init from a generic side thread. Refuse unmeasured paths: a green
@@ -1541,11 +1708,17 @@ int main(int argc, char **argv) {
         scheduled = true;
       }
 #endif
+#if defined(DEVOURER_HAVE_KESTREL)
+      if (auto *kestrel = dynamic_cast<RtlKestrelDevice *>(rtlDevice)) {
+        kestrel->ScheduleAckResponderDisarmForTest(static_cast<uint32_t>(ms));
+        scheduled = true;
+      }
+#endif
       if (!scheduled) {
         logger->error(
-            "DEVOURER_ACK_DISARM_AFTER_MS is supported only by RTL8733B "
-            "and the Jaguar1/CHIP_8812 path (measured on RTL8812AU); "
-            "refusing {}",
+            "DEVOURER_ACK_DISARM_AFTER_MS is supported only by RTL8733B, "
+            "the Jaguar1/CHIP_8812 path (measured on RTL8812AU) and Kestrel "
+            "(measured on RTL8852BU); refusing {}",
             devourer::generation_name(
                 rtlDevice->GetAdapterCaps().generation));
         return 1;
@@ -1876,6 +2049,30 @@ int main(int argc, char **argv) {
     });
   }
 
+  /* The station arm: IRadio orders it after the RX loop is running, so it
+   * waits for the first frame (10 s cap - a silent channel still arms; a
+   * backend refuses before bring-up and the helper retries that), then arms,
+   * then runs the optional scheduled clear. A worker-thread Init that has
+   * failed or ended (g_rx_ended) refuses the arm; the main-path Init runs on
+   * this thread's caller, and its end stops this thread through sta_stop. */
+  std::atomic<bool> sta_stop{false};
+  std::thread sta_thread;
+  if (sta_req) {
+    IRadio *dev = rtlDevice;
+    const devourer::StationArmRequest req = *sta_req;
+    sta_thread = std::thread([&sta_stop, dev, req, logger]() {
+      for (uint32_t s = 0; s < 10000 && !sta_stop.load() &&
+                           !g_rx_ended.load() && g_rx_count.load() == 0;
+           s += 50)
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+      if (sta_stop.load())
+        return;
+      if (devourer::station_arm_run(dev, req, *g_ev, logger, sta_stop,
+                                    &g_rx_ended))
+        devourer::station_clear_after(dev, req, *g_ev, logger, sta_stop);
+    });
+  }
+
   /* Every path below may have one or more background register readers alive.
    * Stop them before DeviceSession tears down the device/USB transport, and do
    * the same on exceptions: a joinable std::thread destructor terminates the
@@ -1887,6 +2084,9 @@ int main(int argc, char **argv) {
 #endif
     energy_emitter_stop = true;
     busy_emitter_stop = true;
+    sta_stop = true;
+    if (sta_thread.joinable())
+      sta_thread.join();
     if (busy_emitter.joinable())
       busy_emitter.join();
     if (therm_emitter.joinable())
@@ -2044,6 +2244,7 @@ int main(int argc, char **argv) {
       } catch (const std::exception &e) {
         logger->error("lockstep RX failed: {}", e.what());
       }
+      g_rx_ended = true;
     });
     /* Do not race FastRetune against firmware/calibration bring-up. A frame on
      * the parked channel proves RX is live; a silent link uses the same 10 s
@@ -2194,6 +2395,7 @@ int main(int argc, char **argv) {
       rx.join();
     stop_background_emitters.Run();
     dev->Stop();
+    emit_txhit_final();
     session.close();
     return 0;
   }
@@ -2216,6 +2418,7 @@ int main(int argc, char **argv) {
       } catch (const std::exception &e) {
         logger->error("RX-sweep bring-up failed: {}", e.what());
       }
+      g_rx_ended = true;
     });
     /* Let bring-up complete before the first retune: a retune racing the
      * worker thread's init (FW download, DACK/IQK on Jaguar3) interleaves
@@ -2303,6 +2506,7 @@ int main(int argc, char **argv) {
       rx.join();
     stop_background_emitters.Run();
     dev->Stop();
+    emit_txhit_final();
     session.close();
     return 0;
   }
@@ -2360,6 +2564,7 @@ int main(int argc, char **argv) {
   /* Clean chip de-init before dropping the interface (card-disable PWR_SEQ), so
    * the adapter re-enumerates instead of hanging its USB core. */
   rtlDevice->Stop();
+  emit_txhit_final();
 
   /* Device, then interface, handle and context (DeviceSession.h). Explicit
    * only because the process has nothing left to do here — the destructor

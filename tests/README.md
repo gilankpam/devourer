@@ -588,6 +588,30 @@ frame size. It exists to put a number under the hardware-crypto question
 (`docs/mt7612u-ap-mode.md`); compare it with a transport's per-frame send
 cost, not with another CPU.
 
+### `stream_timing_onair.sh`: per-frame timing telemetry on air
+
+Two adapters: a stream transmitter (`streamtx`, or `svctx` / `duplex` as
+phases) stamping the addr3 timing field and airing the
+`DEVOURER_STREAM_TIMING` marker, and a witness `rxdemo` fitting the
+transmitter's clock from its egress-stamped frames. Phases: `floor` (REPS
+identical runs, the run-to-run sd of the median latency reported before any
+claim), `delay` (the producer sleeps 20 ms between its capture stamp and
+every 10th record; the receiver must see that step on ~10% of frames), `hop`
+(slot hopping; the clock survives retunes where the part stamps injected
+frames), `corrupt` (CRC-failed frames kept and never fed to the fit), `svctx`
+(replay), `svctx-live` (`svctx --live` fed by `gen_svc_nals.py --capture-ts
+--pace-us`, the same producer-delay check per NAL), `duplex`, `report`
+(streamtx with a CCX report per frame: the reports must join their frames by
+tag; `TX_REPORT=1` adds the join verdict to the duplex phase too, which is how
+a Jaguar2 transmitter is covered). `tests/mcast_da_rx_check.sh` is the gate behind the
+addr1 extension: an injector alternates the broadcast DA and the group DA the
+extension's encoder ships (`07:…`) and each receiver family (the MT7612U with `MT7612U_FW_DIR`) must deliver
+both at parity. `tests/stream_timing_analyze.py` is the per-capture summary and the
+checks; `PACE_US` slows the producer for a part that cannot take 500 fps (the
+8812EU on 5 GHz). Which parts stamp an injected probe response is measured by
+`tests/probe_resp_egress_tsf_check.sh` (`HWBEACON=1` for the hardware
+beacon). Numbers and the adversarial readings: `docs/stream-timing.md`.
+
 ### `mt7612u_tsf_wrap.sh`: the MT7612U TSF read across the low-word wrap
 
 Wraps `bringup tsfwrap`, which is where the "two TSF halves are not latched"

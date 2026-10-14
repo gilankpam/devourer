@@ -203,7 +203,11 @@ int mt7612u_stop(struct mt7612u_dev *dev);
 
 /*
  * Inject one complete 802.11 frame (no FCS - the MAC appends it). Builds the
- * TXWI + TXINFO and submits a single bulk transfer. Fire-and-forget.
+ * TXWI + TXINFO and submits a single bulk transfer. Fire-and-forget: with a
+ * ring running it returns once the transfer is submitted, waiting up to ~1 s
+ * for a free slot when all are in flight and refusing (-1) if none frees.
+ * Transfers carry no timeout (as mt76's URBs): a chip that never takes them
+ * keeps refusing until mt7612u_rx_stop()/mt7612u_close() cancels the ring.
  */
 int mt7612u_tx(struct mt7612u_dev *dev, const void *frame, size_t len,
                const struct mt7612u_tx_rate *rate);
@@ -214,6 +218,11 @@ int mt7612u_tx(struct mt7612u_dev *dev, const void *frame, size_t len,
  * MAC strips it, and the four bytes that follow the MPDU in the DMA buffer
  * are the FCE info trailer, not a checksum (measured: CRC-32 matched them on
  * 0 of 4263 frames). Must not block and must not call back into the device.
+ * If a callback transmits anyway, what happens is: with the TX ring full it
+ * blocks the event thread - and with it every RX and TX completion - for up
+ * to the ~1 s slot wait; and anything that goes through the synchronous USB
+ * path (a register access, an MCU command, a send with no ring running)
+ * cannot make progress from the event thread at all.
  */
 typedef void (*mt7612u_rx_cb)(void *user, const void *frame, size_t len,
                               const struct mt7612u_rx_info *info);
@@ -249,6 +258,10 @@ int mt7612u_rx_quiesce(struct mt7612u_dev *dev);
  * station - on ambient 2.4 GHz traffic that is the difference between seeing
  * the whole mix and seeing almost nothing but beacons. Call this after
  * mt7612u_start(), which rewrites the register.
+ *
+ * While a station identity is armed (mt7612u_set_station_identity) the
+ * managed filter stays in force and this request is recorded instead; the
+ * station's clear installs it.
  */
 int mt7612u_set_monitor_rx(struct mt7612u_dev *dev, int keep_corrupted);
 
@@ -265,7 +278,8 @@ struct mt7612u_tx_view { const uint8_t *data; size_t len; };
 /*
  * Submit several frames in one call. MT7612U chains them into a single
  * bulk-OUT transfer via the TXDMA's "next valid" bit, so a burst costs one USB
- * transaction instead of one per frame. Returns the number accepted.
+ * transaction instead of one per frame. Returns the number accepted; with a
+ * ring running it stops at the first refused transfer (see mt7612u_tx).
  */
 size_t mt7612u_send_packets(struct mt7612u_dev *dev,
                             const struct mt7612u_tx_view *pkts, size_t count);
@@ -293,6 +307,48 @@ void mt7612u_clear_ack_responder(struct mt7612u_dev *dev);
  * for every setter here.
  */
 int  mt7612u_set_retry_limit(struct mt7612u_dev *dev, int limit);
+
+/*
+ * Infrastructure-station identity: this adapter is `own`, the AP it has
+ * joined is `bssid`. Backs IRadio::SetStationIdentity.
+ *
+ * On this part the job is almost entirely refusal, and that is a measured
+ * result rather than a shortcut - docs/mt7612u-station-identity.md:
+ *
+ *   - It does NOT write MT_MAC_ADDR; it requires `own` to already BE the port
+ *     identity and fails if it is not. The auto-response engine matches
+ *     address 1 against that register, so moving it stops the station being
+ *     acknowledged; under the MANAGED receive filter it also stops the
+ *     station receiving at all. This is why a station must not be armed with
+ *     mt7612u_set_ack_responder(bssid): that call retargets the very register
+ *     a station needs left alone.
+ *   - It does NOT write MT_MAC_BSSID or the APC slot table. MT_MAC_BSSID
+ *     programmed wrong, and the AP's BSSID in the station's slot, receive
+ *     what nothing programmed receives.
+ *     The BSSID is recorded for the host (it is addr3 on every frame a station
+ *     sends) and retrievable with mt7612u_station_bssid().
+ *   - It verifies MT_AUTO_RSP_EN, since the measured auto-ACK depends on it.
+ *   - It DOES write MT_RX_FILTR_CFG: the managed filter 0x00015f97
+ *     (MT_RX_FILTR_CFG_MANAGED), the receiver every station cell measured,
+ *     read back before the arm counts. What the register held is kept and put
+ *     back by the clear, and by a drop (below). A refusal writes nothing; a
+ *     managed write that does not read back is undone and refused.
+ *
+ * Returns 0 when armed, -1 when refused - including when something else (a
+ * beacon, an ACK responder) owns the port identity. A beacon or ACK responder
+ * armed LATER that moves the port identity drops the station arm with a
+ * warning and puts the pre-arm filter back; re-arm once it has been given
+ * back.
+ *
+ * The clear returns 0 once the pre-arm filter reads back (or nothing was
+ * armed), -1 when it does not - the arm then stays recorded, so a second
+ * clear retries the restore.
+ */
+int  mt7612u_set_station_identity(struct mt7612u_dev *dev,
+                                  const uint8_t own[6], const uint8_t bssid[6]);
+int  mt7612u_clear_station_identity(struct mt7612u_dev *dev);
+/* The BSSID last armed; -1 if no station identity is armed. */
+int  mt7612u_station_bssid(struct mt7612u_dev *dev, uint8_t out[6]);
 
 /*
  * Hardware beacon, from the MAC's reserved page.
@@ -364,9 +420,10 @@ struct mt7612u_stats {
 	 * them too. Nonzero here means the RX path is seeing garbage, not that
 	 * the radio is slow. */
 	uint64_t rx_invalid;
-	/* Frames the parser rejected on length - a short or malformed
-	 * transfer. Counted because such a frame used to move no counter at
-	 * all, which is indistinguishable from one that was never sent.
+	/* Completed transfers the parser rejected: a short or malformed
+	 * transfer, AND every invalid-PHY frame (which rx_invalid also counts,
+	 * so rx_dropped - rx_invalid is the length rejects). Counted so that a
+	 * rejected frame is distinguishable from one that was never sent.
 	 *
 	 * It does NOT count an oversize frame: those are discarded by the MAC
 	 * above max_mpdu_rx, before USB, so they raise nothing here. That
@@ -374,6 +431,18 @@ struct mt7612u_stats {
 	uint64_t rx_dropped;
 };
 void mt7612u_get_stats(struct mt7612u_dev *dev, struct mt7612u_stats *out);
+/* Frames handed to the async ring whose USB transfer then failed, was
+ * cancelled or was left stranded by a stop - frames that may not have reached
+ * the chip. An upper bound, not an exact count: a cancelled or short
+ * aggregated transfer counts all of its frames although the chip may have
+ * taken some, and a stranded transfer is counted when the stop strands it and
+ * never corrected should it complete later on another thread.
+ * Frames refused at submit are not in it - the send call already returned
+ * them as not accepted - nor are the synchronous path's (no ring running).
+ * Monotonic for the device's lifetime - unlike mt7612u_stats it survives a
+ * ring restart - and counted in frames, an aggregated transfer adding all of
+ * its frames. Safe to call from any thread while the device is open. */
+uint64_t mt7612u_tx_wire_failed(struct mt7612u_dev *dev);
 
 /*
  * Per-interval link statistics from the MAC's MIB counters.

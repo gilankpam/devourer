@@ -26,8 +26,8 @@ public:
   KestrelFw(RtlAdapter device, Logger_t logger, ChipVariant variant);
 
   /* mac_hal_init pre-FWDL half: hci_func_en + dmac_pre_init (DLE/HFC for
-   * DLFW). The caller then runs usb_pre_init (intf_pre_init, vendor order)
-   * before download_firmware. */
+   * DLFW). The caller then runs the intf_pre_init step (usb_pre_init /
+   * pcie_pre_init, vendor order) before download_firmware. */
   bool fw_pre_init();
 
   /* The FWDL state machine: WDT config + disable/enable WCPU + download the
@@ -43,7 +43,7 @@ public:
   bool radio_page_to_fw(uint8_t cls, uint8_t page, const uint32_t *packed,
                         uint16_t count);
 
-  bool ch12_ready() const { return _ch12_ep != 0; }
+  bool ch12_ready() const { return _ch12_ready; }
 
   /* Enable the per-user TX report (mac_cfg_usr_tx_rpt): H2C cat=MAC,
    * class=FW_OFLD, func=USR_TX_RPT. `mode` = mac_ax_usr_tx_rpt_mode (PERIOD /
@@ -67,6 +67,13 @@ public:
   bool fw_role_maintain(uint8_t macid, uint8_t self_role, uint8_t wifi_role,
                         uint8_t upd_mode, uint8_t band, uint8_t port);
 
+  /* rtw89_fw_h2c_join_info: H2C cat=MAC, class=MEDIA_RPT, func=JOININFO --
+   * the firmware's "station connected" op (`connect` sends OP=0). Without it
+   * the firmware accepts a station's addr_cam H2C and does not commit it.
+   * Roles are mac_ax_self_role / mac_ax_wifi_role, net_type mac_ax_net_type. */
+  bool fw_join_info(uint8_t macid, uint8_t net_type, uint8_t self_role,
+                    uint8_t wifi_role, uint8_t port, uint8_t band, bool connect);
+
   /* mac_upd_addr_cam (addr_cam.c): H2C cat=MAC, class=ADDR_CAM_UPDATE,
    * func=ADDRCAM_INFO — programs the address-CAM entry (BSSID+SMA+TMA+macid+
    * net_type) for `macid`. `self_mac` is the 6-byte transmitter address (our
@@ -75,6 +82,13 @@ public:
    * this entry; without it the CMAC cannot build the PPDU. */
   bool fw_upd_addr_cam(uint8_t macid, const uint8_t self_mac[6], uint8_t net_type,
                        uint8_t addr_cam_idx, uint8_t bssid_cam_idx);
+
+  /* The station form of the addr_cam, as the vendor Windows driver writes it on
+   * an association: SMA = our own address, TMA = the AP's BSSID (different),
+   * the SHORT entry length, and the BSSID CAM entry embedded with BSSID = tma. */
+  bool fw_upd_addr_cam_sta(uint8_t macid, const uint8_t sma[6],
+                           const uint8_t tma[6], uint8_t net_type,
+                           uint8_t addr_cam_idx, uint8_t bssid_cam_idx);
 
   /* mac_upd_cctl_info (tblupd.c): H2C cat=MAC, class=FR_EXCHG, func=CCTLINFO_UD
    * — the per-MACID CMAC control table. Sets the default TX rate, the TX
@@ -194,7 +208,11 @@ private:
   RtlAdapter _device;
   Logger_t _logger;
   ChipVariant _variant;
-  uint8_t _ch12_ep = 0; /* resolved bulk-OUT endpoint for CH12 (BULKOUTID2) */
+  /* CH12 (FWDL/H2C) queue handle, bus-neutral: the bulk-OUT endpoint on USB
+   * (BULKOUTID2), the DMA channel number 12 on PCIe (PcieDmaAx routes on it). */
+  uint8_t _ch12_q = 0;
+  bool _ch12_ready = false;
+  bool _pcie = false;
   std::vector<uint8_t> _txbuf; /* reused H2C packet scratch */
   uint8_t _h2c_seq = 0; /* fwinfo->h2c_seq: 8-bit rolling, all runtime H2Cs */
   /* Serializes send_h2c_cmd: it mutates the shared _txbuf scratch + _h2c_seq

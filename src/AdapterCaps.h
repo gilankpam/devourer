@@ -191,7 +191,14 @@ struct AdapterCaps {
    * 8822B, 8812C/8822C, 8812E/8822E (the 8811A rides the 8812 die path and
    * inherits its row), 8733B (1725/1725 frames ACKed at retries_mean 0.00,
    * and retarget-proof: re-armed on a different MAC, 1728/1728 —
-   * tests/ack_txreport_matrix.sh run with the 8733B as the responder).
+   * tests/ack_txreport_matrix.sh run with the 8733B as the responder),
+   * 8852B (Kestrel has no CCX report, so the soliciting TX is an 8832CU
+   * counting the ACK frames it receives, one attempt per frame, MCS1 on
+   * ch161, 3 runs per row: 14230/14430 armed at Init, 14391/14431 armed at
+   * InitWrite, 14347/14425 retargeted, 0/6440 at the old address after the
+   * retarget, 0/6194 never armed, 0/6603 after a live disarm). The 8852C
+   * reads false: its firmware does not commit the station entry, and the
+   * arm refuses on the read-back.
    *
    * The `on`, `retarget`, and legacy `off` rows establish arming, retargeting,
    * and a never-armed control. A backend-owned `disarmed` row supports only
@@ -235,6 +242,80 @@ struct AdapterCaps {
    * false-as-unmeasured on the 8821C. */
   bool ack_responder_ok = false;
   bool tx_retry_limit_ok = false;
+
+  /* station_mode_ok: IRadio::SetStationIdentity can program this MAC for the
+   * STATION half of an infrastructure BSS, and the behaviour a station needs
+   * from the silicon has been measured on air. Gate station-mode callers on
+   * this rather than on SetStationIdentity's return value alone, so a caller
+   * can refuse before it starts a handshake it cannot finish.
+   *
+   * False means "not ported / not measured", never "the silicon cannot". Do
+   * not set it from a code-reading: the bar is an on-air cell showing this
+   * adapter receiving unicast addressed to it and being ACKed for what it
+   * sends - the same shape of evidence ack_responder_ok carries, measured per
+   * die. (The MT7612U acknowledgement cells use a raw injector and an armed
+   * ACK responder as the peer, not an AP.)
+   *
+   * TRUE on MT7612U, and read docs/mt7612u-station-identity.md - its
+   * retraction section first - before quoting a number from it. Both halves
+   * of the bar are measured there, with controls: a Realtek peer's own CCX
+   * reports show this MAC acknowledging 100% of unicast addressed to it with
+   * nothing armed (0.45 mean retries, 1279 reports) against three controls
+   * pinned at the peer's 12-retry limit (a destination nobody holds, the DUT
+   * absent, and MT_AUTO_RSP_EN cleared); and the MAC's own TX status FIFO
+   * shows its uplink acknowledged 200/200 at 0.0 mean retries against a
+   * 0/200 control run to the full ladder. The uplink cell sent from the
+   * bring-up tool with an ACK-requesting TXWI and a retry limit of 15 - not
+   * a library session, whose defaults (NOACK stream radiotap, tx.retry_limit
+   * 0) send each unicast once; see IRadio::SetStationIdentity. Note the
+   * limits the measurements do NOT clear, which a caller should know:
+   *
+   *   - every cell ran an UNASSOCIATED station receiving traffic it had not
+   *     negotiated, so power save, TIM parsing, cross-BSS duplicate detection
+   *     and hardware key lookup are untested;
+   *   - those cells did not drive SetStationIdentity itself. On this part the
+   *     seam writes no identity register and installs the managed receive
+   *     filter the cells ran (0x00015f97; the RX loop's monitor filter comes
+   *     back on clear), so the measured hardware state is the state a
+   *     successful arm leaves behind, but the literal "arm through IRadio,
+   *     then measure" path is not what the cells ran;
+   *   - two units, one peer model, one channel, near field, no soak; the
+   *     second unit reproduced the acknowledgement and uplink cells (its
+   *     uplink at 1.9 mean retries against the first unit's 0.0), not the
+   *     BSSID receive table.
+   *
+   * TRUE on the Jaguar3 8822C and the Jaguar2 8822B dies, through the
+   * Realtek arm (src/StationArm.h has how it differs from the MT7612U: it
+   * configures the port rather than checking it, and refuses the other
+   * port-0 claimants rather than being dropped by them). Both halves were
+   * measured by tests/realtek_station_onair.sh, which arms through the seam
+   * itself and reads the transmitter's own CCX reports; one RTL8812CU and
+   * one RTL8812BU, each the other's peer. Read docs/realtek-station-arm.md
+   * - its limits section above all (one unit, two runs on one rig, near
+   * field, one AP type; what "received" means; the report gap) - before
+   * quoting:
+   *
+   *                  8812CU station          8812BU station
+   *   A armed        100.0% ok, 0.03 retries 100.0% ok, 0.33 retries
+   *   B nobody       0.0%, 12.00             0.0%, 12.00
+   *   C DUT absent   0.0%, 12.00             0.0%, 12.00
+   *   D unarmed      0.0%, 12.00             0.0%, 12.00
+   *   E cleared      0.0%, 12.00             0.0%, 12.00
+   *   F uplink->AP   100.0%, 0.09            100.0%, 0.20
+   *   G uplink->none 0.0%, 12.00             0.0%, 12.00
+   *   H unarmed F    100.0%, 0.08            100.0%, 0.20
+   *
+   * (Current record; an earlier record on the same rig matches it.) The
+   * flag rests on both halves met WHILE ARMED. H shows the uplink half holds
+   * without the arm too - the AP acknowledges by address - so on these dies
+   * the arm is what the DOWN half needs (D and E at 0%).
+   *
+   * FALSE on the other Realtek dies, where SetStationIdentity is ported and
+   * unmeasured: the 8822E (not measured by this cell), the 8821C, and every
+   * Jaguar1 die (8812, 8814A, 8821A, the 8811AU cut).
+   *
+   * FALSE on Kestrel and the RTL8733B: not ported. */
+  bool station_mode_ok = false;
 
   /* TxMode::no_agg is honoured: a frame carrying the radiotap TX_FLAGS
    * kRadiotapTxFlagNoAgg bit (RadiotapTxFlags.h) airs as its own PPDU at its
@@ -339,12 +420,42 @@ struct AdapterCaps {
    * (both word orders, no beacon armed), which is exactly what the Jaguar1
    * WriteTsf writes; the override itself has not run on Jaguar1 hardware. The
    * 8812A/8814A, 8821C (USB and PCIe) and 8822E ride the same pair and code
-   * path and are not separately measured. FALSE on the MT7612U (measured: its DW0/DW1 registers
-   * do not load the counter, docs/mt7612u.md), and on Kestrel and the RTL8733B
-   * (no TSF write in the source — not a bench fact). */
+   * path and are not separately measured. Kestrel: true over PCIe (RTL8852CE,
+   * readback against the FREERUN counter: +30000 µs -> +29998), false over USB
+   * (unmeasured). FALSE on the MT7612U (measured: its DW0/DW1 registers
+   * do not load the counter, docs/mt7612u.md), and on the RTL8733B (no TSF
+   * write in the source — not a bench fact).
+   *
+   * tbtt_follows_tsf: an active hardware beacon's TBTT moves with a WriteTsf
+   * (the TBTT is hardware-locked to the TSF grid), so disciplining the TSF
+   * steers the beacon — the actuator tests/pcie_ptp_tsf_discipline.cpp needs.
+   * Measured on air through WriteTsf on the RTL8852CE (Kestrel, PCIe). FALSE on
+   * Jaguar2/3, whose TBTT is deaf to a TSF write (measured — use
+   * PinBeaconTbtt there), and left false on Jaguar1: its TBTT is recorded as
+   * TSF-locked from the PinBeaconTbtt bench, but not measured through
+   * WriteTsf.
+   *
+   * hw_injected_mgmt_txtsf: the MAC ALSO overwrites the timestamp field of a
+   * management frame the HOST injects through send_packet (a probe response or
+   * a beacon-shaped frame) with its live egress TSF, so a caller can air an
+   * egress-stamped frame on any channel at any time without the hardware
+   * beacon function. Measured with a constant in the field and an independent
+   * witness reading it back (tests/probe_resp_egress_tsf_check.sh): true on
+   * the Jaguar2 8822B die (8812BU), Jaguar3 (8812CU, 8812EU) and the Kestrel
+   * 8852C die (8832CU), both FC 0x50 and 0x80, arrival−egress spread 34–41 µs
+   * over 15 s; the 8821C and 8852B dies are unmeasured and stay false. FALSE
+   * on Jaguar1:
+   * the 8821AU rewrites the field, but with a free-running counter that is
+   * neither TSF port (both read live during the run) and repeats for ~7
+   * frames at a time; its hardware TBTT beacon IS stamped (3.2 µs spread), so
+   * on this family the egress pair rides StartBeacon. The 8812AU/8814AU are
+   * unmeasured and inherit false. False on the RTL8733B (no TSF read, no
+   * beacon) and the MT7612U (unmeasured). */
   bool hw_rx_timestamp = false;
   bool hw_beacon_txtsf = false;
+  bool hw_injected_mgmt_txtsf = false;
   bool tsf_write_ok = false;
+  bool tbtt_follows_tsf = false;
   /* 802.11ax scheduled UL (Kestrel/RTL8852 only). trigger_ul_ok: the adapter
    * can air an HE Trigger frame (UL-OFDMA grant) and program the fw UL-OFDMA
    * scheduler (SendTrigger / ConfigureUlOfdma). twt_ok: the fw exposes the TWT
