@@ -1398,6 +1398,26 @@ void UsbTransport::quiesce_tx() {
   }
 }
 
+namespace {
+/* Bulk-OUT clear_halt for the async (Jaguar1) TX path. Not issued under
+ * WebUSB: there, Chrome on macOS completes every in-flight bulk-IN transfer
+ * on the device as cancelled (all of them, AbortError) while the device stays
+ * enumerated, so the RX loop dies the instant TX starts. Seen on one
+ * RTL8812AU driven through the mabur web GS: every Ground-station session
+ * failed this way with the call and none did without it; not checked on
+ * other hosts or browsers. The cost is the stall recovery this guards: a
+ * wedged bulk-OUT stays wedged in the browser. Native builds are unchanged. */
+int clear_tx_halt(libusb_device_handle *h, uint8_t ep) {
+#ifdef __EMSCRIPTEN__
+  (void)h;
+  (void)ep;
+  return 0;
+#else
+  return libusb_clear_halt(h, ep);
+#endif
+}
+} // namespace
+
 bool UsbTransport::tx_async(uint8_t tx_ep, uint8_t *packet, size_t length,
                             unsigned timeout_ms) {
   flush_writes();
@@ -1451,7 +1471,7 @@ bool UsbTransport::tx_async(uint8_t tx_ep, uint8_t *packet, size_t length,
    * the first send used to clear_halt; a mid-stream stall (e.g. hardware NDP
    * generation on some xhci hosts) then stayed wedged forever. */
   if (_tx_wedged.exchange(false)) {
-    int hr = libusb_clear_halt(_dev_handle, tx_ep);
+    int hr = clear_tx_halt(_dev_handle, tx_ep);
     _logger->info("TX EP 0x{:02X} re-clear_halt after wedge rc={}", (int)tx_ep,
                   hr);
   }
@@ -1464,7 +1484,7 @@ bool UsbTransport::tx_async(uint8_t tx_ep, uint8_t *packet, size_t length,
     /* Clear any HALT state on the TX EP. The fwdl process can leave the
      * TX EP in a stalled state from the chip side; without clear_halt the
      * USB controller would NAK every subsequent bulk OUT URB. */
-    int chr = libusb_clear_halt(_dev_handle, tx_ep);
+    int chr = clear_tx_halt(_dev_handle, tx_ep);
     _logger->info("libusb_clear_halt(EP 0x{:02X}) rc={}", (int)tx_ep, chr);
     size_t dump_len = std::min<size_t>(length, 64);
     char hex[64 * 2 + 1] = {0};
