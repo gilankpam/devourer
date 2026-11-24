@@ -363,8 +363,12 @@ at `TSF % interval` ≈ 22–48 µs after one transitional beacon, and toggling
 native state and nonzero offsets are refused; ports 1–4 do not run a TSF
 (`TSF_SYNC` from another port is unusable) and `TBTT_SHIFT_P0` is TU-granular.
 The discipline loop steers the TSF itself through `WriteTsf` —
-`tests/pcie_ptp_tsf_discipline.cpp` (actuator = TSF step, the steps subtracted
-from the fit's TSF axis, i.e. the steering ledger below) holds the TBTT to an
+`tests/pcie_ptp_tsf_discipline.cpp` (actuator = TSF step; the fit runs against
+the MAC's free-running counter, `IRadio::ReadTsfAndFreeRun`, so every step's true
+effect is measured — the older steering-ledger axis, which books commanded steps,
+let three cells drift ~10 µs rms apart on air while each loop's own estimate stayed
+sub-µs; with the free-running axis, cross-cell TBTT alignment measured on air is
+median −3…0 µs, 1.8–3.6 µs rms over five runs) holds the TBTT to an
 I226 PHC at **0.57–0.86 µs RMS** over four runs on each of two 8852CEs, one on a
 root port and one behind an ASM1182e PCIe switch (no measurable slot
 difference, including with an NVMe saturating the switch uplink) — the same
@@ -379,6 +383,24 @@ repeated-steer accuracy (incl. a PCIe master via `MASTER_CMD='ssh …'`):
 `tests/beacon_steer_survival.sh [n] [steer_us] [period_s]`.
 
 Harness: `tests/timesync_ta_demo.sh` (+ `tests/timesync_ta_analyze.py`).
+
+### Deterministic beacon departure (`SetBeaconBackoff`)
+
+A hardware beacon does not leave at its TBTT: it contends like any frame,
+waiting AIFS plus a random backoff. On Kestrel (RTL8852CE) the vendor beacon
+queue is AIFS 25 µs, ecw_min 2 / ecw_max 3, and the beacon's own egress
+timestamp shows it leaving at exactly 22, 30, 39 or 48 µs after the TBTT in
+roughly equal shares — ~10 µs RMS of departure jitter that no TSF discipline
+can remove. `IRadio::SetBeaconBackoff(false)` (where
+`AdapterCaps::beacon_backoff_ctl`) sets the beacon queue's CW to 0 with the
+AIFS unchanged; on the bench 568 of 569 beacons then left at 22 µs. The
+setting persists across a scheduler re-init.
+
+The default stays random, and it should: the backoff is what keeps two
+**uncoordinated** co-channel APs whose TBTTs coincide from colliding on every
+beacon. Turn it off only when co-channel cells' TBTTs are coordinated —
+staggered by a schedule, as in a scheduled RAN. `tests/pcie_ptp_tsf_discipline`
+takes `BCN_BACKOFF=0` for this (use it with distinct `PHASE_US` per cell).
 
 ## Bridging to network PTP (IEEE 1588)
 

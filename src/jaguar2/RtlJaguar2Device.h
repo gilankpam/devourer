@@ -71,6 +71,10 @@ public:
   void FastSetBandwidth(ChannelWidth_t bw) override;
   void InitWrite(SelectedChannel channel) override;
   bool send_packet(const uint8_t *packet, size_t length) override;
+  /* DEVOURER_TX_DATA_BE endpoint routing (RtlJaguar2Device.cpp). */
+  uint8_t tx_ep_for(const uint8_t *txdesc) const;
+  bool ac_queue_ok() const;
+  void apply_ac_tx_queue_knobs();
   /* Batch TX with USB aggregation (IRadio contract): with
    * cfg.tx.usb_agg_max > 1 consecutive frames are packed into shared bulk-OUT
    * URBs — one [txdesc][frame] block per frame, first descriptor carrying the
@@ -417,6 +421,15 @@ private:
   /* StartRxLoop stop request (StopRxLoop). volatile (not atomic) to match the
    * signal-flag pattern used across the library (g_devourer_should_stop). */
   volatile bool _rx_stop = false;
+  /* True while the RX reap loop runs; pcie_quiesce waits for it to return
+   * before the card-disable sequence stops the DMA under it. */
+  std::atomic<bool> _rx_running{false};
+  /* PCIe only: stop the chip's DMA before the transport unmaps the slab
+   * (Stop() and the destructor; idempotent). */
+  void pcie_quiesce();
+  bool _pcie_quiesced = false;
+
+  void start_rx_loop(Action_ParsedRadioPacket packetProcessor, bool clear_stale);
 
   /* Shared cold bring-up (power-on -> DLFW -> MAC/BB/RF -> channel -> LCK ->
    * IQK -> coex -> enable RX/TX engine). Used by both Init (RX) and InitWrite

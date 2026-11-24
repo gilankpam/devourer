@@ -37,13 +37,15 @@ option(DEVOURER_KESTREL_8852C "RTL8852CU / 8832CU (Kestrel 11ax, G6)"           
 # RTL8821CE on the Jaguar2 HAL) and the AX HAXI TXBD/WD-page + RXQ/RPQ rings
 # (the RTL8852CE on the Kestrel HAL). Each plane compiles with its chip group,
 # so DEVOURER_PCIE=ON needs at least one of DEVOURER_JAGUAR2_8821C /
-# DEVOURER_KESTREL_8852C. Other HalMAC PCIe parts (RTL8822BE / RTL8822CE)
-# could ride the 88xx rings with per-chip HAL gates; the RTL8852BE is refused
-# (its PCIe power sequence and single-BDRAM table are unported); Jaguar1 PCIe
+# DEVOURER_KESTREL_8852C. The RTL8822BE (Jaguar2, DEVOURER_JAGUAR2_8822B) and
+# RTL8822CE (Jaguar3, DEVOURER_JAGUAR3_8822C) ride the same 88xx rings behind
+# their HALs' is_usb() gates; the RTL8852BE (DEVOURER_KESTREL_8852B) is the
+# AX plane's second ring engine
+# (7 channels, its own register bank); Jaguar1 PCIe
 # parts (RTL8812AE/8821AE) CANNOT — pre-HalMAC silicon with the older
 # rtlwifi-style own-bit descriptor DMA, a different engine.
 # OFF by default — libusb-only builds are bit-identical.
-option(DEVOURER_PCIE          "PCIe transport via vfio-pci (Linux; RTL8821CE, RTL8852CE)"  OFF)
+option(DEVOURER_PCIE          "PCIe transport via vfio-pci (Linux; RTL8821CE, RTL8822BE, RTL8822CE, RTL8852BE, RTL8852CE)"  OFF)
 # MediaTek MT7612U / MT7662U — the first non-Realtek part. Compiles the
 # src/mt7612u subtree (its own C++ library with a C ABI, landed unwired in #412)
 # into libdevourer along with Mt7612uRadio, the IRadio backend WiFiDriver
@@ -113,14 +115,16 @@ if(DEVOURER_PCIE)
     if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
         message(FATAL_ERROR "DEVOURER_PCIE=ON requires Linux (vfio-pci).")
     endif()
-    if(NOT DEVOURER_JAGUAR2_8821C AND NOT DEVOURER_KESTREL_8852C)
+    if(NOT DEVOURER_JAGUAR2_8821C AND NOT DEVOURER_JAGUAR2_8822B
+       AND NOT DEVOURER_JAGUAR3_8822C AND NOT DEVOURER_KESTREL_8852B
+       AND NOT DEVOURER_KESTREL_8852C)
         message(FATAL_ERROR
-            "DEVOURER_PCIE=ON requires DEVOURER_JAGUAR2_8821C=ON (RTL8821CE, the "
-            "88xx buffer-descriptor DMA plane) or DEVOURER_KESTREL_8852C=ON "
-            "(RTL8852CE, the AX HAXI DMA plane) — a PCIe build without either "
-            "has no usable chip. Not an architectural limit for the HalMAC "
-            "families — RTL8822BE (Jaguar2) / RTL8822CE (Jaguar3) could reuse "
-            "the 88xx rings with per-chip HAL gates. Jaguar1 PCIe parts "
+            "DEVOURER_PCIE=ON requires DEVOURER_JAGUAR2_8821C=ON (RTL8821CE), "
+            "DEVOURER_JAGUAR2_8822B=ON (RTL8822BE) or DEVOURER_JAGUAR3_8822C=ON "
+            "(RTL8822CE) — all on the 88xx buffer-descriptor DMA plane — or "
+            "DEVOURER_KESTREL_8852B=ON / DEVOURER_KESTREL_8852C=ON (RTL8852BE / "
+            "RTL8852CE, the AX DMA plane) — a PCIe build without any of them has "
+            "no usable chip. Jaguar1 PCIe parts "
             "(RTL8812AE/8821AE) are out of reach of this transport: pre-HalMAC "
             "silicon with rtlwifi-style own-bit descriptor DMA, a different "
             "engine entirely.")
@@ -419,10 +423,10 @@ if(DEVOURER_PCIE)
     target_sources(devourer PRIVATE
         src/PcieTransport.cpp src/PcieTransport.h src/PcieDmaPlane.h
         src/PcieDmaUtil.h)
-    if(DEVOURER_JAGUAR2_8821C)
+    if(DEVOURER_JAGUAR2_8821C OR DEVOURER_JAGUAR2_8822B OR DEVOURER_JAGUAR3_8822C)
         target_sources(devourer PRIVATE src/PcieDma88xx.cpp src/PcieDma88xx.h)
     endif()
-    if(DEVOURER_KESTREL_8852C)
+    if(DEVOURER_KESTREL_8852B OR DEVOURER_KESTREL_8852C)
         target_sources(devourer PRIVATE src/PcieDmaAx.cpp src/PcieDmaAx.h)
     endif()
     target_compile_definitions(devourer PUBLIC DEVOURER_HAVE_PCIE=1)
@@ -617,7 +621,7 @@ if(DEVOURER_KESTREL)
 endif()
 
 
-# pcieprobe — staged PCIe bring-up driver for the RTL8821CE / RTL8852CE
+# pcieprobe — staged PCIe bring-up driver for the RTL8821CE / RTL8822BE / RTL8822CE / RTL8852BE / RTL8852CE
 # milestones (id/MMIO sanity -> power-on + EFUSE -> firmware download). rxdemo's
 # DEVOURER_PCIE_BDF branch is the full-RX consumer; this probe validates the
 # layers below it one at a time. Linux/vfio only.
@@ -645,6 +649,29 @@ if(DEVOURER_PCIE)
     )
     target_link_libraries(pcie_ptp_tsf_discipline PUBLIC devourer)
 endif()
+# beacon_phase_observer — on-air check that PTP-disciplined nodes hold their
+# beacons on one timebase (one receiver, one clock, every node's beacon).
+if(DEVOURER_PCIE)
+    add_executable(beacon_phase_observer
+        tests/beacon_phase_observer.cpp
+    )
+    target_link_libraries(beacon_phase_observer PUBLIC devourer)
+endif()
+# M0 contract probes (docs/scheduled-mac.md), USB or PCIe through
+# examples/common/radio_open.h (DEVOURER_PCIE_BDF selects the vfio radio).
+# POSIX bench tools (unistd.h / _exit), so not on Windows.
+if(NOT WIN32)
+foreach(m0probe dl_departure_tx txegress_witness beacon_update_probe ue_rx_probe)
+    add_executable(${m0probe}
+        tests/${m0probe}.cpp
+        examples/common/env_config.cpp
+    )
+    target_include_directories(${m0probe} PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/examples/common
+        ${CMAKE_CURRENT_SOURCE_DIR}/examples/tdma)
+    target_link_libraries(${m0probe} PUBLIC devourer)
+endforeach()
+endif()
 
 # kestrelprobe — staged USB bring-up prober for the Kestrel (RTL8852B/C):
 # AX identity (die-id/cut) -> power-on + EFUSE -> firmware download, the
@@ -656,6 +683,15 @@ if(DEVOURER_KESTREL)
     target_link_libraries(kestrelprobe PUBLIC devourer PRIVATE PkgConfig::libusb)
     # DeviceSession.h (shared teardown-order holder) lives in examples/common/.
     target_include_directories(kestrelprobe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/examples/common)
+endif()
+
+# cellcaps — print the AdapterCaps that gate a cell node (USB or, with
+# DEVOURER_PCIE, vfio PCIe). examples/common/radio_open.h selects the radio;
+# a POSIX bench tool (libusb + _exit), like the other radio_open probes.
+if(NOT WIN32)
+    add_executable(cellcaps examples/cellcaps/main.cpp examples/common/env_config.cpp)
+    target_link_libraries(cellcaps PUBLIC devourer PRIVATE PkgConfig::libusb)
+    target_include_directories(cellcaps PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/examples/common)
 endif()
 
 # rtl8733bprobe — staged USB bring-up prober for the RTL8733B (HALMAC 87xx),
@@ -906,6 +942,16 @@ add_executable(BusyWindowProbe
 target_include_directories(BusyWindowProbe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/examples/common)
 target_link_libraries(BusyWindowProbe PUBLIC devourer PRIVATE PkgConfig::libusb)
 
+# Bench driver for the StopRxLoop contract on IRadio.h: a stop issued while
+# Init() is still bringing the chip up must end Init without a loop, and a
+# stale stop must not refuse the next loop. tests/stop_during_init.sh runs the
+# matrix; a hung Init is reported as DEADLOCK, never waited out.
+add_executable(StopDuringInitProbe
+    tests/stop_during_init_probe.cpp
+)
+target_include_directories(StopDuringInitProbe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/examples/common)
+target_link_libraries(StopDuringInitProbe PUBLIC devourer PRIVATE PkgConfig::libusb)
+
 # Headless regression guard for the binary-stdin framing shared by the two
 # stream demos above (examples/common/stream_stdin.h). No libusb, no radio — just the
 # set_stdin_binary() + read_exact() path, so a text-mode regression (e.g. the
@@ -934,6 +980,16 @@ add_executable(ToneMaskSelftest
 target_link_libraries(ToneMaskSelftest PRIVATE devourer)
 
 add_test(NAME tone_mask_math COMMAND ToneMaskSelftest)
+
+# Headless guard for the Kestrel station address-CAM encoder shared by the
+# 8852B's addr_cam H2C and the 8852C's host write; expected words are
+# hardware read-backs (src/kestrel/KestrelAddrCam.h).
+add_executable(KestrelAddrCamSelftest
+    tests/kestrel_addr_cam_selftest.cpp
+)
+target_link_libraries(KestrelAddrCamSelftest PRIVATE devourer)
+
+add_test(NAME kestrel_addr_cam COMMAND KestrelAddrCamSelftest)
 
 # Headless guard for the radio contract: a radio implementing only IRadio's
 # pure-virtual core must compile without any Realtek type, its not-ported
@@ -1636,6 +1692,105 @@ target_link_libraries(UeRxAttributionSelftest PRIVATE devourer)
 
 add_test(NAME ue_rx_attribution_derive COMMAND UeRxAttributionSelftest)
 
+# Headless guard for the M1 cell core (src/cell/SlotGrid.h, GrantMap.h):
+# airtime + slot budget, fixed-grid phase math, grant-map IE round trip and
+# rejects, the receiver's epoch / effective-superframe rules.
+add_executable(CellSelftest
+    tests/cell_selftest.cpp
+)
+target_link_libraries(CellSelftest PRIVATE devourer)
+add_test(NAME cell_core COMMAND CellSelftest)
+
+# Headless guard for the M4 cell core (src/cell/TsfDiscipline.h,
+# SyncHealth.h): the discipline loop against a simulated radio + PHC (true
+# on-air TBTT phase), its bracket filter / write-failure re-anchor / ledger
+# axis, and the lock / degrade / lose / recover rules.
+add_executable(CellM4Selftest
+    tests/cell_m4_selftest.cpp
+)
+target_link_libraries(CellM4Selftest PRIVATE devourer)
+add_test(NAME cell_m4 COMMAND CellM4Selftest)
+
+# Headless guard for the M5 cell core (src/cell/Coord.h, F1.h): the CU's
+# coordination planner on the rig layout and random scenarios, the F1
+# messages (round trips, tags, malformed input) and the DU's failure model.
+add_executable(CellM5Selftest
+    tests/cell_m5_selftest.cpp
+)
+target_link_libraries(CellM5Selftest PRIVATE devourer)
+add_test(NAME cell_m5 COMMAND CellM5Selftest)
+
+# Headless guard for the M6 cell core (src/cell/Handover.h): the L3
+# measurement filter, the A3 (CHO) trigger with hysteresis / time-to-trigger /
+# dwell (a noisy cell-edge crossing: raw RSSI ping-pongs, filtered A3 moves
+# once), DAPS sequence dedup, and the F1 v2 measurement fields.
+add_executable(CellM6Selftest
+    tests/cell_m6_selftest.cpp
+)
+target_link_libraries(CellM6Selftest PRIVATE devourer)
+add_test(NAME cell_m6 COMMAND CellM6Selftest)
+
+# Headless guard for the M1 cell node's pure logic (examples/cell/cell.h).
+add_executable(CellNodeSelftest
+    tests/cell_node_selftest.cpp
+)
+target_link_libraries(CellNodeSelftest PRIVATE devourer)
+target_include_directories(CellNodeSelftest PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/examples/cell)
+add_test(NAME cell_node COMMAND CellNodeSelftest)
+
+# cell — the M1 (#255) reference DU / UE / witness node (examples/cell/main.cpp).
+# POSIX bench tool like the M0 probes (radio_open.h), so not on Windows.
+if(NOT WIN32)
+    add_executable(cell
+        examples/cell/main.cpp
+        examples/common/env_config.cpp
+    )
+    target_link_libraries(cell PUBLIC devourer)
+    target_include_directories(cell PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/examples/common
+        ${CMAKE_CURRENT_SOURCE_DIR}/examples/cell)
+    # CELL_PSK authenticates the cell with HMAC-SHA1 — the scheduling-frame
+    # tags (cell.h CellMac) and the M3 RACH (src/cell/Rach.h) both take the
+    # primitive injected. Without OpenSSL the cell runs unauthenticated and
+    # cannot RACH.
+    if(OpenSSL_FOUND)
+        target_link_libraries(cell PRIVATE OpenSSL::Crypto)
+        target_compile_definitions(cell PRIVATE DEVOURER_CELL_OPENSSL=1)
+    endif()
+endif()
+
+# ran-controller — the M5 (#259) CU (tools/ran-controller/main.cpp): F1
+# reports in, src/cell/Coord.h plans, schedules out. Header-only on the
+# library side: it never opens a radio, so it builds without libusb on a
+# controller host. POSIX sockets, so not on Windows.
+if(NOT WIN32)
+    add_executable(ran-controller tools/ran-controller/main.cpp)
+    target_include_directories(ran-controller PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_compile_features(ran-controller PRIVATE cxx_std_20)
+    if(OpenSSL_FOUND)
+        target_link_libraries(ran-controller PRIVATE OpenSSL::Crypto)
+        target_compile_definitions(ran-controller PRIVATE DEVOURER_CELL_OPENSSL=1)
+    endif()
+endif()
+
+# Headless guard for the M2 cell core (src/cell/Harq.h, LinkAdapt.h): HARQ
+# receiver dedup/window, sender ACK/NACK/timeout/attempt limit/span, a lossy-
+# channel HARQ-vs-baseline simulation, and the link-adaptation rate rules.
+add_executable(CellM2Selftest
+    tests/cell_m2_selftest.cpp
+)
+target_link_libraries(CellM2Selftest PRIVATE devourer)
+add_test(NAME cell_m2 COMMAND CellM2Selftest)
+
+# Headless guard for the M3 cell core (src/cell/Rach.h, UeRegistry.h): the
+# pool, the msgA/msgB formats and their auth/freshness rejects, duplicates,
+# exhaustion, the client's backoff rules, and a multi-UE contention run.
+add_executable(CellM3Selftest
+    tests/cell_m3_selftest.cpp
+)
+target_link_libraries(CellM3Selftest PRIVATE devourer)
+add_test(NAME cell_m3 COMMAND CellM3Selftest)
+
 # Headless guard for the TsfSync one-way time-distribution fit (src/TsfSync.h):
 # skew/offset recovery from beacon {egress, arrival} TSF pairs, clock
 # translation, the local 32-bit TSF wrap, and the Packet::TxEgressTsf pick.
@@ -1704,6 +1859,21 @@ add_executable(TxQueueSelftest tests/txqueue_selftest.cpp)
 target_link_libraries(TxQueueSelftest PRIVATE devourer)
 target_include_directories(TxQueueSelftest PRIVATE src)
 add_test(NAME txqueue_map COMMAND TxQueueSelftest)
+
+# Headless guard for the monitor RX filter knobs (src/RxFilter.h): the RCR
+# and RXFLTMAP1 values drop_ctrl / own_addr_only produce, and that the
+# defaults leave both as the monitor setups always wrote them.
+add_executable(RxFilterSelftest tests/rx_filter_selftest.cpp)
+target_link_libraries(RxFilterSelftest PRIVATE devourer)
+target_include_directories(RxFilterSelftest PRIVATE src)
+add_test(NAME rx_filter COMMAND RxFilterSelftest)
+
+# Headless guard for the AC-queue register arithmetic (src/AcTxQueue.h) behind
+# DeviceConfig::Tx::be_fast_retry / ac_lifetime_us.
+add_executable(AcTxQueueSelftest tests/ac_tx_queue_selftest.cpp)
+target_link_libraries(AcTxQueueSelftest PRIVATE devourer PkgConfig::libusb)
+target_include_directories(AcTxQueueSelftest PRIVATE src)
+add_test(NAME ac_tx_queue COMMAND AcTxQueueSelftest)
 
 # Headless guard for the beamforming-report decoder (src/BfReportDecode.h) — the
 # LSB-first Givens-angle unpacking + per-tone variance behind sense. It
@@ -1822,6 +1992,24 @@ if(Python3_Interpreter_FOUND)
                 ${CMAKE_CURRENT_SOURCE_DIR}/tools/la_csi.py --selftest
     )
     set_tests_properties(la_csi_math PROPERTIES SKIP_RETURN_CODE 77)
+
+    # Headless guard for the M1 cell KPI analysis (tests/cell_2ue_analyze.py):
+    # a synthetic in-slot run passes; a UE uplink moved into the other UE's
+    # slot is flagged out-of-slot and as an overlap; a missed uplink counts.
+    add_test(
+        NAME cell_2ue_analyze
+        COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/cell_2ue_analyze.py --selftest
+    )
+
+    # Headless guard for the M5 coordination KPIs (tests/ran_coord_analyze.py):
+    # a synthetic planned run passes; the uncoordinated one (a DL on the other
+    # cell's beacon) fails on delivery and on witness cross-cell overlaps.
+    add_test(
+        NAME ran_coord_analyze
+        COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/ran_coord_analyze.py --selftest
+    )
 
     # Headless guard for the 2.4 GHz-VHT waterfall's decode + crossing math
     # (tests/nitroqam_waterfall.py). The DESC_RATE decode is what proves which

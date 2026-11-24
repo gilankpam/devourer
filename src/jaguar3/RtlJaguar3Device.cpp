@@ -1,5 +1,7 @@
+#include "RxFilter.h"
 #include "RtlJaguar3Device.h"
 #include "TxQueueMap.h"
+#include "AcTxQueue.h"
 #include "PktBufWindow.h"
 #include "InitTimer.h"
 
@@ -86,6 +88,8 @@ struct WriteBatchScope {
 void RtlJaguar3Device::Init(Action_ParsedRadioPacket packetProcessor,
                             SelectedChannel channel) {
   _nhm_busy_ready = false;
+  _rx_stop = false;
+
   /* A new session has sent no wide frame: a re-bring-up must not inherit the
    * previous session's wide-TX IGI floor (_wide_tx_seen). */
   _wide_tx_seen.store(false, std::memory_order_relaxed);
@@ -112,6 +116,10 @@ void RtlJaguar3Device::Init(Action_ParsedRadioPacket packetProcessor,
    * the TX path (InitWrite, cold + warm); the RX-only
    * Init path has not been measured with it on a ground-station card. */
   _hal.rtw_hal_init(channel);  /* full vendor-source bring-up */
+  /* rtw_hal_init wrote this session's monitor filter maps. A TX-only
+   * InitWrite earlier on this object no longer applies: re-opening the maps
+   * in StartRxLoop would undo the beamformee arm's RXFLTMAP1 below. */
+  _rx_filters_closed = false;
   /* Tune the channel/bandwidth (5/10 MHz ChannelWidth re-clocks to narrowband),
    * then run IQK calibration (it reads RF18 for the tuned channel).
    *
@@ -170,6 +178,11 @@ void RtlJaguar3Device::Init(Action_ParsedRadioPacket packetProcessor,
      * RA has nothing to match. Give the beamformee a known identity here so
      * the sounder can address it; log it for the test harness. */
     static const uint8_t kBfeeMac[6] = {0x00, 0xe0, 0x4c, 0x88, 0x22, 0xce};
+    if (devourer::own_addr_identity_conflict(_cfg, kBfeeMac))
+      throw std::runtime_error(
+          "Jaguar3: rx.own_addr_only cannot serve a beamformee and an ACK "
+          "responder on different addresses (one MACID); give the responder "
+          "the beamformee address 00:e0:4c:88:22:ce");
     for (uint16_t i = 0; i < 6; ++i)
       _device.rtw_write8(0x0610 + i, kBfeeMac[i]);
     /* bf.mu upgrades the responder to an MU beamformee, whose report appends
@@ -194,6 +207,7 @@ void RtlJaguar3Device::Init(Action_ParsedRadioPacket packetProcessor,
       !SetAckResponder(*_cfg.rx.ack_responder)) /* DEVOURER_ACK_RESPONDER */
     throw std::runtime_error(
         "Jaguar3: configured ACK responder could not be armed");
+  apply_ac_tx_queue_knobs();
   apply_replay_wseq(); /* DEVOURER_REPLAY_WSEQ — end of both bring-ups,
                         * like Jaguar2's. */
   if (_cfg.debug.bb_dump) {
@@ -208,13 +222,28 @@ void RtlJaguar3Device::Init(Action_ParsedRadioPacket packetProcessor,
     std::lock_guard<std::mutex> lk(_reg_mu);
     _station_ready = true; /* every port-0 write of this bring-up is done */
   }
-  StartRxLoop(std::move(packetProcessor));
+  start_rx_loop(std::move(packetProcessor), false);
 }
 
 void RtlJaguar3Device::StartRxLoop(Action_ParsedRadioPacket packetProcessor) {
+  start_rx_loop(std::move(packetProcessor), true);
+}
+
+void RtlJaguar3Device::start_rx_loop(Action_ParsedRadioPacket packetProcessor, bool clear_stale) {
+  /* A signal has already landed: skip the setup below rather than build it
+   * for a loop whose own predicate would exit on its first pass. */
+  if (g_devourer_should_stop)
+    return;
+
   _packetProcessor = std::move(packetProcessor);
-  /* Restartable: clear any stop request left by a prior StopRxLoop(). */
-  _rx_stop = false;
+
+  if (clear_stale) {
+    _rx_stop = false;
+  } else if (_rx_stop) {
+    /* Stop requested during Init must prevent its receive loop from starting */
+    return;
+  }
+
   /* Take over bulk-IN from the coex thread's C2H drain up front — also during
    * the register restore below, so its 200 ms bulk reads don't interleave with
    * the RX-path enable sequence. */
@@ -224,7 +253,7 @@ void RtlJaguar3Device::StartRxLoop(Action_ParsedRadioPacket packetProcessor) {
    * (0x6A0-0x6A4, so a TX-only session's unread frames can't fill the on-chip
    * RX FIFO) and never ran enable_rx_path (the 3-wire IGI toggle that puts the
    * RF into RX mode — without it the chip delivers zero frames). This caller
-   * wants RX, so restore the monitor_rx_cfg accept-all filters and enable the
+   * wants RX, so restore the monitor_rx_cfg filter maps and enable the
    * RX path. Serialized against the coex housekeeping tick, the only other
    * register writer right now. */
   if (_rx_filters_closed) {
@@ -236,9 +265,7 @@ void RtlJaguar3Device::StartRxLoop(Action_ParsedRadioPacket packetProcessor) {
     for (int attempt = 0; attempt < 5; ++attempt) {
       try {
         std::lock_guard<std::mutex> lk(_reg_mu);
-        _device.rtw_write<uint16_t>(0x06A0, 0xFFFF);
-        _device.rtw_write<uint16_t>(0x06A2, 0xFFFF);
-        _device.rtw_write<uint16_t>(0x06A4, 0xFFFF);
+        _hal.write_rx_filter_maps();
         _hal.enable_rx_path();
         _rx_filters_closed = false;
         _logger->info("Jaguar3: RX filters re-opened + RX path enabled for "
@@ -263,6 +290,17 @@ void RtlJaguar3Device::StartRxLoop(Action_ParsedRadioPacket packetProcessor) {
         _device, _logger, devourer::tonemask::Family::JGR3, _channel, 2,
         _cfg.rx.csi_mask ? _cfg.rx.csi_mask->c_str() : nullptr,
         _cfg.rx.nbi ? _cfg.rx.nbi->c_str() : nullptr);
+  }
+
+  /* rx.own_addr_only passes only unicast to MACID, which this bring-up never
+   * programs: say so if nothing has armed an identity by now. */
+  static constexpr uint8_t kNoMac[6] = {};
+  if (_cfg.rx.own_addr_only) {
+    std::lock_guard<std::mutex> lk(_reg_mu); /* against the coex tick */
+    if (devourer::ack::macid_is(_device, kNoMac))
+      _logger->warn("Jaguar3: rx.own_addr_only with MACID 00:00:00:00:00:00: no "
+                    "unicast passes until SetAckResponder or a station or beacon "
+                    "arm sets an identity");
   }
 
   _logger->info("Jaguar3: entering RX loop (kernel-style async URB queue)");
@@ -303,7 +341,7 @@ void RtlJaguar3Device::StartRxLoop(Action_ParsedRadioPacket packetProcessor) {
           std::lock_guard<std::mutex> lk(_reg_mu);
           /* edcca_track follows the EDCCA gate alone — see the housekeeping
            * tick below for why the all-or-nothing flag is the wrong input. */
-          _phydm.tick(_channel.Channel, !_cca_edcca_disabled);
+          _phydm.tick(_channel.Channel, !_cca_edcca_disabled, !_cfg.tuning.skip_dig);
         } catch (...) {
           break; /* chip gone — the RX loop will wind down too */
         }
@@ -532,7 +570,14 @@ void RtlJaguar3Device::coex_runtime_loop() {
   auto next_tick = std::chrono::steady_clock::now();
   const auto period = std::chrono::seconds(2);
   while (!_coex_stop && !g_devourer_should_stop) {
-    if (!_rx_loop_active.load()) {
+    if (!_device.is_usb()) {
+      /* PCIe: there is no single-shot bulk read — RX (and so C2H) is the
+       * BD ring, which only StartRxLoop drains. A TX-only PCIe session keeps
+       * the coex heartbeat cadence here and sees no CCX tx.report (run
+       * DEVOURER_TX_WITH_RX=thread for those, as on J1/J2). Without this
+       * branch bulk_read_raw returns -1 at once and the loop spins. */
+      std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    } else if (!_rx_loop_active.load()) {
       /* Drain bulk-IN (empties the FW C2H buffer). 200 ms timeout bounds
        * shutdown latency when the pipe is idle. */
       int n =
@@ -581,7 +626,7 @@ void RtlJaguar3Device::coex_runtime_loop() {
        * thresholds at 0x84c every ~2 s in the EDCCA-off/primary-on arm,
        * undoing the disable the caller asked for. Jaguar1 does the same
        * thing via SetEdccaTrack(!edcca_disabled) at the end of apply_cca. */
-      _phydm.tick(_channel.Channel, !_cca_edcca_disabled);
+      _phydm.tick(_channel.Channel, !_cca_edcca_disabled, !_cfg.tuning.skip_dig);
       _hal.fw_update_wl_phy_info();
       _hal.fw_set_pwr_mode_active();
       _hal.fw_coex_query_bt_info();
@@ -805,6 +850,27 @@ void RtlJaguar3Device::apply_dpdt_route_8822e() {
   }
 }
 
+/* Three bulk-OUT endpoints: DATA rides BE (TxQueueMap.h), where the
+ * lifetime reaches it. */
+bool RtlJaguar3Device::ac_queue_ok() const {
+  return jaguar3::per_queue_routing(_device.bulk_out_ep_count());
+}
+
+/* DEVOURER_TX_BE_FAST_RETRY / _AC_LIFETIME_US, from both bring-ups (Init
+ * and InitWrite): with three bulk-OUT endpoints DATA rides BE after either
+ * (TxQueueMap.h), so the lifetime must be programmed after either. After
+ * init_edca_cfg, before the debug replay (which keeps the last word) and
+ * before the coex thread starts, so no _reg_mu. Both Jaguar3 parts, the
+ * RTL8822C and RTL8822E, were measured with three bulk-OUT endpoints; below
+ * that DATA stays on MGMT, which is never aged. */
+void RtlJaguar3Device::apply_ac_tx_queue_knobs() {
+  if (_cfg.tx.ac_lifetime_us && !ac_queue_ok())
+    _logger->warn("Jaguar3: tx.ac_lifetime_us does not reach DATA with fewer "
+                  "than three bulk-OUT endpoints (DATA stays on MGMT)");
+  if (!devourer::apply_ac_tx_queue(_device, _cfg.tx))
+    throw std::runtime_error("Jaguar3: AC-queue options could not be set");
+}
+
 /* Golden-init replay — same file format as Jaguar2's ("%x %u %llx" = addr
  * width value per line, tests/decode_wseq.py output). */
 void RtlJaguar3Device::apply_replay_wseq() {
@@ -952,6 +1018,11 @@ void RtlJaguar3Device::InitWrite(SelectedChannel channel) {
                   [this] { _device.flush_writes(); });
   WriteBatchScope batch(_device);
   _hal.rtw_hal_init(channel);  /* full vendor-source bring-up */
+  /* That bring-up wrote the monitor filter maps, so a "closed" state left by
+   * an earlier TX-only InitWrite on this object no longer describes the chip.
+   * Left set, start_rx_loop would rewrite the maps after a beamformee arm and
+   * take its control subtypes back out under rx.drop_ctrl. */
+  _rx_filters_closed = false;
   timer.stage("hal_init");
   /* 8822C at 40/80 MHz: IQK at 20 MHz, then retune — see Init. */
   const bool iqk_at_20 = _variant == jaguar3::ChipVariant::C8822C &&
@@ -1157,6 +1228,10 @@ void RtlJaguar3Device::InitWrite(SelectedChannel channel) {
       _cfg.tx.ack_timeout_us > 255   ? 255
       : _cfg.tx.ack_timeout_us < 1 ? 1
                                      : _cfg.tx.ack_timeout_us));
+  /* Inside the pipelined write batch, so a failed write most likely surfaces
+   * at batch.end() rather than as the helper's throw; bring-up fails either
+   * way. */
+  apply_ac_tx_queue_knobs();
   apply_replay_wseq(); /* DEVOURER_REPLAY_WSEQ golden-init replay (debug) */
   if (_cfg.debug.bb_dump) {
     /* Full MAC+BB dump (0x000..0x4ffc — MAC plane, then BB incl. the RF
@@ -1181,7 +1256,10 @@ void RtlJaguar3Device::InitWrite(SelectedChannel channel) {
    * adapter's transfer counter, so anything emitted after it would count
    * that thread's register and H2C traffic as bring-up. */
   timer.total();
-  _coex_thread = std::thread([this] { coex_runtime_loop(); });
+  if (_cfg.tuning.j3_runtime_thread)
+    _coex_thread = std::thread([this] { coex_runtime_loop(); });
+  else
+    _logger->info("Jaguar3: coex/phydm runtime thread not started (tuning.j3_runtime_thread)");
   if (_cfg.rx.ack_responder &&
       !SetAckResponder(*_cfg.rx.ack_responder)) /* DEVOURER_ACK_RESPONDER */
     throw std::runtime_error(
@@ -2170,6 +2248,9 @@ devourer::AdapterCaps RtlJaguar3Device::GetAdapterCaps() {
   c.station_mode_ok = _variant == jaguar3::ChipVariant::C8822C;
   /* TxMode::no_agg: AGG_EN=0 + BK=1 in build_tx_block. */
   c.tx_no_agg_ok = true;
+  c.rx_mac_filters_ok = true;
+  c.tx_ac_lifetime_ok = ac_queue_ok();
+  c.tx_be_fast_retry_ok = true;
   /* Per-packet TX power: the TXPWR_OFSET_TYPE bank selector + programmable
    * 0x1e70 offset banks (SetTxPacketPowerOffsetQdb / radiotap DBM_TX_POWER;
    * TxPktPwrBanks.h). Continuous in step_qdb units, ±63/-64 index travel, 2
@@ -2589,6 +2670,15 @@ bool RtlJaguar3Device::send_packet(const uint8_t *packet, size_t length) {
 }
 
 bool RtlJaguar3Device::send_built_block(uint8_t *block, size_t len) {
+  /* The block was sized for a shared URB; alone it can sit on a bulk-size
+   * multiple, which never airs. */
+  std::vector<uint8_t> repadded;
+  if (_device.is_usb() &&
+      jaguar3::repad_tx_block_8822c(
+          block, len, devourer::usb_bulk_mps(_device.speed()), repadded)) {
+    block = repadded.data();
+    len = repadded.size();
+  }
   const int rc = _device.bulk_send_data_sync_ep(tx_ep_for_descriptor(block),
                                                 block, len,
                                                 /*timeout_ms=*/20);
@@ -2616,9 +2706,17 @@ bool RtlJaguar3Device::send_one(const uint8_t *packet, size_t length,
   const uint16_t rlen = devourer::radiotap_hdr_len(packet, length);
   if (rlen == 0)
     return false;
-  std::vector<uint8_t> usb_frame(jaguar3::TXDESC_SIZE_8822C + (length - rlen),
-                                 0);
-  if (build_tx_block(packet, length, usb_frame.data(), 0, am) == 0)
+  /* A transfer of an exact bulk-MPS multiple never airs on this sync path
+   * (no ZLP): pad 8 bytes behind the descriptor then (TxAggPlan.h). */
+  const size_t frame_len = length - rlen;
+  const uint8_t pkt_offset =
+      _device.is_usb()
+          ? devourer::single_block_pkt_offset(
+                jaguar3::TXDESC_SIZE_8822C, frame_len, devourer::usb_bulk_mps(_device.speed()))
+          : 0;
+  std::vector<uint8_t> usb_frame(
+      jaguar3::TXDESC_SIZE_8822C + static_cast<size_t>(pkt_offset) * 8 + frame_len, 0);
+  if (build_tx_block(packet, length, usb_frame.data(), pkt_offset, am) == 0)
     return false;
   /* The endpoint IS the queue on this bus (TxQueueMap.h), unless the caller
    * forced one (tx_ep_for_qsel). */
@@ -2645,9 +2743,7 @@ size_t RtlJaguar3Device::send_packets(const TxPacketView *pkts, size_t count) {
 
   devourer::TxAggLimits lim;
   lim.desc_size = jaguar3::TXDESC_SIZE_8822C;
-  lim.bulk_size = _device.speed() >= devourer::kUsbSpeedSuper  ? 1024
-                  : _device.speed() >= devourer::kUsbSpeedHigh ? 512
-                                                               : 64;
+  lim.bulk_size = devourer::usb_bulk_mps(_device.speed());
   /* HalMAC chips parse at most 3 descriptors per bulk transfer (rtw88
    * usb_tx_agg_desc_num / halmac BLK_DESC_NUM) — beyond that the TXDMA
    * misparses (bench-proven on the 8822BU sibling: block 1 re-aired agg-num

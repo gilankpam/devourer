@@ -2,13 +2,16 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
 #include <cstring>
 #include <span>
 #include <stdexcept>
+#include <string>
 #include <thread>
 #include <utility>
 #include <vector>
 
+#include "AcTxQueue.h"
 #include "AckResponder.h" /* hardware ACK responder recipe */
 #include "RateDefinitions.h"
 #include "RadiotapPeek.h" /* send_packets batch pre-parse */
@@ -18,6 +21,7 @@
 #include "rtl8733b/TxDescriptor8733b.h"
 #include "SignalStop.h"
 #include "TxAggPlan.h" /* shared USB TX aggregation layout planner */
+#include "TxReport.h"  /* CCX C2H decode + tx.report emission */
 
 extern "C" {
 #include "ieee80211_radiotap.h"
@@ -73,6 +77,26 @@ void Rtl8733bDevice::bring_up_to_phy() {
       throw std::runtime_error("RTL8733B HALMAC/MAC initialization failed");
     _mac_ready = true;
     _firmware_ready = true;
+    /* MAC init just wrote 0x0520 = 0x6f (both carrier-sense gates ON), so a
+     * fresh MAC resets the gate pair to the configured default — bring-up IS
+     * a reset here, as on Jaguar1 — unless SetCcaMode was called BEFORE this
+     * bring-up, in which case that request is what gets applied (it returns
+     * void, so recording it is the only way to honour it; SetCcaGates
+     * refuses pre-bring-up instead, per its contract). Runtime state set
+     * later in the session survives retunes (re-asserted there), not a
+     * Stop()/Init() cycle. */
+    if (!_cca_requested) {
+      _cca_primary_disabled = _cfg.tuning.disable_cca;
+      _cca_edcca_disabled = _cfg.tuning.disable_cca;
+    }
+    _cca_requested = false;
+    /* Written unconditionally, the enabled state included: the chip keeps
+     * 0x0520 across a warm re-init (the vendor MAC table's 0x6f is not among
+     * the registers this bring-up rewrites), so a session that ended with a
+     * gate off would otherwise hand the next session that gate still off
+     * while its state said "default". Seen on the bench as a regcheck that
+     * passed once and failed on the run after it. */
+    apply_cca_gates_locked(_cca_primary_disabled, _cca_edcca_disabled);
   }
   if (!_phy.initialize(_chip.cut, _efuse))
     throw std::runtime_error("RTL8733B PHY/RF initialization failed");
@@ -132,45 +156,19 @@ void Rtl8733bDevice::bring_up_to_phy() {
     throw std::runtime_error(
         "RTL8733B: configured ACK responder could not be armed");
   }
-  /* Every other generation applies tuning.disable_cca during bring-up
-   * (jaguar1/2/3, kestrel all call SetCcaMode there), so a caller setting
-   * DEVOURER_DIS_CCA=1 reasonably expects it to take effect. This backend has
-   * not located and measured the HALMAC 87xx carrier-sense gate, so it cannot
-   * honour the request — say so once, loudly, rather than dropping it in
-   * silence, which is the one way a refused knob can look like a granted one:
-   * the operator would otherwise believe carrier-sense was off and read the
-   * resulting deferral as a transmitter problem.
-   *
-   * Deliberately a warning and not the throw SetCcaMode(true) raises: the knob
-   * is on by default for the streamtx FPV downlink, and failing bring-up
-   * outright is a harsh answer to a request the caller may be making only via
-   * an inherited environment. The session runs with standard carrier-sense.
-   *
-   * Sited in bring_up_to_phy rather than InitWrite so an RX-only session that
-   * set the knob is told too, and so it fires exactly once per bring-up. */
-  if (_cfg.tuning.disable_cca)
-    _logger->warn(
-        "RTL8733B: DEVOURER_DIS_CCA / tuning.disable_cca is not implemented by "
-        "this backend — carrier-sense stays ENABLED for this session");
-  /* DEVOURER_TX_REPORT: the CCX per-frame TX-status path is not ported. The
-   * descriptor and receive-side pieces were checked, but this backend lacks
-   * the H2C/MEDIA_STATUS_RPT path needed to register the MACID, so the observed
-   * absence of C2H reports is not assigned to firmware. The full bench
-   * narrative lives in src/rtl8733b/CLAUDE.md "Hardware ARQ".
-   *
-   * Warn rather than drop it silently: a consumer that sets this knob is
-   * asking for its per-frame delivery sensor, and would otherwise read the
-   * absence of tx.report events as a quiet link rather than an absent
-   * feature. */
+  /* DEVOURER_TX_REPORT needs nothing at bring-up beyond a freshly loaded
+   * firmware (download_firmware never reuses a running image — a reused one
+   * emits no C2H) and the SPE_RPT/SW_DEFINE stamps build_tx_block adds. The
+   * reports need an RX loop to arrive on, like Jaguar1/2. */
   if (_cfg.tx.report)
-    _logger->warn(
-        "RTL8733B: DEVOURER_TX_REPORT / tx.report is not implemented by this "
-        "backend — no CCX reports were observed, and the H2C/MACID "
-        "registration path is missing (see src/rtl8733b/CLAUDE.md)");
+    _logger->info(
+        "RTL8733B: tx.report armed — CCX reports arrive on the C2H RX path, "
+        "one terminal report per frame (src/rtl8733b/CLAUDE.md)");
 }
 
 void Rtl8733bDevice::Init(Action_ParsedRadioPacket packetProcessor,
                           SelectedChannel channel) {
+  _rx_stop = false;
   try {
     {
       std::lock_guard<std::recursive_mutex> lock(_reg_mu);
@@ -193,7 +191,7 @@ void Rtl8733bDevice::Init(Action_ParsedRadioPacket packetProcessor,
         throw std::runtime_error("RTL8733B channel configuration failed");
       _channel = channel;
       _rx_configured_bw = channel.ChannelWidth == CHANNEL_WIDTH_40 ? 1 : 0;
-      if (!_mac.configure_monitor_rx(_cfg.rx.keep_corrupted))
+      if (!_mac.configure_monitor_rx(_cfg.rx))
         throw std::runtime_error("RTL8733B monitor RX configuration failed");
     }
     /* Measurement-only live disarm. Constructed only after bring-up has
@@ -225,7 +223,7 @@ void Rtl8733bDevice::Init(Action_ParsedRadioPacket packetProcessor,
             ClearAckResponder();
           });
     }
-    StartRxLoop(std::move(packetProcessor));
+    start_rx_loop(std::move(packetProcessor), false);
   } catch (...) {
     Stop();
     throw;
@@ -248,10 +246,20 @@ void Rtl8733bDevice::InitWrite(SelectedChannel channel) {
     if (!configure_tx_power(channel))
       throw std::runtime_error("RTL8733B safe TX power setup failed");
     if (_cfg.rx.enable_with_tx &&
-        !_mac.configure_monitor_rx(_cfg.rx.keep_corrupted))
+        !_mac.configure_monitor_rx(_cfg.rx))
       throw std::runtime_error("RTL8733B monitor RX configuration failed");
     _tx_ready = true;
     _tx_submits = 0;
+    /* DEVOURER_TX_BE_FAST_RETRY / _AC_LIFETIME_US, after init_edca and
+     * before the A-MPDU mode captures the EDCA word it later restores. */
+    if (!devourer::apply_ac_tx_queue(_device, _cfg.tx))
+      throw std::runtime_error("RTL8733B AC-queue options could not be set");
+    /* DEVOURER_TX_AMPDU_MODE: MAC init rewrote the pacing registers, so a
+     * recorded mode is re-applied on every TX bring-up. */
+    if (_cfg.tx.ampdu && !_ampdu.enabled)
+      _ampdu = *_cfg.tx.ampdu;
+    if (_ampdu.enabled)
+      apply_ampdu_mode_locked();
     /* One-shot thermal snapshot at bring-up — the PA-heating baseline for the
      * session, same as the Kestrel InitWrite snapshot. Logged, never acted on:
      * the meter is a PA-bias tracking index, not a calibrated °C sensor, and
@@ -355,6 +363,16 @@ bool Rtl8733bDevice::configure_tx_power(SelectedChannel channel) {
 
 void Rtl8733bDevice::StartRxLoop(
     Action_ParsedRadioPacket packetProcessor) {
+  start_rx_loop(std::move(packetProcessor), true);
+}
+
+void Rtl8733bDevice::start_rx_loop(
+    Action_ParsedRadioPacket packetProcessor, bool clear_stale) {
+  /* A signal has already landed: skip the setup below rather than build it
+   * for a loop whose own predicate would exit on its first pass. */
+  if (g_devourer_should_stop)
+    return;
+
   Action_ParsedRadioPacket rx_packet_processor = std::move(packetProcessor);
   uint8_t rx_channel = 0;
   {
@@ -363,7 +381,12 @@ void Rtl8733bDevice::StartRxLoop(
       throw std::runtime_error("RTL8733B RX loop requires initialized hardware");
     if (_rx_active)
       throw std::runtime_error("RTL8733B RX loop is already active");
-    _rx_stop = false;
+    if (clear_stale) {
+      _rx_stop = false;
+    } else if (_rx_stop) {
+      /* Stop requested during Init must prevent its receive loop from starting */
+      return;
+    }
     _rx_active = true;
     rx_channel = _channel.Channel;
   }
@@ -422,6 +445,31 @@ void Rtl8733bDevice::StartRxLoop(
       packet.RxAtrib.pkt_rpt_type = frame.c2h
                                        ? RX_PACKET_TYPE::C2H_PACKET
                                        : RX_PACKET_TYPE::NORMAL_RX;
+      if (frame.c2h) {
+        /* Firmware report, not an 802.11 frame. The payload starts right
+         * after the RX descriptor (parse_rx_8733b keeps drvinfo/shift at 0
+         * for C2H). The CCX report is the fw-offload C2H pkt 0xFF/0x0F the
+         * shared parser decodes (src/TxReport.h); anything else is counted
+         * and, for the first few, dumped for the diagnostic plane. */
+        const uint64_t n = _c2h_seen.fetch_add(1) + 1;
+        if (devourer::is_ccx_halmac(frame.frame, frame.frame_len)) {
+          DeliverTxReport(_logger->events(),
+                          devourer::parse_ccx_halmac(frame.frame,
+                                                     frame.frame_len),
+                          "halmac");
+        } else if (n <= 8) {
+          std::string hex;
+          for (size_t i = 0; i < frame.frame_len && i < 16; ++i) {
+            char b[4];
+            std::snprintf(b, sizeof b, "%02x ", frame.frame[i]);
+            hex += b;
+          }
+          _logger->debug("RTL8733B RX: C2H #{} len={} id=0x{:02x} sub=0x{:02x} "
+                         "bytes={}",
+                         n, frame.frame_len, frame.frame[0],
+                         frame.frame_len > 2 ? frame.frame[2] : 0, hex);
+        }
+      }
       bool phy_parsed = false;
       if (!frame.c2h && frame.physt && frame.drvinfo_size >= 24)
         phy_parsed = rtl8733b::parse_phy_status_8733b(
@@ -516,6 +564,9 @@ void Rtl8733bDevice::SetMonitorChannel(SelectedChannel channel) {
     throw std::runtime_error("RTL8733B channel configuration failed");
   _channel = channel;
   _rx_configured_bw = channel.ChannelWidth == CHANNEL_WIDTH_40 ? 1 : 0;
+  /* Gate state is sticky across a retune by re-assertion, not by luck. */
+  if (_cca_primary_disabled || _cca_edcca_disabled)
+    apply_cca_gates_locked(_cca_primary_disabled, _cca_edcca_disabled);
   if (was_tx_ready) {
     if (!configure_tx_power(channel)) {
       _tx_ready = false;
@@ -544,6 +595,8 @@ void Rtl8733bDevice::FastRetune(uint8_t channel, bool cache_rf) {
                        rtl8733b::kSafeTssiTargetQdbm8733b, cache_rf,
                        _tx_offset_qdb)) {
     _channel = target;
+    if (_cca_primary_disabled || _cca_edcca_disabled)
+      apply_cca_gates_locked(_cca_primary_disabled, _cca_edcca_disabled);
     return;
   }
   /* Fast path declined (band/width change, cold radio) — full channel set at
@@ -569,13 +622,9 @@ bool Rtl8733bDevice::send_packet(const uint8_t *packet, size_t length) {
   if (radiotap_length == 0)
     return false;
   const size_t frame_len = length - radiotap_length;
-  const size_t bulk_packet = _device.speed() >= devourer::kUsbSpeedSuper
-                                 ? 1024u
-                                 : _device.speed() >= devourer::kUsbSpeedHigh
-                                       ? 512u
-                                       : 64u;
-  const uint8_t packet_offset =
-      (rtl8733b::kTxDescSize + frame_len) % bulk_packet == 0 ? 1 : 0;
+  const uint8_t packet_offset = devourer::single_block_pkt_offset(
+      rtl8733b::kTxDescSize, frame_len,
+      devourer::usb_bulk_mps(_device.speed()));
   std::vector<uint8_t> usb_frame(rtl8733b::kTxDescSize +
                                      static_cast<size_t>(packet_offset) * 8u +
                                      frame_len,
@@ -589,7 +638,7 @@ bool Rtl8733bDevice::send_packet(const uint8_t *packet, size_t length) {
    * profile, hence bulk-out ID 0 / the first enumerated endpoint (0x05 on the
    * tested f72b). Use synchronous TX so every submission has an
    * immediate, bounded result and no buffer outlives this call. */
-  const uint8_t endpoint = _device.first_bulk_out_ep();
+  const uint8_t endpoint = ep_for_qsel(usb_frame[0x05] & 0x1f);
   const uint8_t rate_hw = usb_frame[0x10] & 0x7f;
   const uint8_t rate_id = usb_frame[0x06] & 0x1f;
   const uint8_t bandwidth = (usb_frame[0x14] >> 5) & 0x3;
@@ -615,6 +664,94 @@ bool Rtl8733bDevice::send_packet(const uint8_t *packet, size_t length) {
   }
   return true;
 }
+
+uint8_t Rtl8733bDevice::ep_for_qsel(uint8_t qsel) const {
+  if (_device.bulk_out_ep_count() < 3)
+    return _device.first_bulk_out_ep();
+  switch (qsel) {
+  case 0: case 3: case 1: case 2: /* BE, BK -> LOW */
+    return _device.nth_bulk_out_ep(2);
+  case 4: case 5: case 6: case 7: /* VI, VO -> NORMAL */
+    return _device.nth_bulk_out_ep(1);
+  default: /* MGT 0x12, HIQ 0x11, beacon, cmd -> HIGH */
+    return _device.first_bulk_out_ep();
+  }
+}
+
+/* EDCA parameter register of the access category a TID rides (802.11 UP ->
+ * AC): BE 0x0508 (TIDs 0, 3), BK 0x050c (1, 2), VI 0x0504 (4, 5), VO 0x0500
+ * (6, 7). */
+static uint16_t edca_reg_for_tid(uint8_t tid) {
+  switch (tid & 7) {
+  case 1: case 2: return 0x050c;
+  case 4: case 5: return 0x0504;
+  case 6: case 7: return 0x0500;
+  default: return 0x0508;
+  }
+}
+
+/* The pacing half of the A-MPDU mode on this die. The Jaguar2 pair is
+ * programmed too (REG_AMPDU_MAX_TIME is 0x0456 here; the burst gate
+ * 0x04BC[6] reads 0x40 after init) but neither moved the needle: what paces
+ * a data queue on this MAC is its EDCA TXOP limit — the vendor init's BE
+ * value 0x005ea42b holds each launch for the full 0x5e x 32 us = 3.0 ms
+ * (VO 0x2f = 1.5 ms), so a data-queue frame airs every ~3.3 ms (~310 fps
+ * against ~2600 on the MGMT queue, measured). With the TXOP limit zeroed
+ * the queue runs free and aggregates form (EN_HWSEQ permitting). The AC's
+ * register is saved on first enable and restored on disable. */
+void Rtl8733bDevice::apply_ampdu_mode_locked() {
+  const uint16_t edca = edca_reg_for_tid(_ampdu.tid);
+  if (_ampdu.enabled) {
+    if (_ampdu.max_time != 0)
+      _device.rtw_write8(0x0456, _ampdu.max_time); /* REG_AMPDU_MAX_TIME_8733B */
+    if (_ampdu.clear_burst_mode) {
+      const uint8_t cur = _device.rtw_read8(0x04bc);
+      if (!_burst_ctrl_orig)
+        _burst_ctrl_orig = cur;
+      _device.rtw_write8(0x04bc, static_cast<uint8_t>(cur & ~(1u << 6)));
+    }
+    /* A TID change across access categories hands the previous register
+     * its saved value back before the new one is captured and zeroed, so a
+     * clear restores every register the mode touched, not just the last. */
+    if (_edca_orig && _edca_orig->first != edca) {
+      _device.rtw_write32(_edca_orig->first, _edca_orig->second);
+      _edca_orig.reset();
+    }
+    const uint32_t cur_edca = _device.rtw_read32(edca);
+    if (!_edca_orig)
+      _edca_orig = std::make_pair(edca, cur_edca);
+    _device.rtw_write32(edca, cur_edca & 0x0000ffffu); /* TXOP limit 0 */
+    _logger->info("RTL8733B: A-MPDU mode ON (tid={} max={} density={} {} "
+                  "max_time=0x{:02x} burst_ctrl 0x{:02x}->0x{:02x} "
+                  "EDCA[0x{:03x}] 0x{:08x}->0x{:08x}, HW sequence numbers)",
+                  _ampdu.tid, _ampdu.max_num, _ampdu.density,
+                  _ampdu.no_ack ? "no-ack" : "ack", _ampdu.max_time,
+                  _burst_ctrl_orig.value_or(_device.rtw_read8(0x04bc)),
+                  _device.rtw_read8(0x04bc), edca, cur_edca,
+                  _device.rtw_read32(edca));
+  } else {
+    _device.rtw_write8(0x0456, 0x70);
+    if (_burst_ctrl_orig)
+      _device.rtw_write8(0x04bc, *_burst_ctrl_orig);
+    if (_edca_orig)
+      _device.rtw_write32(_edca_orig->first, _edca_orig->second);
+    /* Forgotten once restored: the next enable captures what bring-up or a
+     * caller left there, not a value from a previous session's registers. */
+    _burst_ctrl_orig.reset();
+    _edca_orig.reset();
+    _logger->info("RTL8733B: A-MPDU mode OFF (pacing restored)");
+  }
+}
+
+bool Rtl8733bDevice::SetAmpduMode(const devourer::AmpduMode &mode) {
+  std::lock_guard<std::recursive_mutex> lock(_reg_mu);
+  _ampdu = mode;
+  if (_mac_ready)
+    apply_ampdu_mode_locked();
+  return true;
+}
+
+void Rtl8733bDevice::ClearAmpduMode() { SetAmpduMode(devourer::AmpduMode{}); }
 
 void Rtl8733bDevice::SetTxMode(const devourer::TxMode &mode) {
   std::lock_guard<std::recursive_mutex> lock(_reg_mu);
@@ -644,9 +781,7 @@ size_t Rtl8733bDevice::send_packets(const TxPacketView *pkts, size_t count) {
 
   devourer::TxAggLimits lim;
   lim.desc_size = rtl8733b::kTxDescSize;
-  lim.bulk_size = _device.speed() >= devourer::kUsbSpeedSuper  ? 1024
-                  : _device.speed() >= devourer::kUsbSpeedHigh ? 512
-                                                               : 64;
+  lim.bulk_size = devourer::usb_bulk_mps(_device.speed());
   /* BLK_DESC_NUM: MAC init already programs 3 into DWBCN0_CTRL[7:4]
    * (Halmac8733bMac.cpp) — the same field and value the HalMAC 88xx siblings
    * use — so 3 descriptors per bulk transfer is what this TXDMA parses.
@@ -663,6 +798,7 @@ size_t Rtl8733bDevice::send_packets(const TxPacketView *pkts, size_t count) {
      * outright and it must not be packed beside frames that would have
      * aired. */
     std::vector<size_t> lens;
+    bool run_data = false;
     for (size_t i = done; i < count && lens.size() < lim.max_frames; ++i) {
       /* A null view is treated exactly like a malformed one: it ends the run
        * and, if it led, is skipped per the IRadio::send_packets
@@ -673,6 +809,17 @@ size_t Rtl8733bDevice::send_packets(const TxPacketView *pkts, size_t count) {
               : devourer::radiotap_hdr_len(pkts[i].data, pkts[i].len);
       if (rlen == 0)
         break;
+      /* DEVOURER_TX_DATA_BE: DATA rides BE and everything else MGMT, on
+       * different endpoints, and one URB goes to one endpoint — a change of
+       * frame type ends the run. */
+      if (_cfg.tx.data_on_be) {
+        const bool data =
+            pkts[i].len > rlen && devourer::dot11_is_data(pkts[i].data[rlen]);
+        if (lens.empty())
+          run_data = data;
+        else if (data != run_data)
+          break;
+      }
       const int want =
           devourer::radiotap_peek_channel(pkts[i].data, pkts[i].len);
       if (want > 0 && want != _channel.Channel) {
@@ -729,7 +876,8 @@ size_t Rtl8733bDevice::send_packets(const TxPacketView *pkts, size_t count) {
       continue;
     }
 
-    const int rc = _device.bulk_send_sync_ep(_device.first_bulk_out_ep(),
+    const uint8_t agg_ep = ep_for_qsel(urb[0x05] & 0x1f);
+    const int rc = _device.bulk_send_sync_ep(agg_ep,
                                              urb.data(), urb.size(),
                                              /*timeout_ms=*/100);
     /* bulk_send_sync_ep returns BYTES SUBMITTED, so `rc >= 0` also covers a
@@ -745,7 +893,7 @@ size_t Rtl8733bDevice::send_packets(const TxPacketView *pkts, size_t count) {
        * backend has no NAK-backoff flood concern excusing silence. */
       _logger->error("RTL8733B aggregated TX failed/short on EP 0x{:02x}: "
                      "{}/{} ({} frames dropped)",
-                     _device.first_bulk_out_ep(), rc, urb.size(),
+                     agg_ep, rc, urb.size(),
                      plan.frames());
     devourer::Ev(_logger->events(), "tx.agg")
         .f("frames", (unsigned long long)plan.frames())
@@ -764,7 +912,7 @@ size_t Rtl8733bDevice::send_packets(const TxPacketView *pkts, size_t count) {
         _logger->info(
             "RTL8733B first TX accepted (aggregated): EP=0x{:02x} frames={} "
             "bytes={} shim={}",
-            _device.first_bulk_out_ep(), plan.frames(), urb.size(), plan.shim);
+            agg_ep, plan.frames(), urb.size(), plan.shim);
     }
     done += plan.frames();
   }
@@ -792,6 +940,16 @@ size_t Rtl8733bDevice::build_tx_block(const uint8_t *packet, size_t length,
 
   /* A per-packet radiotap rate below remains authoritative. Rate-less frames
    * use the same SetTxMode default as the established backends and txdemo. */
+  bool short_gi = false;
+  bool ldpc = false;
+  /* Every refusal below is said once, by name: a silent `return 0` reaches
+   * txdemo as a run of failed sends, and the operator is then told to look
+   * at the USB path for a frame this backend never tried to send. */
+  const auto refuse = [this](const char *why) -> size_t {
+    if (!_refusal_logged.exchange(true))
+      _logger->error("RTL8733B TX refused: {}", why);
+    return 0;
+  };
   if (_tx_mode_default) {
     const auto &mode = *_tx_mode_default;
     /* One predicate covers the family (VHT/HE refused outright) and its
@@ -799,12 +957,16 @@ size_t Rtl8733bDevice::build_tx_block(const uint8_t *packet, size_t length,
      * below cannot drift apart — and the refusals are testable without
      * hardware (tests/rtl8733b_tx_desc_selftest.cpp). */
     if (!rtl8733b::tx_mode_supported_8733b(mode))
-      return 0;
+      return refuse("the configured TX mode is outside this die's contract "
+                    "(1SS legacy/HT MCS0-7, 20/40 MHz, no STBC/VHT/HE; CCK "
+                    "on 2.4 GHz at 20 MHz only)");
     if (mode.mode == devourer::TxMode::Mode::Legacy) {
       fixed_rate = mode.legacy_rate_500kbps;
     } else {
       fixed_rate = static_cast<uint8_t>(MGN_MCS0 + mode.ht_mcs);
       frame_width = mode.bw_mhz == 40 ? CHANNEL_WIDTH_40 : CHANNEL_WIDTH_20;
+      short_gi = mode.sgi;
+      ldpc = mode.ldpc;
     }
   }
 
@@ -819,12 +981,14 @@ size_t Rtl8733bDevice::build_tx_block(const uint8_t *packet, size_t length,
     case IEEE80211_RADIOTAP_RATE:
       fixed_rate = *iterator.this_arg;
       frame_width = CHANNEL_WIDTH_20;
+      short_gi = false;
+      ldpc = false;
       break;
     case IEEE80211_RADIOTAP_CHANNEL:
       requested_channel =
           devourer::freq_to_chan(get_unaligned_le16(iterator.this_arg));
       if (requested_channel <= 0)
-        return 0;
+        return refuse("radiotap CHANNEL names no 802.11 channel");
       break;
     case IEEE80211_RADIOTAP_MCS: {
       const auto m = devourer::decode_radiotap_mcs_field(iterator.this_arg);
@@ -832,14 +996,17 @@ size_t Rtl8733bDevice::build_tx_block(const uint8_t *packet, size_t length,
           !rtl8733b::ht_request_supported_8733b(m.mcs, m.bw40 ? 40 : 20,
                                                 m.sgi != 0, m.ldpc != 0,
                                                 m.stbc != 0))
-        return 0;
+        return refuse("radiotap MCS asks for HT this die refuses (MCS > 7, "
+                      "a second stream, or STBC)");
       fixed_rate = static_cast<uint8_t>(MGN_MCS0 + m.mcs);
       frame_width = m.bw40 ? CHANNEL_WIDTH_40 : CHANNEL_WIDTH_20;
+      short_gi = m.sgi != 0;
+      ldpc = m.ldpc != 0;
       break;
     }
     case IEEE80211_RADIOTAP_VHT:
     case IEEE80211_RADIOTAP_HE:
-      return 0; // RTL8733B contract is legacy CCK/OFDM + HT 1SS only
+      return refuse("radiotap VHT/HE — this die is 802.11b/g/n only");
     default:
       break;
     }
@@ -848,16 +1015,22 @@ size_t Rtl8733bDevice::build_tx_block(const uint8_t *packet, size_t length,
   /* This initial path does not retune during a submission. Refuse a mismatched
    * radiotap CHANNEL instead of silently airing on the session channel. */
   if (requested_channel > 0 && requested_channel != _channel.Channel)
-    return 0;
+    return refuse("radiotap CHANNEL differs from the tuned channel — this "
+                  "backend retunes for nobody mid-submission (FastRetune "
+                  "first, or drop the field)");
 
   if (frame_width == CHANNEL_WIDTH_40 &&
       _channel.ChannelWidth != CHANNEL_WIDTH_40)
-    return 0;
+    return refuse(_channel.ChannelWidth == CHANNEL_WIDTH_20
+                      ? "a 40 MHz frame on a 20 MHz-configured channel — "
+                        "bring the channel up at 40 MHz (txdemo: "
+                        "DEVOURER_HOP_BW=40) or send a 20 MHz frame"
+                      : "a 40 MHz frame on a narrowband-configured channel");
   if (_channel.ChannelWidth != CHANNEL_WIDTH_20 &&
       _channel.ChannelWidth != CHANNEL_WIDTH_40 &&
       _channel.ChannelWidth != CHANNEL_WIDTH_5 &&
       _channel.ChannelWidth != CHANNEL_WIDTH_10)
-    return 0;
+    return refuse("the tuned channel width is not one this die injects on");
 
   uint8_t data_sc = 0;
   if (_channel.ChannelWidth == CHANNEL_WIDTH_40 &&
@@ -885,13 +1058,46 @@ size_t Rtl8733bDevice::build_tx_block(const uint8_t *packet, size_t length,
   cfg.agg_num = agg_num;
   cfg.retry_limit = static_cast<uint8_t>(
       std::clamp(_cfg.tx.retry_limit, 0, 63));
-  cfg.short_gi = false;
-  cfg.ldpc = false;
+  cfg.short_gi = short_gi;
+  cfg.ldpc = ldpc;
   cfg.bmc = bmc;
-  if (!rtl8733b::fill_tx_desc_8733b(out, rtl8733b::kTxDescSize, cfg)) {
-    _logger->error("RTL8733B TX rejected: unsupported rate/width/coding");
-    return 0;
+  /* DEVOURER_TX_DATA_BE: DATA frames ride BE; send_packet / send_packets
+   * route the block to the BE queue's endpoint through ep_for_qsel. */
+  if (_cfg.tx.data_on_be && devourer::dot11_is_data(dot11[0]))
+    cfg.qsel = 0;
+  if (_ampdu.enabled) {
+    cfg.qsel = static_cast<uint8_t>(_ampdu.tid & 0x07);
+    cfg.agg_en = true;
+    cfg.max_agg_num = static_cast<uint8_t>(_ampdu.max_num & 0x1f);
+    cfg.ampdu_density = static_cast<uint8_t>(_ampdu.density & 0x07);
+    cfg.hw_seq = true;
+    if (_ampdu.no_ack)
+      cfg.retry_limit = 0;
   }
+  /* The raw per-field spike knobs (DeviceConfig::debug tx_qsel / tx_ampdu_*)
+   * override the product mode, as on Jaguar2 — register-level isolation of
+   * queue vs AGG_EN vs retry, nothing a consumer should set. */
+  if (_cfg.debug.tx_qsel)
+    cfg.qsel = static_cast<uint8_t>(*_cfg.debug.tx_qsel & 0x1f);
+  if (_cfg.debug.tx_ampdu_max) {
+    cfg.agg_en = true;
+    cfg.max_agg_num = static_cast<uint8_t>(*_cfg.debug.tx_ampdu_max & 0x1f);
+    cfg.ampdu_density = static_cast<uint8_t>(_cfg.debug.tx_ampdu_density & 0x7);
+    if (_cfg.debug.tx_ampdu_rty)
+      cfg.retry_limit = static_cast<uint8_t>(*_cfg.debug.tx_ampdu_rty & 0x3f);
+  }
+  if (_cfg.tx.report) {
+    /* DEVOURER_TX_REPORT: SPE_RPT on every Nth frame, the SW_DEFINE tag on
+     * every frame, the same shape as Jaguar2/3 so tests/txrpt_coverage_attrib
+     * reads this die's reports unchanged. */
+    const uint64_t k = _tx_rpt_tag.fetch_add(1);
+    cfg.spe_rpt = k % static_cast<uint64_t>(_cfg.tx.report) == 0;
+    cfg.sw_define = static_cast<uint16_t>(k & 0xff);
+  }
+  if (!rtl8733b::fill_tx_desc_8733b(out, rtl8733b::kTxDescSize, cfg))
+    return refuse("the descriptor encoder rejected the rate/width/coding "
+                  "combination (CCK off 2.4 GHz or at 40 MHz, legacy SGI/"
+                  "LDPC, or an out-of-range field)");
 
   const size_t frame_offset =
       rtl8733b::kTxDescSize + static_cast<size_t>(packet_offset) * 8u;
@@ -1013,27 +1219,62 @@ void Rtl8733bDevice::ClearAckResponder() {
   (void)disarm_ack_responder();
 }
 
+/* 0x0520[14] BIT_DIS_CCA (primary carrier-sense) / [15] BIT_DIS_EDCCA, plus
+ * 0x0524[11] BIT_EDCCA_MSK_CNTDOWN_EN following the EDCCA gate alone — the
+ * Jaguar3 recipe, on a register map halmac_bit_8733b.h names identically.
+ * MAC bits only: the vendor's BB CCA-off writes (0x1d58[11:3], and on this
+ * die 0x2a24[13] for CCK) stop detection and deafen the RX, so they stay out.
+ * Caller holds _reg_mu. */
+void Rtl8733bDevice::apply_cca_gates_locked(bool primary_disabled,
+                                            bool edcca_disabled) {
+  uint32_t v520 = _device.rtw_read32(0x0520);
+  uint32_t v524 = _device.rtw_read32(0x0524);
+  if (primary_disabled) v520 |= (1u << 14); else v520 &= ~(1u << 14);
+  if (edcca_disabled)   v520 |= (1u << 15); else v520 &= ~(1u << 15);
+  if (edcca_disabled)   v524 &= ~(1u << 11); else v524 |= (1u << 11);
+  _device.rtw_write32(0x0520, v520);
+  _device.rtw_write32(0x0524, v524);
+}
+
+bool Rtl8733bDevice::GetCcaGates(bool &primary_disabled, bool &edcca_disabled) {
+  std::lock_guard<std::recursive_mutex> lock(_reg_mu);
+  if (!_mac_ready)
+    return false;
+  const uint32_t v = _device.rtw_read32(0x0520);
+  primary_disabled = (v & (1u << 14)) != 0;
+  edcca_disabled = (v & (1u << 15)) != 0;
+  return true;
+}
+
+bool Rtl8733bDevice::SetCcaGates(bool primary_disabled, bool edcca_disabled) {
+  std::lock_guard<std::recursive_mutex> lock(_reg_mu);
+  if (!_mac_ready)
+    return false;
+  _cca_primary_disabled = primary_disabled;
+  _cca_edcca_disabled = edcca_disabled;
+  apply_cca_gates_locked(primary_disabled, edcca_disabled);
+  _logger->info("RTL8733B: CCA gates primary={} edcca={}",
+                primary_disabled ? "OFF" : "on", edcca_disabled ? "OFF" : "on");
+  return true;
+}
+
 void Rtl8733bDevice::SetCcaMode(bool disabled) {
-  if (!disabled) {
-    /* `false` is the universal default — carrier-sense + EDCCA enabled — and
-     * that is exactly what this backend's HALMAC MAC bring-up leaves
-     * programmed. Succeed as a no-op: callers that assert the default
-     * unconditionally (examples/timesync) must not be punished for asking for
-     * the state the chip is already in. */
-    return;
+  std::lock_guard<std::recursive_mutex> lock(_reg_mu);
+  _cca_primary_disabled = disabled;
+  _cca_edcca_disabled = disabled;
+  if (_mac_ready) {
+    apply_cca_gates_locked(disabled, disabled);
+  } else {
+    /* Nothing to write yet; bring-up applies this instead of the config
+     * default. Said out loud so a pre-bring-up call is never mistaken for
+     * one that took effect on the chip. */
+    _cca_requested = true;
+    _logger->info("RTL8733B: MAC carrier-sense {} recorded before bring-up — "
+                  "applied when the MAC comes up",
+                  disabled ? "DISABLE" : "enable");
   }
-  /* `true` (DEVOURER_DIS_CCA) is not ported. The HALMAC 87xx carrier-sense
-   * gate has not been located and measured on this part, and this backend
-   * does not guess at PHY/MAC writes it cannot read back. Refuse loudly, per
-   * the pure-virtual contract in IRadio — but do NOT tear the session
-   * down: an unsupported optional knob is not a hardware-safety event, and
-   * card-disabling here would leave the caller with a dead chip for asking a
-   * question. The session stays up with standard carrier-sense. */
-  _logger->error(
-      "RTL8733B: CCA disable (DEVOURER_DIS_CCA) is not implemented by this "
-      "backend; carrier-sense stays enabled");
-  throw std::runtime_error(
-      "RTL8733B CCA disable is not implemented by this backend");
+  _logger->info("RTL8733B: MAC carrier-sense {}",
+                disabled ? "DISABLED (dis_cca: CCA+EDCCA)" : "enabled (default)");
 }
 
 void Rtl8733bDevice::Stop() {
@@ -1084,13 +1325,14 @@ void Rtl8733bDevice::Stop() {
 
 devourer::TxCaps Rtl8733bDevice::GetTxCaps() {
   /* Advertised surface: one spatial stream, 2.4-GHz long-preamble CCK, legacy
-   * OFDM, and HT MCS0-7 at 20/40 MHz. TxCaps has no separate CCK flag. Keep SGI
-   * false: an independent receiver decoded a descriptor-SGI probe as long GI.
-   * The vendor advertises TX-LDPC (but not RX-LDPC); this raw-injection backend
-   * keeps it false because only forced-global-BCC operation has passed
-   * independently witnessed injection. Experimental 5/10 MHz is likewise
-   * omitted until an occupied-bandwidth and cross-receiver gate passes. */
-  return devourer::tx_caps_for_chains(1, false, false, 40);
+   * OFDM, and HT MCS0-7 at 20/40 MHz, long or short GI, BCC or LDPC — SGI
+   * and LDPC each measured on air (TxDescriptor8733b.h). ldpc_ok is the
+   * TRANSMIT claim — the frame airs LDPC-coded and a witness decodes it with
+   * its LDPC flag set; the coding GAIN (the Jaguars' ~+3 dB waterfall) is
+   * unmeasured on this die and not implied by the flag. TxCaps has no
+   * separate CCK flag. Experimental 5/10 MHz is omitted until an
+   * occupied-bandwidth and cross-receiver gate passes. */
+  return devourer::tx_caps_for_chains(1, true, true, 40);
 }
 
 devourer::AdapterCaps Rtl8733bDevice::GetAdapterCaps() {
@@ -1157,7 +1399,17 @@ devourer::AdapterCaps Rtl8733bDevice::GetAdapterCaps() {
    * (tests/rtl8733b_retry_limit_onair.sh; bench narrative in
    * src/rtl8733b/CLAUDE.md "Hardware ARQ"). */
   caps.ack_responder_ok = true;
+  caps.rx_mac_filters_ok = true;
+  caps.tx_ac_lifetime_ok = true;
+  caps.tx_be_fast_retry_ok = true;
   caps.tx_retry_limit_ok = true;
+  /* RX-LDPC measured absent, as the vendor HAL declares: 0 of 1542 MCS7/20
+   * LDPC frames from an RTL8822BU decoded on the b733 against 1435/1542
+   * (93%) BCC in the same session shape (ch36). The RX parser also carries
+   * no LDPC indicator. TX-LDPC is the separate, true claim in GetTxCaps. */
+  caps.ldpc_rx_ht = false;
+  caps.ldpc_rx_vht = false;
+  caps.ldpc_rx_flag = false;
   caps.txpwr = GetTxPowerCaps();
   return caps;
 }

@@ -27,6 +27,7 @@
 #define DEVOURER_ADAPTER_CAPS_H
 
 #include <cstdint>
+#include <string_view>
 
 #include "TxCaps.h"
 #include "TxPower.h"
@@ -151,7 +152,10 @@ struct AdapterCaps {
    * on-air. The TX side lives in TxCaps.ldpc_ok. HT and VHT are separate
    * decoder paths in silicon, so the flags split: the RTL8821A field failure
    * ("PixelPilot can't RX LDPC from Eachine Sphere Link") is VHT-only. --- */
-  bool ldpc_rx_ht = false;  /* baseband decodes LDPC-coded HT PPDUs */
+  bool ldpc_rx_ht = false;  /* baseband decodes LDPC-coded HT PPDUs. RTL8733B:
+                             * measured false — 0/1542 LDPC MCS7 frames vs
+                             * 93% BCC from an 8822BU — while its TX-LDPC
+                             * (TxCaps.ldpc_ok) is measured true. */
   bool ldpc_rx_vht = false; /* baseband decodes LDPC-coded VHT PPDUs */
   /* Per-frame LDPC *reporting*: RxAtrib.ldpc is populated (RX-descriptor bit
    * on the 8812A die, PHY-status byte7[5] on Jaguar2/3). False on the 8814A —
@@ -194,11 +198,32 @@ struct AdapterCaps {
    * tests/ack_txreport_matrix.sh run with the 8733B as the responder),
    * 8852B (Kestrel has no CCX report, so the soliciting TX is an 8832CU
    * counting the ACK frames it receives, one attempt per frame, MCS1 on
-   * ch161, 3 runs per row: 14230/14430 armed at Init, 14391/14431 armed at
-   * InitWrite, 14347/14425 retargeted, 0/6440 at the old address after the
-   * retarget, 0/6194 never armed, 0/6603 after a live disarm). The 8852C
-   * reads false: its firmware does not commit the station entry, and the
-   * arm refuses on the read-back.
+   * ch161, 3 runs per row, responder on its own macid 127 / ADDR_CAM entry
+   * 127: 14414/14422 armed at Init, 14376/14417 armed at InitWrite,
+   * 14419/14432 retargeted, 0/6597 at the old address after the retarget,
+   * 0/6575 never armed, 0/6561 after a live disarm, re-run with the
+   * solicitor across the disarm: 3842/3848 then 0/1773; one cell in about 55
+   * across the development runs, at entry 1, read the entry back committed
+   * and answered no ACKs, not reproduced since), 8852C (the same bench with
+   * the roles swapped, the 8852B soliciting; the entry is host-written at
+   * macid / ADDR_CAM entry 63, docs/kestrel-ack-responder.md. 3 runs per row
+   * with the entry at hardware entry 126, an earlier layout that used the
+   * 8852B's CAM stride: 13831/14041 armed at Init, 14239/14408 retargeted,
+   * armed at InitWrite 98.9% and 97.0% in two runs with the third a dead
+   * session, 0/5993 at the old address, 0/6062 never armed. At hardware
+   * entry 63, the solicitor running across a live disarm in one session:
+   * 3812/3837 then 0/1616, 3846/3848 then 0/1623 (a third cell was a dead
+   * session and says nothing). Some bring-ups used to answer no ACK at all:
+   * the TX path selection the MAC attached to the ACK was uninitialised. The
+   * dead rate drifts through a day, so with times (2026-10-15, UTC-3):
+   * without the fix 6 of 15 at 10:12-10:19, 10 of 104 at 12:51-14:45 and
+   * 4 of 30 at 16:15-16:31 (plus 3 of 12 on an earlier day, time not
+   * recorded; up to ~85% on a second bench in the afternoon); with the path selection taken from the BB's
+   * P-MAC registers (docs/kestrel-ack-responder.md) 0 dead of 93 at
+   * 14:47-16:04 and 0 of 30 at 17:27-17:43, every session 96.8-100%, and 0
+   * of 20 on the second bench an hour after its ~85% series; solicitor
+   * across a live disarm 3791/3845 then 0/1602 and 3829/3843 then 0/1639,
+   * never armed 0/1591, at 17:44-17:46).
    *
    * The `on`, `retarget`, and legacy `off` rows establish arming, retargeting,
    * and a never-armed control. A backend-owned `disarmed` row supports only
@@ -223,13 +248,13 @@ struct AdapterCaps {
    * generation — the AP-mode work proved the gate where it was measured.
    * False-as-unmeasured (the
    * vht_2g4_ok reading: unmeasured, not incapable): the 8821C — it shares
-   * the recipe but no 8821CU/CE cell has run. FALSE on Kestrel:
-   * SetAckResponder is not implemented on the AX generation.
+   * the recipe but no 8821CU/CE cell has run.
    * tx_retry_limit_ok: DEVOURER_TX_RETRY_LIMIT drives hardware autonomous
    * retransmission (measured 12/0/12 A/B: 8821AU, 8812BU, 8822CU; the 8733B
    * by airtime dose-response instead, 0/3/12 -> 1.00/4.00/12.32–12.33 airings per
-   * frame, because that die has no CCX path to judge its own frames
-   * (tests/rtl8733b_retry_limit_onair.sh); Kestrel
+   * frame — measured before that die's CCX reports were reached; its own
+   * tx.report off cell since pins 12.0 mean retries at 0.98 report coverage
+   * (tests/rtl8733b_retry_limit_onair.sh, tests/ack_txreport_matrix.sh); Kestrel
    * 8832CU witness-measured — the AX WD DATA_TXCNT_LMT field counts
    * ATTEMPTS, folded +1 to the N-retries contract, limits {0,2,8} -> modal
    * on-air copies {1,3,8-9}; the MT7612U by its own TX status FIFO -
@@ -325,6 +350,25 @@ struct AdapterCaps {
    * False everywhere else: the bit is ignored and a flagged frame can still
    * be folded into an aggregate at its neighbour's rate. */
   bool tx_no_agg_ok = false;
+  /* DeviceConfig::Rx::drop_ctrl and own_addr_only are applied by this
+   * backend's monitor RX setup. TRUE on Jaguar1, Jaguar2, Jaguar3 and the
+   * RTL8733B (on air: 8812AU, 8812BU, 8812CU, 8812EU, 8733BU, one unit
+   * each). False elsewhere: the knobs are ignored and the host sees every
+   * frame. */
+  bool rx_mac_filters_ok = false;
+  /* DeviceConfig::Tx::ac_lifetime_us reaches DATA (with data_on_be where
+   * DATA does not already ride BE): the MAC ages it out at the lifetime.
+   * TRUE with three bulk-OUT endpoints on the RTL8812A (Jaguar1), RTL8822B
+   * (Jaguar2), RTL8822C and RTL8822E (Jaguar3), and on the RTL8733B (on air:
+   * one 8812AU, 8812BU, 8812CU, 8812EU, 8733BU). False elsewhere, including
+   * the 8814A, 8821A, 8821C and two- or four-endpoint parts: DATA keeps
+   * MGMT, which is never aged. */
+  bool tx_ac_lifetime_ok = false;
+  /* DeviceConfig::Tx::be_fast_retry is applied. TRUE where
+   * tx_ac_lifetime_ok is, except the RTL8812A, which ignores it (it cut
+   * saturated throughput there) and logs that it does; also TRUE on Jaguar3
+   * below three endpoints, where it is written but DATA stays on MGMT. */
+  bool tx_be_fast_retry_ok = false;
 
   /* --- feature flags --- */
   /* Per-packet TX power: a per-frame power trim driven by radiotap
@@ -456,6 +500,13 @@ struct AdapterCaps {
   bool hw_injected_mgmt_txtsf = false;
   bool tsf_write_ok = false;
   bool tbtt_follows_tsf = false;
+  /* beacon_backoff_ctl: IRadio::SetBeaconBackoff can turn the hardware
+   * beacon's EDCA random backoff off, so a beacon leaves a fixed AIFS after
+   * its TBTT instead of AIFS + 0..CW random slots. Kestrel: the vendor/default
+   * beacon queue is ecw_min 2 / ecw_max 3, AIFS 25 us, measured on an
+   * RTL8852CE as departures at exactly 22/30/39/48 us after TBTT (~equal
+   * shares); with the backoff off, 568/569 beacons left at 22 us. */
+  bool beacon_backoff_ctl = false;
   /* 802.11ax scheduled UL (Kestrel/RTL8852 only). trigger_ul_ok: the adapter
    * can air an HE Trigger frame (UL-OFDMA grant) and program the fw UL-OFDMA
    * scheduler (SendTrigger / ConfigureUlOfdma). twt_ok: the fw exposes the TWT
@@ -470,6 +521,35 @@ struct AdapterCaps {
    * host-injected SendTrigger is what puts a Trigger on the air. */
   bool sounding_ok = false;
 };
+
+/* The M4 (#258) sync tier of a DU built on this adapter, from the timing caps
+ * above (derived, so it cannot drift from them). M5's coordinator reads it.
+ *   Tight  — PCIe/MMIO, a writable TSF the hardware beacon's TBTT follows: the
+ *            PTP discipline (src/cell/TsfDiscipline.h) holds the beacon grid to
+ *            ~us (RTL8852CE: on-air TBTT p95 ~4 us across three cells). Eligible
+ *            for same-channel coordinated slots.
+ *   Coarse — a hardware beacon with a writable TSF over a slower bus or a
+ *            TBTT that does not follow the write (USB; Jaguar2/3, steered per
+ *            TU): ~0.5-1.5 ms disturbance. Needs ms guards or its own channel.
+ *   None   — no hardware beacon or no TSF write: cannot hold a shared grid.
+ * The tier is what the TSF-write actuator achieves. A part steered another way
+ * (PinBeaconTbtt, measured to ~0.67 us on the 8821CE) is not promoted by it. */
+enum class SyncTier : uint8_t { None = 0, Coarse = 1, Tight = 2 };
+
+inline const char *sync_tier_name(SyncTier t) {
+  switch (t) {
+  case SyncTier::Tight: return "tight";
+  case SyncTier::Coarse: return "coarse";
+  default: return "none";
+  }
+}
+
+inline SyncTier sync_tier(const AdapterCaps &c) {
+  if (!c.hw_beacon_txtsf || !c.tsf_write_ok)
+    return SyncTier::None;
+  const bool pcie = c.transport && std::string_view(c.transport) == "pcie";
+  return pcie && c.tbtt_follows_tsf ? SyncTier::Tight : SyncTier::Coarse;
+}
 
 inline void set_standard_freq_ranges(AdapterCaps &c) {
   c.tune_2g4 = BandRange{true, 2412, 2484};

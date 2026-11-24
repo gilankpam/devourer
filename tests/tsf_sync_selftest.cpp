@@ -88,6 +88,95 @@ int main() {
     CHECK(s.Count() == 1, "data frame not counted");
   }
 
+  {
+    // ShiftRemote: fitted to transmitter A, then moved to B whose clock is
+    // A's + delta (same rate: both held to one PTP timebase). The shifted fit
+    // maps local time to B's clock without a sample of B, and B's beacons
+    // then extend the same line (no reset, Ready() throughout).
+    devourer::TsfSync s;
+    const double skew = 1.0 + 15e-6; // local runs 15 ppm fast vs both
+    const int64_t a0 = 5'000'000, delta = 13450 - 7 * 102400LL;
+    const uint32_t l0 = 1'000'000;
+    for (int i = 0; i < 40; ++i) {
+      const int64_t r = a0 + i * 102400LL;
+      s.Add(static_cast<uint64_t>(r), static_cast<uint32_t>(l0 + llround((r - a0) * skew)));
+    }
+    CHECK(s.Ready(), "ready on A");
+    const int64_t at = a0 + 40 * 102400LL + 5000; // A's TSF at some later instant
+    const uint64_t local_at = l0 + llround((at - a0) * skew);
+    const int64_t a_est = s.RemoteForLocal(local_at);
+    s.ShiftRemote(delta);
+    CHECK(s.Ready(), "still ready after the shift");
+    CHECK(std::llabs(s.RemoteForLocal(local_at) - (a_est + delta)) <= 1,
+          "shifted fit = A's clock + delta");
+    CHECK(std::llabs(s.RemoteForLocal(local_at) - (at + delta)) <= 1, "= B's true clock");
+    for (int i = 40; i < 60; ++i) { // B's beacons (B's TSF = A's + delta)
+      const int64_t r = a0 + i * 102400LL;
+      s.Add(static_cast<uint64_t>(r + delta), static_cast<uint32_t>(l0 + llround((r - a0) * skew)));
+    }
+    CHECK(std::fabs(s.SkewPpm() - 15.0) < 0.5, "B's beacons extend the same line");
+    const int64_t later = a0 + 70 * 102400LL;
+    CHECK(std::llabs(s.RemoteForLocal(l0 + llround((later - a0) * skew)) - (later + delta)) <= 1,
+          "tracks B after the switch");
+  }
+
+  {
+    // Step detection: the transmitter's TSF jumps +1300 us after 24 beacons
+    // (the M6 rig case). Off: the cumulative fit takes the jump as skew. On:
+    // 3 agreeing beacons confirm a step, the axis is re-anchored, the skew
+    // stays the crystals'; a lone stray beacon is dropped, not fitted.
+    const double skew = 1.0 - 4.3e-6;
+    const int64_t a0 = 7'000'000, J = 1300;
+    const uint32_t l0 = 2'000'000;
+    auto feed = [&](devourer::TsfSync &s, int from, int to, int64_t jump, int stray_at) {
+      for (int i = from; i < to; ++i) {
+        const int64_t r = a0 + i * 102400LL; // the transmitter's true time
+        const int64_t tx = r + (i >= 24 ? jump : 0) + (i == stray_at ? 5000 : 0);
+        s.Add(static_cast<uint64_t>(tx), static_cast<uint32_t>(l0 + llround((r - a0) * skew)));
+      }
+    };
+    devourer::TsfSync off;
+    feed(off, 0, 60, J, -1);
+    CHECK(std::fabs(off.SkewPpm() + 4.3) > 50, "without detection the jump reads as skew");
+
+    devourer::TsfSync on;
+    on.SetStepDetect(200, 3);
+    feed(on, 0, 60, J, 40);
+    CHECK(on.Steps() == 1 && on.LastStepUs() == J, "one step, of the jump");
+    CHECK(std::fabs(on.SkewPpm() + 4.3) < 0.5, "skew stays the crystals'");
+    CHECK(on.Rejected() == 1, "the stray beacon dropped");
+    const int64_t later = a0 + 80 * 102400LL;
+    CHECK(std::llabs(on.RemoteForLocal(l0 + llround((later - a0) * skew)) - (later + J)) <= 2,
+          "tracks the stepped clock");
+    // ... and back (the transmitter's discipline undoing it).
+    for (int i = 60; i < 90; ++i) {
+      const int64_t r = a0 + i * 102400LL;
+      on.Add(static_cast<uint64_t>(r), static_cast<uint32_t>(l0 + llround((r - a0) * skew)));
+    }
+    CHECK(on.Steps() == 2 && on.LastStepUs() == -J, "the step back too");
+    // A jump undone within the confirm window (the DU's discipline, ~5
+    // beacons, against the UE's 6) is never followed: held, then dropped.
+    devourer::TsfSync tr;
+    tr.SetStepDetect(200, 6);
+    for (int i = 0; i < 60; ++i) {
+      const int64_t r = a0 + i * 102400LL;
+      const int64_t tx = r + (i >= 30 && i < 35 ? J : 0);
+      tr.Add(static_cast<uint64_t>(tx), static_cast<uint32_t>(l0 + llround((r - a0) * skew)));
+    }
+    CHECK(tr.Steps() == 0 && tr.Rejected() == 5, "a transient jump: dropped, not followed");
+    CHECK(std::fabs(tr.SkewPpm() + 4.3) < 0.5, "and the line unbent");
+    // Disagreeing outliers never confirm a step.
+    devourer::TsfSync noisy;
+    noisy.SetStepDetect(200, 3);
+    for (int i = 0; i < 60; ++i) {
+      const int64_t r = a0 + i * 102400LL;
+      const int64_t tx = r + (i >= 30 && i < 36 ? (i % 2 ? 900 : -900) : 0);
+      noisy.Add(static_cast<uint64_t>(tx), static_cast<uint32_t>(l0 + llround((r - a0) * skew)));
+    }
+    CHECK(noisy.Steps() == 0 && noisy.Rejected() == 6, "alternating outliers: no step");
+    CHECK(std::fabs(noisy.SkewPpm() + 4.3) < 0.5, "and the line unbent");
+  }
+
   std::printf(g_fail ? "tsf_sync_selftest: %d FAILURE(S)\n"
                      : "tsf_sync_selftest: all passed\n",
               g_fail);

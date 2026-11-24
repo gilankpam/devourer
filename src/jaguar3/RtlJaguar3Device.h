@@ -372,7 +372,8 @@ private:
                 const devourer::AmpduMode &am);
   /* Submit one already-built TXDMA block as its own URB on its own
    * descriptor's endpoint - no rebuild, so no second round of
-   * build_tx_block's side effects. */
+   * build_tx_block's side effects. A block that lands on a bulk-size
+   * multiple alone is re-padded off it first (repad_tx_block_8822c). */
   bool send_built_block(uint8_t *block, size_t len);
 
   RtlAdapter _device;
@@ -518,6 +519,8 @@ private:
    * captured kernel register-write stream verbatim at the end of InitWrite —
    * the hardware-diff lever (same as Jaguar2's; found the 8822B RF18 bug). */
   void apply_replay_wseq();
+  bool ac_queue_ok() const;
+  void apply_ac_tx_queue_knobs();
   /* 8822E eFEM (rfe 21-24) GPIO pin-function routing — kernel-parity port of
    * _efem_pinmux_config/pinmux_set_func_8822e for RFE_CTRL_3/5/7/8/9/11.
    * Routes the DPDT antenna transfer switch to the RFE engine (hardware
@@ -579,6 +582,9 @@ private:
   int64_t _tbtt_off_us = 0;
   /* StartRxLoop stop request (StopRxLoop). */
   volatile bool _rx_stop = false;
+
+  void start_rx_loop(Action_ParsedRadioPacket packetProcessor, bool clear_stale);
+
   /* True while StartRxLoop owns bulk-IN (gates the coex thread's drain). */
   std::atomic<bool> _rx_loop_active{false};
   /* Set when InitWrite zeroes the RX filters (0x6A0-0x6A4) for TX-only

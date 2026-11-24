@@ -40,7 +40,9 @@ construction from the `SYS_CFG2` chip-id (Kestrel: PID-first):
   and rtl8822e (RTL8812EU/8822EU, chip-id `0x17`). 5/10 MHz narrowband,
   80 MHz (incl. a 40-in-80 frame), halrf calibration. Sustained 5 GHz TX
   needs the coex runtime thread (started in `InitWrite`) — without it the
-  combo chip's coex firmware silences the antenna. 8822e constraints:
+  combo chip's coex firmware silences the antenna. A host that owns bulk-IN
+  itself can opt out (`tuning.j3_runtime_thread`, see `src/jaguar3/CLAUDE.md`
+  for what that costs). 8822e constraints:
   `docs/8822e-quirks.md`.
 - **Kestrel** (`src/kestrel/`): the Wi-Fi 6 / 802.11ax generation —
   RTL8852BU/8832BU (variant C8852B) and RTL8852CU/8832CU (C8852C), one HAL
@@ -66,12 +68,13 @@ construction from the `SYS_CFG2` chip-id (Kestrel: PID-first):
   only what an independent witness decoded — legacy OFDM + HT MCS0-7, BCC,
   20/40 MHz on 2.4/5 GHz, plus long-preamble CCK on 2.4 GHz at 20 MHz, plus
   10 MHz narrowband (5 MHz refused — `src/rtl8733b/CLAUDE.md`).
-  Everything the backend has not ported (TSF/beacons, A-MPDU, CCX/`tx.report`,
+  Everything the backend has not ported (TSF/beacons,
   the flat-index and per-rate TX-power knobs) falls through to `IRadio`/`IRtlRadio`'s
   not-ported defaults rather than being faked, so read the base class before
   assuming a cross-generation feature below applies here. `FastRetune` IS
-  ported (intra-band, TSSI kept live — `src/rtl8733b/CLAUDE.md`). SGI, LDPC, STBC, VHT
-  and HE are refused outright. Scope, one-unit validation record and the
+  ported (intra-band, TSSI kept live — `src/rtl8733b/CLAUDE.md`). SGI and LDPC TX
+  are advertised (measured on air; RX-LDPC measured absent); STBC, VHT and HE
+  are refused outright. Scope, one-unit validation record and the
   deferred matrix: `docs/rtl8733b.md`.
 
 Naming traps: **RTL8821AU is Jaguar1** (not Jaguar2, despite the Jaguar2
@@ -81,18 +84,27 @@ the TP-Link TX50UH is RTL8832**C**U (8852C-family) despite lab lore calling it
 supported, RTL8733B**S** is the SDIO sibling and has no transport here. Full
 chip / bench-throughput table: README **Supported hardware**.
 
-**PCIe** (`DEVOURER_PCIE=ON`, Linux-only, default OFF): two parts ride their
+**PCIe** (`DEVOURER_PCIE=ON`, Linux-only, default OFF): five parts ride their
 USB siblings' HALs unchanged through one vfio-pci transport
 (`src/PcieTransport.{h,cpp}`: BAR2 MMIO registers, the caller owns vfio like
-it owns libusb). The RTL8821CE (PCIe 8821CU) is the Jaguar2 HAL over the
-88xx buffer-descriptor DMA rings (`src/PcieDma88xx.cpp`); the RTL8852CE
-(PCIe 8852CU, `10ec:c852`) is the Kestrel HAL over the AX HAXI plane
-(`src/PcieDmaAx.cpp`: 13 TXBD rings, WD pages + addr_info over a per-page
-payload bounce, CH12 fwcmd slots for FWDL/H2C, RXQ/RPQ rings with
-release-report page recycling — the rtw89 host contract, since the vendor
-USB drop ships no PCIe ring driver). `Open()` picks the plane from the PCI
-device id; the factory dispatches `c852` before reading the Jaguar chip-id,
-and refuses the RTL8852BE (`b852`, power sequence unported). USB and PCIe are
+it owns libusb). The RTL8821CE (PCIe 8821CU) and RTL8822BE (PCIe 8822BU,
+`10ec:b822`, chip-id `0x0a`) are the Jaguar2 HAL and the RTL8822CE (PCIe
+8822CU, `10ec:c822`, chip-id `0x13`) the Jaguar3 HAL, all over the same 88xx
+buffer-descriptor DMA rings (`src/PcieDma88xx.cpp` — the three dies share
+the ring register map and BD geometry, so only the HAL-side `is_usb()` gates
+differ: power sequence, queue map, interface-PHY MDIO table, EFUSE MAC
+offset — `src/jaguar2/CLAUDE.md`, `src/jaguar3/CLAUDE.md`); the RTL8852CE
+(PCIe 8852CU, `10ec:c852`) and RTL8852BE (PCIe 8852BU, `10ec:b852`) are
+the Kestrel HAL over the AX plane (`src/PcieDmaAx.cpp`, one class for the
+two dies' ring engines: the 8852C's HAXI with 13 TXBD rings and 32-byte WD
+bodies, the 8852B's older engine with 7 rings, its own register bank and
+24-byte WD bodies; WD pages + addr_info over a per-page payload bounce, CH12
+fwcmd slots for FWDL/H2C, RXQ/RPQ rings with release-report page recycling —
+the rtw89 host byte formats, since neither vendor USB drop ships its PCIe
+ring driver; the MAC-side PCIe sequences are the vendor mac_ax's,
+`src/kestrel/CLAUDE.md`). `Open()` picks the plane from the PCI device id;
+the factory dispatches `c852`/`b852` before reading the Jaguar chip-id
+(`0x09`/`0x0a` → Jaguar2, `0x13` → Jaguar3). USB and PCIe are
 independent transports behind `devourer::ITransport` (`src/Transport.h`);
 the bus-neutral `RtlAdapter` forwards to whichever it was built with. The
 bus-specific bring-up steps gate on `is_usb()` or ride `hci_setup()` — the
@@ -132,9 +144,11 @@ Per-chip options, all default ON: `DEVOURER_JAGUAR1`, `DEVOURER_8814` (requires
 JAGUAR1), `DEVOURER_JAGUAR2_8822B`, `DEVOURER_JAGUAR2_8821C`,
 `DEVOURER_JAGUAR3_8822C`, `DEVOURER_JAGUAR3_8822E`, `DEVOURER_8733B`,
 `DEVOURER_KESTREL_8852B`, `DEVOURER_KESTREL_8852C`.
-`DEVOURER_PCIE` (default OFF, Linux-only, requires
-JAGUAR2_8821C) adds the vfio-pci transport + `pcieprobe`; OFF builds are
-byte-identical to before it existed. Turning groups off drops their firmware
+`DEVOURER_PCIE` (default OFF, Linux-only, requires at least one of
+JAGUAR2_8821C / JAGUAR2_8822B / JAGUAR3_8822C / KESTREL_8852B /
+KESTREL_8852C) adds the
+vfio-pci transport +
+`pcieprobe`; OFF builds are byte-identical to before it existed. Turning groups off drops their firmware
 blobs + PHY tables (an 8812AU-only `rxdemo` is ~1.6 MB vs ~6.3 MB all-on — the
 verbatim-vendored Kestrel halbb/halrf plane dominates the difference).
 Configure fails on no-chip-selected or 8814-without-JAGUAR1. Each group
@@ -296,6 +310,9 @@ those are the ones listed below.
   unbounded). Exits through the ordinary `Stop()` path once N frames have been
   submitted, so first-light and regression captures get a clean teardown
   instead of a killed timed flood.
+- `DEVOURER_TX_VIA_INIT=<ms>` — txdemo brings the chip up through `Init()`
+  instead of `InitWrite()` before injecting; contract and backend limits at
+  its comment in `examples/tx/main.cpp`, harness `tests/ac_lifetime_onair.sh`.
 - `DEVOURER_TX_BEACON_TU=N` — txdemo arms a hardware TBTT beacon at N TU
   before injecting, on Jaguar2/3 only (unset/`0` = off); contract at its
   comment in
@@ -383,7 +400,7 @@ Behavioural traps the per-field docs can't carry:
   with EDCCA off and primary CCA left on, the same Jaguar1 injector delivers
   95% on an idle channel and still 78% under a co-channel flooder; with both
   gates off it collapses to 0.3%, because it stops waiting for a gap and
-  collides instead. `SetCcaGates` (`IRtlRadio`, Jaguar1, Jaguar3 and Kestrel —
+  collides instead. `SetCcaGates` (`IRtlRadio`, Jaguar1, Jaguar3, Kestrel and the RTL8733B —
   there "primary" is CCA_EN + the sec20/40/80 bits and "edcca" EDCCA_EN;
   txdemo drives it as `DEVOURER_CCA_GATES=<primary>,<edcca>`, 1 = that gate
   off) is the one-bit-at-a-time form for exactly this; `SetCcaMode` remains the portable
@@ -396,13 +413,10 @@ Behavioural traps the per-field docs can't carry:
   `DEVOURER_DIS_CCA=0` forces standard carrier-sense back. On Kestrel the
   8852C runs the same enabled default (measured: full-rate TX, 2.4x flood
   deferral); the 8852B TX bring-up still clears the gates and WARNS pending
-  its measurement arm (`tests/kestrel_cca_default_check.sh`). On the RTL8733B
-  the disable is **not ported** — the HALMAC 87xx carrier-sense gate has not
-  been located and measured there, so `SetCcaMode(true)` throws (loudly, but
-  without tearing the session down) while `SetCcaMode(false)`, the state its
-  MAC bring-up already leaves programmed, succeeds as a no-op; setting the
-  config knob warns once at bring-up (RX-only sessions included) and airs
-  with carrier-sense. Does NOT apply
+  its measurement arm (`tests/kestrel_cca_default_check.sh`). The RTL8733B
+  is the Jaguar3 shape again — same gate map, and on air the primary bit is
+  the one that works while EDCCA alone is null; the figures are in
+  `src/rtl8733b/CLAUDE.md` "Carrier-sense gates". Does NOT apply
   the vendor BB CCA-off writes (they deafen the RX). RX-decode side is a
   separate null (`tests/dis_cca_onair.sh`).
 
@@ -584,7 +598,7 @@ so the chip declines further ACKs and the loss stays ARQ-visible
 lose 5.5k+ frames on the `drop` policy, which remains opt-in and counted as
 `pool_dropped`). Per-frame TX
 outcomes surface as `tx.report` events (CCX via C2H) — the TX-side link
-sensor; C2H rides the RX path, so J1/J2 TX-only sessions see none (run
+sensor; C2H rides the RX path, so J1/J2/RTL8733B TX-only sessions see none (run
 `DEVOURER_TX_WITH_RX=thread`; J3's coex thread drains C2H regardless).
 `GetRxQuality()` is the device-wide windowed RX sensor;
 `cell::UeRxAttribution` is its per-transmitter (per-UE) counterpart. Docs:

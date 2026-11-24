@@ -142,15 +142,19 @@ jobs:
       - name: Set up MSYS2 / mingw-w64
         uses: msys2/setup-msys2@v2
         with:
-          msystem: MINGW64
+          # UCRT64, not MINGW64: MSYS2 deprecated the MINGW64 environment and
+          # its package database stopped carrying libusb (pacman: "target not
+          # found: mingw-w64-x86_64-libusb"), while UCRT64 ships every package
+          # below at the same versions. Still gcc, still pkg-config libusb.
+          msystem: UCRT64
           update: true
           install: >-
-            mingw-w64-x86_64-gcc
-            mingw-w64-x86_64-cmake
-            mingw-w64-x86_64-ninja
-            mingw-w64-x86_64-libusb
-            mingw-w64-x86_64-pkgconf
-            mingw-w64-x86_64-openssl
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-cmake
+            mingw-w64-ucrt-x86_64-ninja
+            mingw-w64-ucrt-x86_64-libusb
+            mingw-w64-ucrt-x86_64-pkgconf
+            mingw-w64-ucrt-x86_64-openssl
 
       - name: Configure CMake (mingw, pkg-config libusb, no vcpkg)
         # VCPKG_ROOT is unset, so CMakeLists takes the pkg-config path — the
@@ -216,6 +220,12 @@ jobs:
             flags: "-DDEVOURER_JAGUAR1=OFF -DDEVOURER_8814=OFF -DDEVOURER_JAGUAR2_8822B=OFF -DDEVOURER_JAGUAR2_8821C=OFF -DDEVOURER_JAGUAR3_8822C=OFF -DDEVOURER_JAGUAR3_8822E=OFF -DDEVOURER_8733B=OFF -DDEVOURER_KESTREL_8852B=OFF"
           - name: pcie+8821c-only
             flags: "-DDEVOURER_PCIE=ON -DDEVOURER_JAGUAR1=OFF -DDEVOURER_8814=OFF -DDEVOURER_JAGUAR2_8822B=OFF -DDEVOURER_JAGUAR3_8822C=OFF -DDEVOURER_JAGUAR3_8822E=OFF -DDEVOURER_8733B=OFF -DDEVOURER_KESTREL_8852B=OFF -DDEVOURER_KESTREL_8852C=OFF"
+          - name: pcie+8822b-only
+            flags: "-DDEVOURER_PCIE=ON -DDEVOURER_JAGUAR1=OFF -DDEVOURER_8814=OFF -DDEVOURER_JAGUAR2_8821C=OFF -DDEVOURER_JAGUAR3_8822C=OFF -DDEVOURER_JAGUAR3_8822E=OFF -DDEVOURER_8733B=OFF -DDEVOURER_KESTREL_8852B=OFF -DDEVOURER_KESTREL_8852C=OFF"
+          - name: pcie+8822c-only
+            flags: "-DDEVOURER_PCIE=ON -DDEVOURER_JAGUAR1=OFF -DDEVOURER_8814=OFF -DDEVOURER_JAGUAR2_8822B=OFF -DDEVOURER_JAGUAR2_8821C=OFF -DDEVOURER_JAGUAR3_8822E=OFF -DDEVOURER_8733B=OFF -DDEVOURER_KESTREL_8852B=OFF -DDEVOURER_KESTREL_8852C=OFF"
+          - name: pcie+kestrel-8852b-only
+            flags: "-DDEVOURER_PCIE=ON -DDEVOURER_JAGUAR1=OFF -DDEVOURER_8814=OFF -DDEVOURER_JAGUAR2_8822B=OFF -DDEVOURER_JAGUAR2_8821C=OFF -DDEVOURER_JAGUAR3_8822C=OFF -DDEVOURER_JAGUAR3_8822E=OFF -DDEVOURER_8733B=OFF -DDEVOURER_KESTREL_8852C=OFF"
           - name: pcie+kestrel-8852c-only
             flags: "-DDEVOURER_PCIE=ON -DDEVOURER_JAGUAR1=OFF -DDEVOURER_8814=OFF -DDEVOURER_JAGUAR2_8822B=OFF -DDEVOURER_JAGUAR2_8821C=OFF -DDEVOURER_JAGUAR3_8822C=OFF -DDEVOURER_JAGUAR3_8822E=OFF -DDEVOURER_8733B=OFF -DDEVOURER_KESTREL_8852B=OFF"
           - name: pcie+all
@@ -274,7 +284,11 @@ jobs:
           -S ${{ github.workspace }}
 
       - name: Build (ASan + UBSan)
-        run: cmake --build build-asan -j
+        # Bounded: a bare -j is unlimited, and ~50 concurrent RelWithDebInfo
+        # ASan/UBSan compiles + links exhaust the hosted runner's memory — it
+        # is then killed mid-link ("The runner has received a shutdown
+        # signal", exit 143), as on master c39b99b and PR #516.
+        run: cmake --build build-asan -j "$(nproc)"
 
       - name: Test (ASan + UBSan)
         working-directory: build-asan
@@ -308,9 +322,11 @@ jobs:
       - name: Reject "PCIe without a PCIe-capable chip"
         run: |
           if cmake -B build-pcie-bad -DDEVOURER_PCIE=ON \
-                -DDEVOURER_JAGUAR2_8821C=OFF -DDEVOURER_KESTREL_8852C=OFF \
+                -DDEVOURER_JAGUAR2_8821C=OFF -DDEVOURER_JAGUAR2_8822B=OFF \
+                -DDEVOURER_JAGUAR3_8822C=OFF -DDEVOURER_KESTREL_8852B=OFF \
+                -DDEVOURER_KESTREL_8852C=OFF \
                 -S "${{ github.workspace }}" 2>err.log; then
-            echo "ERROR: configure should have failed (PCIe without 8821C or 8852C)"; cat err.log; exit 1
+            echo "ERROR: configure should have failed (PCIe without a PCIe-capable chip)"; cat err.log; exit 1
           fi
           grep -q "DEVOURER_PCIE=ON requires" err.log
 

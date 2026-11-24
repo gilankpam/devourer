@@ -67,6 +67,7 @@ class RadioManagementModule {
   RtlAdapter _device;
   devourer::DeviceConfig::Tuning _tuning; /* skip_txpwr / force_iqk / disable_iqk */
   bool _keep_corrupted = false;           /* rx.keep_corrupted */
+  devourer::DeviceConfig::Rx _rx;         /* rx.drop_ctrl / rx.own_addr_only */
   bool _dump_canary = false;              /* debug.dump_canary */
   std::shared_ptr<EepromManager> _eepromManager;
   Logger_t _logger;
@@ -110,6 +111,10 @@ class RadioManagementModule {
   uint32_t _bw_cached_8ac = 0;
   bool _bw_cache_valid = false;
   uint8_t _cur40MhzPrimeSc;
+  /* The HT40 offset the caller asked for, before fit_2g4_ht40_offset: a hop
+   * to the 2.4 GHz grid edge may force the other side, and the next hop must
+   * fit from the request again, not inherit the forced side. */
+  uint8_t _req40MhzPrimeSc = HAL_PRIME_CHNL_OFFSET_DONT_CARE;
   uint8_t _cur80MhzPrimeSc;
   uint8_t _currentCenterFrequencyIndex;
   uint8_t power = 16;

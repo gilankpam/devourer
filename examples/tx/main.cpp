@@ -49,6 +49,7 @@
 #include "SweepSpec.h"
 #include "TxPower.h" /* txpkt_pwr_db_for_step — DEVOURER_TX_PKT_OFSET fan-out */
 #include "caps_event.h"
+#include "poll_skip.h"
 #include "station_arm_env.h"
 #if defined(DEVOURER_HAVE_JAGUAR1)
 #include "jaguar1/RtlJaguarDevice.h"
@@ -1065,12 +1066,27 @@ int main(int argc, char **argv) {
   uint8_t tx_band = 0;
   if (const char *b = std::getenv("DEVOURER_BAND"))
     tx_band = static_cast<uint8_t>(std::atoi(b));
+  const SelectedChannel bringup_channel{
+      .Channel = static_cast<uint8_t>(channel),
+      .ChannelOffset = init_offset,
+      .ChannelWidth = init_width,
+      .Band = tx_band};
+  /* DEVOURER_TX_VIA_INIT=<ms> — bring the chip up through Init() (the RX
+   * bring-up, on the RX thread further down) instead of InitWrite(), then
+   * inject as usual. For checking that something a backend programs at
+   * bring-up is there after either entry point (tests/ac_lifetime_onair.sh).
+   * Init() only returns when its RX loop ends and nothing signals "brought
+   * up", so the value is how long to wait for it before the first send: it
+   * has to cover the bring-up, and a send before that is not caught here.
+   * Jaguar1/2/3 only (run on an RTL8812AU, 8812BU and 8812CU): the RTL8733B
+   * and Kestrel do not enable TX from Init(), so every send is refused. */
+  long via_init_ms = 0;
+  if (const char *e = std::getenv("DEVOURER_TX_VIA_INIT"))
+    via_init_ms = std::strtol(e, nullptr, 0);
+  const bool via_init = via_init_ms > 0;
   try {
-    rtlDevice->InitWrite(SelectedChannel{
-        .Channel = static_cast<uint8_t>(channel),
-        .ChannelOffset = init_offset,
-        .ChannelWidth = init_width,
-        .Band = tx_band});
+    if (!via_init)
+      rtlDevice->InitWrite(bringup_channel);
   } catch (const std::exception &e) {
     /* InitWrite returns void, so a refused bring-up (e.g. a channel/width/
      * offset combination the chip rejects) surfaces as an exception. The
@@ -1083,7 +1099,10 @@ int main(int argc, char **argv) {
    * one-bit-at-a-time form of DEVOURER_DIS_CCA (IRtlRadio::SetCcaGates) for
    * telling a preamble deferral from an energy deferral on a band where
    * injection stalls. Demo-local; applied once the MAC is up. */
-  if (const char *g = std::getenv("DEVOURER_CCA_GATES")) {
+  auto apply_cca_gates = [&] {
+    const char *g = std::getenv("DEVOURER_CCA_GATES");
+    if (!g)
+      return;
     int p = 0, e = 0;
     if (sscanf(g, "%d,%d", &p, &e) == 2) {
       auto *rtl = dynamic_cast<IRtlRadio *>(rtlDevice);
@@ -1093,7 +1112,9 @@ int main(int argc, char **argv) {
     } else {
       logger->error("DEVOURER_CCA_GATES: want <primary>,<edcca> (0/1 each)");
     }
-  }
+  };
+  if (!via_init) /* via Init() the MAC is not up yet: applied after the wait */
+    apply_cca_gates();
 
   write_sentinel(0xBEEF, "post-init/pre-TX");
   devourer::Ev(*g_ev, "init.timing")
@@ -1110,7 +1131,18 @@ int main(int argc, char **argv) {
   /* Set once StartRxLoop has returned or thrown - the RX loop is gone. The
    * station arm below refuses on it. */
   std::atomic<bool> rx_ended{false};
-  if (rx_thread_mode) {
+  if (via_init) {
+    rx_thread = std::thread([&rtlDevice, &rx_ended, logger, bringup_channel] {
+      try {
+        rtlDevice->Init(packetProcessor, bringup_channel);
+      } catch (const std::exception &e) {
+        logger->error("DEVOURER_TX_VIA_INIT: Init failed: {}", e.what());
+      }
+      rx_ended = true;
+    });
+    for (long waited = 0; waited < via_init_ms && !rx_ended; waited += 50)
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  } else if (rx_thread_mode) {
     rx_thread = std::thread([&rtlDevice, &rx_ended, logger] {
       /* An uncaught exception in a std::thread is std::terminate — a transient
        * USB read failure in the RX loop must not tear down the TX process. */
@@ -1147,6 +1179,15 @@ int main(int argc, char **argv) {
     }
     ~IoThreadsJoin() { join(); }
   } io_threads{rtlDevice, rx_thread, usb_thread};
+  if (via_init) {
+    if (rx_ended) {
+      logger->error("DEVOURER_TX_VIA_INIT: Init() ended before the first send");
+      return 1;
+    }
+    logger->info("DEVOURER_TX_VIA_INIT: brought up through Init(), waited {} ms",
+                 via_init_ms);
+    apply_cca_gates();
+  }
 
   /* DEVOURER_STA_IDENTITY: arm before the first frame, once the RX loop is
    * shown running - its first received frame (3 s cap: a silent channel still
@@ -1443,6 +1484,7 @@ int main(int argc, char **argv) {
                  "warn_delta={}", thermal_poll_ms, thermal_warn_delta);
   }
   bool thermal_warned = false;
+  devourer::PollSkips thermal_skips("DEVOURER_THERMAL_POLL_MS");
   auto thermal_next_poll = std::chrono::steady_clock::now() +
       std::chrono::milliseconds(thermal_poll_ms);
 
@@ -1898,6 +1940,10 @@ int main(int argc, char **argv) {
       tx_frame_limit = 0;
   }
   long consec_fail = 0;
+  /* Transport failures counted at the start of the CURRENT failure streak,
+   * so the abort below can tell a NAKing chip from frames the backend refused
+   * before any USB (GetTxStats().failed is cumulative over the session). */
+  uint64_t streak_failed_base = 0;
   /* If the TX path isn't enabled the chip NAKs every bulk-OUT; hammering a
    * non-draining endpoint for the whole run is what wedged its USB core. Bail
    * out after a short burst of consecutive failures so we shut down cleanly
@@ -2602,7 +2648,12 @@ int main(int argc, char **argv) {
         std::chrono::steady_clock::now() >= thermal_next_poll) {
       thermal_next_poll = std::chrono::steady_clock::now() +
           std::chrono::milliseconds(thermal_poll_ms);
-      auto t = rtlDevice->GetThermalStatus();
+      devourer::ThermalStatus t;
+      try {
+        t = rtlDevice->GetThermalStatus();
+      } catch (const std::exception &e) {
+        thermal_skips.note(*logger, e);
+      }
       if (t.valid || t.raw != 0) {
         devourer::Ev ev(*g_ev, "thermal");
         ev.t().f("raw", t.raw);
@@ -2626,11 +2677,28 @@ int main(int argc, char **argv) {
     }
     if (rc) {
       consec_fail = 0;
-    } else if (++consec_fail >= kMaxConsecFail) {
-      logger->error("TX aborting: {} consecutive bulk-OUT failures — TX path "
-                    "not enabled (chip NAKing). Stopping to avoid wedging the "
-                    "adapter; clean card-disable follows.",
-                    consec_fail);
+    } else if ((consec_fail == 0 &&
+                (streak_failed_base = rtlDevice->GetTxStats().failed, true)),
+               ++consec_fail >= kMaxConsecFail) {
+      /* Two different failures share send_packet's `false`: the transport
+       * refusing the URB (a NAKing chip — the wedge risk this abort exists
+       * for) and the backend refusing the FRAME before any USB happens (a
+       * width or rate the channel cannot carry, logged by name by the
+       * backend). GetTxStats().failed counts only the former, so it tells
+       * them apart; blaming the USB path for a refused frame sent more than
+       * one operator after the wrong fault. */
+      const auto st = rtlDevice->GetTxStats();
+      if (st.failed > streak_failed_base)
+        logger->error("TX aborting: {} consecutive bulk-OUT failures — TX "
+                      "path not enabled (chip NAKing). Stopping to avoid "
+                      "wedging the adapter; clean card-disable follows.",
+                      consec_fail);
+      else
+        logger->error("TX aborting: the backend refused {} consecutive frames "
+                      "before any USB transfer (no bulk-OUT failures) — a "
+                      "rate/width/encoding the channel cannot carry; its own "
+                      "error line above names it.",
+                      consec_fail);
       break;
     }
     bool burst_off_window = false;

@@ -201,9 +201,41 @@ def _mediatek_duts() -> dict[str, str]:
     return out
 
 
+def _kestrel_duts() -> dict[str, str]:
+    """The Kestrel (RTL8852B/C) USB ids, read from the C++ gate table the
+    factory consults (src/kestrel/KestrelUsbIds.h) for the same reason as
+    _mediatek_duts(): a hand-copied list drifts silently."""
+    root = Path(__file__).resolve().parent.parent
+    header = root / "src" / "kestrel" / "KestrelUsbIds.h"
+    unavailable = "Kestrel DUTs unavailable —"
+    try:
+        text = header.read_text(encoding="utf-8")
+    except OSError as e:
+        sys.stderr.write(f"{unavailable} cannot read {header}: {e}\n")
+        return {}
+    body = re.search(r"kKestrelUsbIds\[\]\s*=\s*\{(.*?)\n\};", text, re.S)
+    if not body:
+        sys.stderr.write(f"{unavailable} no kKestrelUsbIds[] in {header}\n")
+        return {}
+    out: dict[str, str] = {}
+    for vid, pid, variant, comment in re.findall(
+        r"\{\s*0x([0-9a-fA-F]{4})\s*,\s*0x([0-9a-fA-F]{4})\s*,\s*"
+        r"ChipVariant::(C8852[BC])\s*\}\s*,?"
+        r"(?:[^\S\n]*/\*\s*(.*?)\s*\*/)?",
+        body.group(1),
+    ):
+        die = "RTL8852B" if variant == "C8852B" else "RTL8852C"
+        label = comment.strip() or "Realtek default id"
+        out[f"{vid.lower()}:{pid.lower()}"] = f"{die} ({label}, Kestrel)"
+    if not out:
+        sys.stderr.write(f"{unavailable} kKestrelUsbIds[] parsed empty in {header}\n")
+    return out
+
+
 # The MediaTek half, kept separately as well as merged below: a cell has to
 # know which side of the matrix needs firmware and a MediaTek-enabled build.
 MEDIATEK_DUTS = _mediatek_duts()
+KESTREL_DUTS = _kestrel_duts()
 
 # Map every supported PID to the chipset family used for log readability.
 # Detection of the kernel driver claiming the device is dynamic (via sysfs);
@@ -218,11 +250,14 @@ SUPPORTED_DUTS = {
     "2357:012d": "RTL8822BU (TP-Link T3U, Jaguar2)",
     "0bda:b82c": "RTL8822BU (Jaguar2)",
     "0bda:b812": "RTL8822BU (CF-924AC V2, Jaguar2)",
+    "0bda:b733": "RTL8733BU (LB-LINK BL-M8733BU2-L, HALMAC 87xx)",
+    "0bda:f72b": "RTL8731BU (HALMAC 87xx)",
     "0bda:c811": "RTL8821CU (Jaguar2)",
     "0bda:c812": "RTL8812CU (Jaguar3)",
     "0bda:c82c": "RTL8822CU (Jaguar3)",
     "0bda:a81a": "RTL8812EU (Jaguar3 EU)",
     "0bda:e822": "RTL8822EU (Jaguar3 EU)",
+    **KESTREL_DUTS,
     **MEDIATEK_DUTS,
 }
 
@@ -658,7 +693,20 @@ class Dut:
 
     @property
     def iface_id(self) -> str:
-        """Interface address sysfs expects for bind/unbind."""
+        """Interface address sysfs expects for bind/unbind: the Wi-Fi
+        function. On a single-function dongle that is interface 0; on a
+        Wi-Fi + Bluetooth combo (RTL8733BU: interfaces 0/1 are class e0,
+        Bluetooth, held by btusb) it is the first vendor-specific (class ff)
+        interface — binding or watching :1.0 there drives btusb and never
+        sees the wlan netdev."""
+        base = f"/sys/bus/usb/devices/{self.sysfs_id}"
+        for n in range(8):
+            try:
+                with open(f"{base}/{self.sysfs_id}:1.{n}/bInterfaceClass") as f:
+                    if f.read().strip().lower() == "ff":
+                        return f"{self.sysfs_id}:1.{n}"
+            except OSError:
+                continue
         return f"{self.sysfs_id}:1.0"
 
     @property

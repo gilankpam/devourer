@@ -126,6 +126,26 @@ struct DeviceConfig {
      * RX filter). Jaguar1, Jaguar2, Jaguar3, the RTL8733B and the MT7612U;
      * not ported on Kestrel, where it is silently inert. */
     bool keep_corrupted = false;
+    /* env: DEVOURER_RX_DROP_CTRL — RXFLTMAP1 = 0: control frames (ACK, RTS,
+     * CTS, BlockAck, ...) stop at the MAC. The MAC still acts on the ACKs for
+     * its own frames; host readers of control frames get none. A beamformee
+     * arm re-opens subtypes 4-5. The first few frames of a session can
+     * predate the write (1-3 control frames seen on Jaguar3 and the
+     * RTL8733B, admitted during bring-up). On Jaguar1 the knob clears RCR
+     * ACF instead, and BlockAcks still arrive (that MAC passes them with
+     * data frames). Backends with AdapterCaps::rx_mac_filters_ok (Jaguar1,
+     * Jaguar2, Jaguar3, the RTL8733B); ignored elsewhere. */
+    bool drop_ctrl = false;
+    /* env: DEVOURER_RX_OWN_ADDR_ONLY — RCR AAP off, APM|AM|AB on: only unicast
+     * to the address in MACID (0x0610), plus group frames. The Jaguar1 and
+     * RTL8733B bring-ups program the EFUSE address there; Jaguar2/3 do not,
+     * so arm an identity first (SetAckResponder, a station or beacon arm);
+     * StartRxLoop warns when MACID is still all-zero. MACID is one address:
+     * a beamformee arm plus an ACK responder on a different address is
+     * refused at bring-up (a later runtime arm is the caller's to keep
+     * consistent). Backends with AdapterCaps::rx_mac_filters_ok;
+     * ignored elsewhere. */
+    bool own_addr_only = false;
     /* env: DEVOURER_TX_WITH_RX — Jaguar3 only: keep the RX filters open and
      * enable the RX path during a TX (InitWrite) bring-up so StartRxLoop can
      * run on the same handle. Must be decided before InitWrite (retrofitting
@@ -293,6 +313,52 @@ struct DeviceConfig {
      * retries re-air at the descriptor rate. See the RetryFallback enum for
      * why there is no floor form. */
     RetryFallback retry_fallback = RetryFallback::Default;
+    /* env: DEVOURER_TX_DATA_BE=1 — DATA frames (802.11 type 2) ride the BE
+     * queue (descriptor QSEL 0) and its LOW bulk-OUT endpoint instead of
+     * MGMT (0x12, HIGH), so ac_lifetime_us can reach them; management and
+     * control frames keep MGMT, and a USB-aggregated URB never mixes the
+     * two. A SetAmpduMode TID or DEVOURER_TX_QSEL still wins, and the
+     * endpoint follows the final QSEL. Applied with three bulk-OUT
+     * endpoints by Jaguar1 on the RTL8812A and Jaguar2 on the RTL8822B,
+     * and by the RTL8733B backend (through its existing QSEL endpoint map);
+     * Jaguar3 already puts DATA on BE whenever it has three endpoints
+     * (jaguar3/TxQueueMap.h). Unmeasured parts sharing that code (8814A,
+     * 8821A, 8821C, two-endpoint adapters) log that it is not applied;
+     * other backends ignore it. AdapterCaps::tx_ac_lifetime_ok says whether
+     * the lifetime reaches DATA on this adapter. Default off: descriptors and endpoints
+     * unchanged. On the RTL8733B, DATA on BE keeps the BE queue's 3 ms TXOP
+     * unless be_fast_retry is also set (a BE frame every ~3.3 ms was
+     * measured there, rtl8733b/Rtl8733bDevice.cpp); the 8733B figures are
+     * for all three knobs on. */
+    bool data_on_be = false;
+    /* env: DEVOURER_TX_BE_FAST_RETRY=1 — at bring-up, clear the BE queue's
+     * EDCA TXOP limit and pull its CWmax down to its CWmin
+     * (REG_EDCA_BE_PARAM 0x0508; AIFS and CWmin kept), so retries on BE
+     * re-air back to back the way MGMT's do instead of doubling the window
+     * up to 1023 slots. Not the hardware "Fast EDCA" thresholds. Applied on
+     * the RTL8822B, RTL8822C, RTL8822E and RTL8733B
+     * (AdapterCaps::tx_be_fast_retry_ok). Not on the RTL8812A, where clearing
+     * its 3 ms BE TXOP cut saturated throughput by up to two thirds and the
+     * lifetime alone holds the bound; it logs that it is ignored there. The
+     * counterpart: BE gives up exponential backoff, as MGMT already has, so
+     * it contends harder than stock BE against other stations' traffic. */
+    bool be_fast_retry = false;
+    /* env: DEVOURER_TX_AC_LIFETIME_US — the MAC drops a frame from an AC
+     * queue (VO/VI/BE/BK) once it has been queued this long, mid retry chain
+     * included (REG_LIFETIME_EN 0x0426 bits 0..3, other bits kept;
+     * REG_PKT_LIFE_TIME 0x04C0; 256 us units, rounded up, max ~16.8 s).
+     * 0 = off: no register touched. MGMT is never aged, so it needs
+     * data_on_be. Applied on the RTL8812A, RTL8822B, RTL8822C, RTL8822E and
+     * RTL8733B (AdapterCaps::tx_ac_lifetime_ok; a Jaguar3 part puts DATA on
+     * BE by itself, see data_on_be).
+     * Measured on one RTL8812AU,
+     * 500 fps of 1400 B at MCS4, retry 16, a peer that hears but never ACKs:
+     * a delivered age max of 68.8-71 ms at 68000 and 21.0 ms at 20000, against
+     * 3-9.5 s stock (the frames wait out every retry). The counterpart: a
+     * frame a slow-to-ACK peer would still have taken is dropped as well,
+     * and the drop is reported nowhere; count delivery at the receiver.
+     * Harness: tests/ac_lifetime_onair.sh. */
+    unsigned ac_lifetime_us = 0;
     /* env: DEVOURER_TX_USB_AGG — USB TX aggregation: max frames packed into
      * one bulk-OUT URB by send_packets (0 = off, the default: send_packets
      * degrades to a per-frame loop and every TX path is byte-identical to
@@ -307,9 +373,10 @@ struct DeviceConfig {
      * `tx.report` events. The TX-side link sensor. On the HalMAC chips the
      * descriptor SW_DEFINE also carries a rotating 8-bit tag the report
      * echoes (per-frame correlation). Default off (descriptors
-     * byte-identical). Needs an RX loop to deliver the C2H reports. RTL8733B
-     * is an explicit exception: its backend has no H2C/MEDIA_STATUS_RPT path,
-     * warns that the request is unsupported, and emits no `tx.report` events.
+     * byte-identical). Needs an RX loop to deliver the C2H reports. On the
+     * RTL8733B the reports exist only on a firmware the session itself loaded
+     * — a running image reused across a card power cycle emits no C2H — so
+     * that backend reloads the firmware at every bring-up.
      *
      * Value = sampling divisor N: 1 requests a report on EVERY frame, N > 1
      * on every Nth (0..255). The CCX emission path saturates at ~1.3–1.4 k
@@ -366,7 +433,28 @@ struct DeviceConfig {
     bool skip_trx_reassert = false; /* env: DEVOURER_SKIP_TRX_REASSERT (J2) */
     bool skip_rfe_init = false;     /* env: DEVOURER_SKIP_RFEINIT (J2) */
     bool skip_coex = false;         /* env: DEVOURER_SKIP_COEX (J2) */
-    bool skip_dig = false;          /* env: DEVOURER_SKIP_DIG (J2) */
+    /* env: DEVOURER_J3_RUNTIME ("0" disables) — Jaguar3: start the coex /
+     * phydm watchdog runtime thread after bring-up (default ON). With no RX
+     * loop running, that thread also keeps a bulk-IN read posted to drain
+     * firmware C2H reports, and every ~2 s it writes coex, TX-power tracking
+     * and DIG/EDCCA registers. A host that owns bulk-IN itself (raw C2H)
+     * turns it off. This flag covers only that post-bring-up thread:
+     * StartRxLoop still runs its own phydm watchdog (DIG included) when the
+     * thread is off, so fixed gain during an RX session also needs skip_dig.
+     * A TX-only session with the thread off loses all of it: nothing drains
+     * C2H, so no tx.report (CCX) is emitted; pwr_track (thermal TX-power
+     * compensation, which sustains upper 5 GHz) stops; and the coex re-apply
+     * and FW heartbeats stop (src/jaguar3/CLAUDE.md: sustained 5 GHz TX
+     * needs them). */
+    bool j3_runtime_thread = true;
+    /* env: DEVOURER_SKIP_DIG — J2: StartRxLoop starts no DIG thread; J3: the
+     * phydm watchdog (runtime thread and StartRxLoop worker) skips its DIG
+     * step.
+     * On J3 the wide-TX IGI floor (wide_tx_igi_floor) still writes IGI: the
+     * first 40/80 MHz frame raises a lower IGI to the floor, and leaving the
+     * floor clamps IGI down to the DIG window top. For IGI that stays exactly
+     * where the host put it, also set DEVOURER_WIDE_TX_IGI_FLOOR=0. */
+    bool skip_dig = false;
     /* env: DEVOURER_THERMAL_TRACK — Jaguar2 thermal TX-power tracking
      * (default ON; "0" disables). A ~2 s tick reads the RF 0x42 thermal
      * meter, computes the delta vs the efuse baseline, and writes the vendor

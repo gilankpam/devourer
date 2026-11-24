@@ -289,6 +289,9 @@ public:
   void ClearTxMode();
 
   bool send_packet(const uint8_t* packet, size_t length) override;
+  uint8_t tx_ep_for(const uint8_t* txdesc) const; /* DEVOURER_TX_DATA_BE */
+  void apply_ac_tx_queue_knobs();
+  bool ac_queue_ok() const;
   /* Batch TX with USB aggregation (IRadio contract): with
    * cfg.tx.usb_agg_max > 1 consecutive frames are packed into shared bulk-OUT
    * URBs — one [txdesc][frame] block per frame, first descriptor carrying the
@@ -476,6 +479,8 @@ private:
     fn(devourer::nhm_regs_11ac(), rd, wr);
     return true;
   }
+
+  void start_rx_loop(Action_ParsedRadioPacket packetProcessor, bool clear_stale);
 
   /* Programs 0x520[14]/[15] and, for the EDCCA gate only, the BB thresholds
    * at 0x8a4. SetCcaMode is apply_cca(d, d) and writes exactly what it

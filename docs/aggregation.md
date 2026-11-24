@@ -25,6 +25,18 @@ blocks 8-byte aligned, the FIRST descriptor carries the block count
 (dword7[31:24]: `USB_TXAGG_NUM` Jaguar1 / `DMA_TXAGG_NUM` HalMAC — inside the
 checksummed span, so agg-num is set before the checksum), and the URB total
 never lands on an exact bulk-MPS multiple (the sync bulk path has no ZLP).
+A single frame gets the same treatment on Jaguar2/3, whether the knob is off
+or a plan holds only one frame: when descriptor + frame is an exact bulk-MPS
+multiple, `single_block_pkt_offset` sets PKT_OFFSET = 1 (8 bytes of pad), as
+the vendor drivers do. Without it the chip neither airs nor reports that
+frame. Its descriptor then differs from the default in PKT_OFFSET and in the
+descriptor checksum, which covers that field. The RTL8733B applies the same
+rule; a Jaguar3 block built for a shared URB and then sent alone is re-padded
+off the multiple (`repad_tx_block_8822c`). Kestrel has no pad field to use and
+ends such a transfer with a zero-length packet instead
+(`ITransport::set_tx_sync_zlp`), as its vendor drivers do on every TX URB.
+`tests/tx_bulk_boundary_onair.sh` sends every frame at one length and compares
+boundary lengths against a control.
 
 Per-family hardware rules:
 
@@ -144,6 +156,18 @@ airtime ground truth):
   the deep feed A-MPDU needs is currently HalMAC-only. Jaguar1's descriptor
   path still marks frames aggregatable, but the multiplier is not reachable
   without a feed rework.
+- **The RTL8733B aggregates too, on two conditions the Jaguar recipe does not
+  have.** Its MAC forms A-MPDUs only from frames it numbers itself (the mode
+  sets EN_HWSEQ, so the caller's sequence numbers are replaced), and its data
+  queues are paced by the EDCA TXOP limit (~3 ms per launch on BE) rather
+  than by 0x0455/0x04BC, which `SetAmpduMode` zeroes for the TID's AC.
+  Measured delivered payload at an RTL8812EU witness, **no-ack broadcast
+  shape only**: MCS7/20 2050 → 3829 frames/s (+87%), MCS3/20 1360 → 1758
+  (+29%), and it aggregates from a depth-1 `send_packet` feed as well
+  (3671/s). The adversarial shape — unicast ARQ against a BlockAck
+  responder, which cost the 8822BU **−8%** at MCS3 above — is **unmeasured**
+  on this die, as is aggregate size, so the no-ack gains are not a claim
+  about an ARQ link (`src/rtl8733b/CLAUDE.md`).
 - **The gain is goodput, not channel occupancy.** On-air (8822BU, ch149,
   MCS7/20, B210 duty), aggregation raised delivered goodput **~+30%** (73.3% →
   79.2% duty plus a per-airtime payload increase; RX-capture cross-check +33%

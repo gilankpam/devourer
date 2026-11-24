@@ -90,6 +90,7 @@ public:
   void hci_setup() { _transport->hci_setup(); }
   /* PCIe LTR permission (ITransport::ltr_allowed); true on USB. */
   bool ltr_allowed() { return _transport->ltr_allowed(); }
+  void set_rx_max_wait_us(unsigned us) { _transport->set_rx_max_wait_us(us); }
   /* Pipelined register writes — see ITransport::write_batch_begin. */
   void write_batch_begin() { _transport->write_batch_begin(); }
   bool write_batch_end() { return _transport->write_batch_end(); }
@@ -153,6 +154,8 @@ public:
   uint8_t rxagg_usb_timeout = 0;
 
   bool send_packet(uint8_t *packet, size_t length);
+  /* send_packet on endpoint `ep` (tx.ep still overrides). */
+  bool send_packet_ep(uint8_t ep, uint8_t *packet, size_t length);
   /* Synchronous TX that blocks until completion or timeout. Returns bytes
    * submitted, or negative on error. */
   int bulk_send_sync(uint8_t *packet, size_t length, int timeout_ms) {
@@ -170,6 +173,9 @@ public:
     return _transport->tx_sync_data(ep, packet, length, timeout_ms);
   }
   void bulk_clear_halt(uint8_t ep) { _transport->clear_halt(ep); }
+  /* ITransport::set_tx_sync_zlp. The transport is shared by every copy of
+   * this adapter, so this is a per-device setting, not a per-copy one. */
+  void set_tx_sync_zlp(bool on) { _transport->set_tx_sync_zlp(on); }
 
   /* Stop TX and wait out everything already submitted (ITransport::
    * quiesce_tx). Must run while the caller's bus context is still alive —

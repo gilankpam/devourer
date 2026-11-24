@@ -1,0 +1,401 @@
+/* Headless guard for the M1 cell node's pure logic (examples/cell/cell.h):
+ * identities, the DU beacon / UE beacon / DL frame build-parse round trips and
+ * their rejects, 32->64-bit counter extension, phase wrapping, the UE TSF-step
+ * rule (incl. its sign convention with the timing advance), and the DU TA
+ * controller. No hardware. */
+#include <cstdint>
+#include <cstdio>
+#include <vector>
+
+#include "cell.h"
+#include "cell/Handover.h"
+
+using namespace cellnode;
+
+static int failures = 0;
+
+#define CHECK(cond)                                                            \
+  do {                                                                         \
+    if (!(cond)) {                                                             \
+      std::fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond);     \
+      failures++;                                                              \
+    }                                                                          \
+  } while (0)
+
+int main() {
+  /* Identities. */
+  uint8_t m[6];
+  cell_mac(m, 0x0102, 7);
+  CHECK(m[0] == 0x02 && m[3] == 0x01 && m[4] == 0x02 && m[5] == 7);
+  CHECK(cell_station(m, 0x0102) == 7);
+  CHECK(cell_station(m, 0x0103) == -1);
+  cell_mac(m, 0x0102, 0);
+  CHECK(cell_station(m, 0x0102) == 0);
+
+  /* DU beacon carries the grant map; find_grant_map recovers it. */
+  {
+    GrantMap g;
+    g.cell_id = 5;
+    g.epoch = 9;
+    g.period_tu = 100;
+    g.grants = {{1, 1, 4, 6, 0, -3}, {2, 2, 5, 6, 0, 7}};
+    const devourer::cell::Mac none;
+    const auto b = build_du_beacon(g, none);
+    CHECK(!b.empty() && b[0] == 0x80 && cell_station(b.data() + 10, 5) == 0);
+    CHECK(b[32] == 100 && b[33] == 0); /* beacon interval */
+    auto d = devourer::cell::find_grant_map(b.data(), b.size(), none);
+    CHECK(d.has_value() && *d == g);
+    GrantMap big = g;
+    big.grants.resize(devourer::cell::kGrantMax + 1);
+    CHECK(build_du_beacon(big, none).empty());
+  }
+
+  /* UE beacon round trip and rejects. */
+  {
+    auto b = build_ue_beacon(5, 3, 100, 42,
+                             devourer::cell::HarqFeedback{0x01020304u, 0xA0000005u, 0x1'2345'6789ull}, 61,
+                             9);
+    auto u = parse_ue_beacon(b.data(), b.size(), 5);
+    CHECK(u && u->ue == 3 && u->epoch == 42);
+    CHECK(u && u->fb.base == 0x01020304u && u->fb.bitmap == 0xA0000005u && u->dl_snr_half_db == 61);
+    CHECK(u && u->fb.gen_sf == 0x2345'6789ull && u->snr_gen == 9); /* gen: low 32 bits on air */
+    CHECK(extend32_near(0x2345'6789u, 0x1'2345'6000ll) == 0x1'2345'6789ll);
+    auto plain = build_ue_beacon(5, 3, 100, 7); /* defaults: no feedback, no SNR */
+    auto up = parse_ue_beacon(plain.data(), plain.size(), 5);
+    CHECK(up && up->fb == devourer::cell::HarqFeedback{} && up->dl_snr_half_db == 0);
+    CHECK(!parse_ue_beacon(b.data(), b.size(), 6));      /* other cell */
+    auto du = build_ue_beacon(5, 3, 100, 42);
+    du[15] = 0;                                            /* SA = the DU */
+    CHECK(!parse_ue_beacon(du.data(), du.size(), 5));
+    auto bad = b;
+    const size_t body0 = bad.size() - 2 * kCellTagLen - kUeBodyLen; /* the IE body's first byte */
+    bad[body0 + 3] = 4;                                    /* body ue != SA */
+    CHECK(!parse_ue_beacon(bad.data(), bad.size(), 5));
+    bad = b;
+    bad[body0 + 4] = 1;                                    /* ue high byte: 0x0103 != 3 */
+    CHECK(!parse_ue_beacon(bad.data(), bad.size(), 5));
+    CHECK(!parse_ue_beacon(b.data(), b.size() - 1, 5));   /* torn IE */
+    CHECK(u && !u->dl && up && !up->dl);                   /* no DL status unless given */
+    /* v5: the DL stream status rides the beacon, under the tags. */
+    const UeDlStatus ds{0xDEADBEEFu, 1234u, 0x80000001u, 1190u, 7u};
+    auto sb = build_ue_beacon(5, 3, 100, 42, {}, 0, 0, {}, {}, ds);
+    auto su = parse_ue_beacon(sb.data(), sb.size(), 5);
+    CHECK(su && su->dl && *su->dl == ds);
+    CHECK(!parse_ue_beacon(nullptr, 0, 5));
+  }
+
+  /* DL frame round trip and rejects. */
+  {
+    auto f = build_dl_frame(5, 2, 0x0102030405ull, 77, 10, DlHarq{70, 5, 3});
+    CHECK(f.size() == 26 + kDlBodyLen + 10);
+    CHECK(f[24] == 0x00); /* QoS: TID 0, normal ACK (the UE ACKs in hardware) */
+    auto d = parse_dl_frame(f.data(), f.size(), 5);
+    CHECK(d && d->ue == 2 && d->sf == 0x0102030405ull && d->seq == 77);
+    CHECK(d && d->harq.low == 70 && d->harq.pid == 5 && d->harq.attempt == 3);
+    CHECK(!parse_dl_frame(f.data(), f.size(), 4));
+    auto g = f;
+    g[30] = 1; /* body ue high byte: != RA */
+    CHECK(!parse_dl_frame(g.data(), g.size(), 5));
+    g = f;
+    g[10 + 5] = 3; /* TA is not the DU */
+    CHECK(!parse_dl_frame(g.data(), g.size(), 5));
+    CHECK(!parse_dl_frame(f.data(), 26 + kDlBodyLen - 1, 5));
+    CHECK(d && d->pdus.empty());
+    /* The CU's DL PDUs: carried in order, at most kDlMaxPdus, same length. */
+    std::vector<uint32_t> sns;
+    for (uint32_t i = 0; i < kDlMaxPdus + 2; ++i)
+      sns.push_back(1000 + i);
+    auto fp = build_dl_frame(5, 2, 1, 78, 10, DlHarq{70, 6, 1}, {}, sns);
+    CHECK(fp.size() == f.size());
+    auto dp = parse_dl_frame(fp.data(), fp.size(), 5);
+    CHECK(dp && dp->pdus.size() == kDlMaxPdus && dp->pdus.front() == 1000 &&
+          dp->pdus.back() == 1000 + kDlMaxPdus - 1);
+    auto f3 = build_dl_frame(5, 2, 1, 79, 10, DlHarq{70, 7, 1}, {}, {7, 8, 9}, 0x1122334455667788ull);
+    auto d3 = parse_dl_frame(f3.data(), f3.size(), 5);
+    CHECK(d3 && d3->pdus == std::vector<uint32_t>({7, 8, 9}) && d3->epoch == 0x1122334455667788ull);
+    f3[26 + 31] = kDlMaxPdus + 1; /* npdu beyond the slots */
+    CHECK(!parse_dl_frame(f3.data(), f3.size(), 5));
+  }
+
+  /* DL radiotap: RATE (500 kb/s units) + signed DBM_TX_POWER, no TX_FLAGS. */
+  {
+    const auto rt = build_dl_radiotap(24, -12);
+    CHECK(rt.size() == 10 && rt[2] == 10 && rt[3] == 0);
+    CHECK(rt[4] == 0x04 && rt[5] == 0x04 && rt[6] == 0 && rt[7] == 0);
+    CHECK(rt[8] == 48 && static_cast<int8_t>(rt[9]) == -12);
+    /* No power requested: no DBM_TX_POWER field at all (on Kestrel its mere
+     * presence is an absolute level that bypasses the session power). */
+    const auto r0 = build_dl_radiotap(24);
+    CHECK(r0.size() == 9 && r0[2] == 9 && r0[4] == 0x04 && r0[5] == 0x00 && r0[8] == 48);
+  }
+
+  /* Scheduling-frame integrity: version + tag (keyed by a stand-in MAC). */
+  {
+    auto keyed = [](uint64_t k) -> CellMac {
+      return [k](const uint8_t *d, size_t n, uint8_t out[20]) {
+        uint64_t h = 1469598103934665603ull ^ k;
+        for (size_t i = 0; i < n; ++i) h = (h ^ d[i]) * 1099511628211ull;
+        for (int i = 0; i < 20; ++i) { h = (h ^ static_cast<uint64_t>(i)) * 1099511628211ull; out[i] = static_cast<uint8_t>(h >> 32); }
+        return true;
+      };
+    };
+    const CellMac k1 = keyed(1), k2 = keyed(2);
+    const devourer::cell::HarqFeedback fb{7, 3, 99};
+    auto ub = build_ue_beacon(5, 2, 100, 4, fb, 50, 1, k1);
+    CHECK(parse_ue_beacon(ub.data(), ub.size(), 5, k1).has_value());
+    CHECK(!parse_ue_beacon(ub.data(), ub.size(), 5, k2));    /* wrong key */
+    CHECK(parse_ue_beacon(ub.data(), ub.size(), 5).has_value()); /* unauthenticated receiver */
+    auto unsigned_ub = build_ue_beacon(5, 2, 100, 4, fb, 50, 1);
+    CHECK(!parse_ue_beacon(unsigned_ub.data(), unsigned_ub.size(), 5, k1)); /* keyed: tag required */
+    auto tampered = ub;
+    tampered[tampered.size() - 16 - kUeBodyLen + 9] ^= 1; /* fb.base byte */
+    CHECK(!parse_ue_beacon(tampered.data(), tampered.size(), 5, k1));
+    auto ver = ub;
+    ver[ver.size() - 16 - kUeBodyLen + 2] = 4; /* an older protocol version */
+    CHECK(!parse_ue_beacon(ver.data(), ver.size(), 5));
+    /* The area tag (v3): another cell's DU checks it with the area key; the
+     * serving DU checks the cell tag. Each needs its own key. */
+    auto two = build_ue_beacon(5, 2, 100, 4, fb, 50, 1, k1, k2);
+    CHECK(parse_ue_beacon(two.data(), two.size(), 5, k1));              /* cell tag, cell key */
+    CHECK(parse_ue_beacon(two.data(), two.size(), 5, k2, true));        /* area tag, area key */
+    CHECK(!parse_ue_beacon(two.data(), two.size(), 5, k2));             /* area key on the cell tag */
+    CHECK(!parse_ue_beacon(two.data(), two.size(), 5, k1, true));       /* cell key on the area tag */
+    auto at = two;
+    at.back() ^= 1;                                                     /* area tag bit */
+    CHECK(parse_ue_beacon(at.data(), at.size(), 5, k1) && !parse_ue_beacon(at.data(), at.size(), 5, k2, true));
+    auto dl = build_dl_frame(5, 2, 10, 20, 0, DlHarq{18, 4, 2}, k1);
+    CHECK(parse_dl_frame(dl.data(), dl.size(), 5, k1).has_value());
+    CHECK(!parse_dl_frame(dl.data(), dl.size(), 5, k2));
+    auto dlt = dl;
+    dlt[26 + 13] ^= 1; /* seq */
+    CHECK(!parse_dl_frame(dlt.data(), dlt.size(), 5, k1));
+    /* What a DL frame takes from the queue after a switch: not-yet-offered
+     * first; an offered one just before the fresh one that would push it out
+     * of the UE's reorder window while still recoverable; plain order without
+     * a mark. */
+    {
+      std::deque<uint32_t> q;
+      for (uint32_t s = 100; s < 110; ++s)
+        q.push_back(s);
+      auto a = pick_dl_pdus(q, std::nullopt, 8);
+      CHECK(a == std::vector<uint32_t>({100, 101, 102, 103, 104, 105, 106, 107}) && q.size() == 2);
+      std::deque<uint32_t> r;
+      for (uint32_t s = 100; s < 110; ++s)
+        r.push_back(s);
+      auto b = pick_dl_pdus(r, 105u, 8); /* 100..105 offered: 106..109 first, then the offered */
+      CHECK(b == std::vector<uint32_t>({106, 107, 108, 109, 100, 101, 102, 103}));
+      CHECK(r == std::deque<uint32_t>({104, 105}));
+      /* A lost answer with a large backlog: 100..109 offered, 110..169 fresh —
+       * each offered one goes before the fresh run gets a window ahead of it. */
+      std::deque<uint32_t> w;
+      for (uint32_t s = 100; s < 170; ++s)
+        w.push_back(s);
+      uint32_t newest_sent = 0;
+      bool ok = true;
+      while (!w.empty()) {
+        for (uint32_t sn : pick_dl_pdus(w, 109u, 8)) {
+          if (sn >= 110)
+            newest_sent = std::max(newest_sent, sn);
+          else if (newest_sent && newest_sent - sn > 32) /* the UE's reorder window */
+            ok = false;
+        }
+      }
+      CHECK(ok);
+      /* After a DAPS handover, the usual queue (offered 108..139, at most a
+       * window behind the next fresh PDU 140): the fresh one leads. */
+      std::deque<uint32_t> h;
+      for (uint32_t s = 108; s < 141; ++s)
+        h.push_back(s);
+      auto f = pick_dl_pdus(h, 139u, 8);
+      CHECK(f.size() == 8 && f[0] == 140 && f[1] == 108);
+      /* A 40-PDU offered backlog (100..139) whose answers were ALL lost (the
+       * UE's top is 99) and fresh 140..149, a kDlMaxPdus frame: the UE's
+       * DlStreamRx confirms no gap — 100..107 ride with 140, which would push
+       * them out of its window. */
+      std::deque<uint32_t> g;
+      for (uint32_t s = 100; s < 150; ++s)
+        g.push_back(s);
+      devourer::cell::DlStreamRx rx;
+      rx.accept(1, 99);
+      auto g1 = pick_dl_pdus(g, 139u, kDlMaxPdus);
+      CHECK(g1.size() == kDlMaxPdus &&
+            std::vector<uint32_t>(g1.begin(), g1.begin() + 9) ==
+                std::vector<uint32_t>({100, 101, 102, 103, 104, 105, 106, 107, 140}));
+      for (uint32_t sn : g1)
+        rx.accept(1, sn);
+      while (!g.empty())
+        for (uint32_t sn : pick_dl_pdus(g, 139u, kDlMaxPdus))
+          rx.accept(1, sn);
+      CHECK(rx.missing_confirmed() == 0 && rx.missing_total() == 0 && rx.delivered() == 51);
+      /* The UE's DL status (its beacon) prunes a handover target's queue:
+       * what it has goes, what it lacks stays, settled ones go. */
+      devourer::cell::DlStreamRx sr;
+      for (uint32_t sn : {100u, 101u, 103u, 104u, 120u})
+        sr.accept(7, sn);
+      auto st = sr.status(); /* top 120; 102 and 105..119 pending; tracked from 100 */
+      CHECK(st && st->epoch == 7 && st->top == 120 && st->low == 102 && st->floor == 100);
+      CHECK(st && st->missing == ((1u << (120 - 102 - 1)) | ((1u << 15) - 1))); /* bits 17, 14..0 */
+      auto to_ue = [](const devourer::cell::DlStreamRx::Status &x) {
+        return UeDlStatus{static_cast<uint32_t>(x.epoch), x.top, x.missing, x.low, x.floor};
+      };
+      std::deque<uint32_t> tq;
+      for (uint32_t sn = 95; sn <= 125; ++sn) /* 95..99: below what the UE tracked */
+        tq.push_back(sn);
+      const size_t gone = prune_dl_queue(tq, to_ue(*st));
+      std::deque<uint32_t> want = {95, 96, 97, 98, 99, 102};
+      for (uint32_t sn = 105; sn <= 119; ++sn)
+        want.push_back(sn);
+      for (uint32_t sn = 121; sn <= 125; ++sn)
+        want.push_back(sn);
+      CHECK(tq == want && gone == 31 - want.size());
+      /* A pending run reaching past the 32-sn bitmap (its last sn still in the
+       * window): kept; what is older than its start and tracked: settled. */
+      devourer::cell::DlStreamRx lr;
+      for (uint32_t sn : {100u, 101u, 140u}) /* 102..139 pending: last sn 1 behind */
+        lr.accept(7, sn);
+      auto ls = lr.status();
+      CHECK(ls && ls->low == 102 && ls->missing == 0xFFFFFFFFu);
+      std::deque<uint32_t> lq = {100, 101, 102, 103, 107, 108, 139, 140, 141};
+      prune_dl_queue(lq, to_ue(*ls));
+      CHECK(lq == std::deque<uint32_t>({102, 103, 107, 108, 139, 141})); /* 102..107: beyond the bitmap, pending */
+      /* Abandoned frames' PDUs back at the head: once each, oldest first;
+       * the queue bound drops the oldest, counted. */
+      std::deque<uint32_t> rq = {50, 51, 52};
+      auto [ad, dr] = requeue_dl(rq, {45, 47, 46, 47, 51}, 64);
+      CHECK(ad == 3 && dr == 0 && rq == std::deque<uint32_t>({45, 46, 47, 50, 51, 52}));
+      auto [ad2, dr2] = requeue_dl(rq, {40, 41}, 6);
+      CHECK(ad2 == 2 && dr2 == 2 && rq == std::deque<uint32_t>({45, 46, 47, 50, 51, 52}));
+      /* A queue with gaps (it takes any newer sn): 1..32 offered, then 101 —
+       * every offered one is out of 101's window, yet 101 keeps its place. */
+      std::deque<uint32_t> gq;
+      for (uint32_t s = 1; s <= 32; ++s)
+        gq.push_back(s);
+      gq.push_back(101);
+      auto gf = pick_dl_pdus(gq, 32u, 32);
+      CHECK(gf.size() == 32 && std::find(gf.begin(), gf.end(), 101u) != gf.end() && gf.front() == 1 &&
+            gq == std::deque<uint32_t>({32}));
+    }
+    /* A bench's placement emulated (CELL_UE_MEAS_LEVEL): a listed cell held
+     * back for its calibration, then shifted to the target median; others
+     * unchanged; a malformed item ignored. */
+    {
+      MeasLevelPin pin("2:-53,1:-63,x:5,3:-40", 3);
+      CHECK(pin.active() && !pin.offset(3).has_value());
+      CHECK(pin.adjust(7, -70.0) == -70.0); /* unlisted */
+      CHECK(!pin.adjust(2, -50.0) && !pin.adjust(2, -52.0)); /* calibrating */
+      CHECK(pin.adjust(2, -48.0) == -53.0 + 2.0);             /* median -50 -> offset -3 */
+      CHECK(pin.offset(2) && *pin.offset(2) == -3.0 && pin.adjust(2, -60.0) == -63.0);
+      CHECK(!MeasLevelPin("").active() && !MeasLevelPin("2:abc").active());
+      /* malformed items are reported, not silently dropped */
+      CHECK(MeasLevelPin("2:-53x,1:-63,3,4:").bad() == std::vector<std::string>({"2:-53x", "3", "4:"}));
+      /* a fade in the calibration window slides it on (spread > 6 dB) */
+      MeasLevelPin fp("2:-50", 3);
+      CHECK(!fp.adjust(2, -40.0) && !fp.adjust(2, -60.0) && !fp.adjust(2, -61.0)); /* 21 dB spread */
+      CHECK(fp.adjust(2, -60.0) == -50.0 && fp.adjust(2, -62.0) == -52.0); /* -60,-61,-60 steady: offset +10 */
+    }
+    /* A DAPS-visit DL answer: broadcast RA, the target identity in the body,
+     * tagged with the target cell's key; not a unicast DL frame. */
+    {
+      auto v = build_visit_dl_frame(5, 2, 33, {700, 701, 702}, 9, k1);
+      CHECK(v[4] == 0xff && v[9] == 0xff);
+      auto dv = parse_visit_dl_frame(v.data(), v.size(), 5, k1);
+      CHECK(dv && dv->ue == 2 && dv->pdus == std::vector<uint32_t>({700, 701, 702}) && dv->epoch == 9);
+      CHECK(!parse_visit_dl_frame(v.data(), v.size(), 5, k2)); /* another key */
+      CHECK(!parse_visit_dl_frame(v.data(), v.size(), 4, k1)); /* another cell */
+      CHECK(!parse_dl_frame(v.data(), v.size(), 5, k1));       /* not a unicast DL frame */
+      auto u = build_dl_frame(5, 2, 33, 1, 0, DlHarq{0, 1, 1}, k1);
+      CHECK(!parse_visit_dl_frame(u.data(), u.size(), 5, k1)); /* a unicast one is not an answer */
+      auto vt = v;
+      vt[26 + 32] ^= 1; /* a PDU sn */
+      CHECK(!parse_visit_dl_frame(vt.data(), vt.size(), 5, k1));
+    }
+    auto dls = build_dl_frame(5, 2, 10, 21, 0, DlHarq{18, 5, 1}, k1, {500, 501}, 9);
+    CHECK(parse_dl_frame(dls.data(), dls.size(), 5, k1).has_value());
+    auto dls2 = dls;
+    dls[26 + 32] ^= 1; /* a PDU sn: under the tag */
+    CHECK(!parse_dl_frame(dls.data(), dls.size(), 5, k1));
+    dls2[26 + 23] ^= 1; /* the epoch: under the tag */
+    CHECK(!parse_dl_frame(dls2.data(), dls2.size(), 5, k1));
+    auto dlv = dl;
+    dlv[28] = 1; /* version */
+    CHECK(!parse_dl_frame(dlv.data(), dlv.size(), 5));
+  }
+
+  /* Counter extension. */
+  {
+    const int64_t ref = (int64_t{5} << 32) + 100;
+    CHECK(extend32_near(150, ref) == (int64_t{5} << 32) + 150);
+    CHECK(extend32_near(0xFFFFFF00u, ref) == (int64_t{4} << 32) + 0xFFFFFF00u);
+    const int64_t ref2 = (int64_t{5} << 32) + 0xFFFFFF00u;
+    CHECK(extend32_near(20, ref2) == (int64_t{6} << 32) + 20);
+    Wrap32 w;
+    CHECK(!w.ready());
+    CHECK(w.feed(0xFFFFFFF0u) == 0xFFFFFFF0ll);
+    CHECK(w.extend(0xFFFFFFF8u) == 0xFFFFFFF8ll);
+    CHECK(w.extend(0x10u) == (int64_t{1} << 32) + 0x10); /* wrapped since */
+    CHECK(w.feed(0x20u) == (int64_t{1} << 32) + 0x20);
+  }
+
+  /* Phase wrap. */
+  CHECK(wrap_phase(10, 1000) == 10);
+  CHECK(wrap_phase(990, 1000) == -10);
+  CHECK(wrap_phase(-10, 1000) == -10);
+  CHECK(wrap_phase(2500, 1000) == -500);
+  CHECK(wrap_phase(499, 1000) == 499);
+
+  /* UE TSF step: fires at du % P == ul_off - ta. */
+  {
+    const int64_t P = 102400;
+    /* UE tsf already du - ul_off: no step. */
+    CHECK(ue_tsf_step(1000000 - 23000, 1000000, 23000, 0, P, 2) == 0);
+    /* UE 7 us ahead -> step -7. */
+    CHECK(ue_tsf_step(1000000 - 23000 + 7, 1000000, 23000, 0, P, 2) == -7);
+    /* Within the deadband: no step. */
+    CHECK(ue_tsf_step(1000000 - 23000 + 2, 1000000, 23000, 0, P, 2) == 0);
+    /* TA 5: the UE wants to read 5 us MORE (fire 5 us earlier on the DU grid). */
+    CHECK(ue_tsf_step(1000000 - 23000, 1000000, 23000, 5, P, 2) == 5);
+    /* Whole-period differences are not errors. */
+    CHECK(ue_tsf_step(1000000 - 23000 + 3 * P, 1000000, 23000, 0, P, 2) == 0);
+    /* After the step the UE's TBTT (tsf % P == 0) lands at du % P == ul_off - ta. */
+    const int64_t du = 5 * P + 777, ul_off = 23000, ta = 12;
+    int64_t ue = 31337;
+    ue += ue_tsf_step(ue, du, ul_off, ta, P, 0);
+    const int64_t du_at_tbtt = du + ((P - (ue % P)) % P); /* advance to the UE's TBTT */
+    CHECK(wrap_phase(du_at_tbtt - (ul_off - ta), P) == 0);
+  }
+
+  /* TA loop: late arrivals raise the TA (fire earlier), with gain, clamp, min. */
+  {
+    TaLoop t(0.5, 50);
+    t.sample(10);
+    t.sample(10);
+    CHECK(!t.update(3)); /* too few samples: kept */
+    t.sample(10);
+    CHECK(t.update(3) && t.ta() == 5);
+    CHECK(t.pending() == 0);
+    for (int i = 0; i < 3; ++i) t.sample(-4);
+    CHECK(t.update(3) && t.ta() == 3);
+    for (int i = 0; i < 3; ++i) t.sample(1000);
+    CHECK(t.update(3) && t.ta() == 50); /* clamped */
+    for (int i = 0; i < 3; ++i) t.sample(1);
+    CHECK(!t.update(3) && t.ta() == 50); /* still clamped: unchanged */
+    t.sample(100);
+    t.discard();
+    /* One wild arrival (the rig's joining UE: its beacon before the first TSF
+     * step, 39 ms off) does not steer the TA: the window median does. */
+    TaLoop o(0.5, 25600);
+    for (int i = 0; i < 9; ++i) o.sample(-420);
+    o.sample(39125);
+    CHECK(o.update(3) && o.ta() == -210 && o.last_mean() == -420);
+    /* A loop never updated keeps only the newest kMaxWindow samples. */
+    TaLoop idle(0.5, 25600);
+    for (int i = 0; i < 10000; ++i) idle.sample(i);
+    CHECK(idle.pending() == TaLoop::kMaxWindow);
+    CHECK(idle.update(3) && idle.last_mean() >= 10000 - static_cast<double>(TaLoop::kMaxWindow));
+    CHECK(t.pending() == 0 && t.ta() == 50);
+  }
+
+  if (failures == 0)
+    std::printf("cell_node_selftest: all checks passed\n");
+  return failures == 0 ? 0 : 1;
+}

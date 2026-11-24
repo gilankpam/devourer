@@ -1,12 +1,14 @@
-/* pcieprobe — staged bring-up driver for the PCIe transport (RTL8821CE on
- * the 88xx ring plane; RTL8852CE on the AX plane — see probe_8852c below).
+/* pcieprobe — staged bring-up driver for the PCIe transport (RTL8821CE,
+ * RTL8822BE and RTL8822CE on the 88xx ring plane; RTL8852BE and RTL8852CE on
+ * the AX plane — see probe_kestrel below).
  *
  * Validates the PCIe milestones one layer at a time, bottom-up:
- *   id     (M0) vfio open + BAR2 MMIO: chip-id @0xFC must read 0x09,
- *               SYS_CFG1/REG_CR sanity.
+ *   id     (M0) vfio open + BAR2 MMIO: chip-id @0xFC must read 0x09 (8821C),
+ *               0x0a (8822B) or 0x13 (8822C), SYS_CFG1/REG_CR sanity.
  *   power  (M1) + TRX ring registers, pre-init, PCIe power-on sequence,
- *               chip version, EFUSE logical map (MAC @0xD0 must match the
- *               address the kernel driver reported).
+ *               chip version, EFUSE logical map (MAC @0xD0 on the
+ *               8821CE/8822BE, @0x120 on the 8822CE, must match the address
+ *               the kernel driver reported).
  *   fw     (M2) + init_system_cfg + firmware DLFW over the BCN TX ring
  *               (pass = REG_MCUFW_CTRL 0x80 == 0xC078).
  * Full RX (M3) lives in rxdemo via DEVOURER_PCIE_BDF.
@@ -29,12 +31,20 @@
 #include "logger.h"
 
 #include "jaguar2/ChipVariant.h"
-#if defined(DEVOURER_HAVE_JAGUAR2_8821C)
+#if defined(DEVOURER_HAVE_JAGUAR2_8821C) || defined(DEVOURER_HAVE_JAGUAR2_8822B)
+#define PCIEPROBE_HAVE_JAGUAR2 1
 #include "jaguar2/HalJaguar2.h"
 #include "jaguar2/HalmacJaguar2Fw.h"
 #include "jaguar2/HalmacJaguar2MacInit.h"
 #endif
-#if defined(DEVOURER_HAVE_KESTREL_8852C)
+#if defined(DEVOURER_HAVE_JAGUAR3_8822C)
+#include "jaguar3/ChipVariant.h"
+#include "jaguar3/HalJaguar3.h"
+#include "jaguar3/HalmacJaguar3Fw.h"
+#include "jaguar3/HalmacJaguar3MacInit.h"
+#endif
+#if defined(DEVOURER_HAVE_KESTREL_8852C) || defined(DEVOURER_HAVE_KESTREL_8852B)
+#define PCIEPROBE_HAVE_KESTREL 1
 #include "kestrel/ChipVariant.h"
 #include "kestrel/HalKestrel.h"
 #endif
@@ -49,21 +59,27 @@ static uint16_t pci_device_id(const std::string &bdf) {
   return static_cast<uint16_t>(v);
 }
 
-#if defined(DEVOURER_HAVE_KESTREL_8852C)
-/* RTL8852CE (Kestrel, AX): M0 die-id + cut, M1 = HalKestrel PCIe power-on
- * (mac_pwr_on_nic_pcie_8852c) + EFUSE, cross-checking the efuse copy of the
- * PCI ids against config space; M2 = firmware download over the AX HAXI
- * FWCMD ring (HalKestrel::download_firmware runs the PCIe pre-init, which
- * programs the rings through hci_setup, then the three-phase FWDL). */
-static int probe_8852c(RtlAdapter &adapter, Logger_t logger, int want) {
+#if defined(PCIEPROBE_HAVE_KESTREL)
+/* RTL8852CE / RTL8852BE (Kestrel, AX): M0 die-id (0x52 / 0x51) + cut, M1 =
+ * HalKestrel PCIe power-on (mac_pwr_on_nic_pcie_8852c / mac_pwr_on_pcie_8852b)
+ * + EFUSE, cross-checking the efuse copy of the PCI ids against config
+ * space; M2 = firmware download over the FWCMD ring (HalKestrel::
+ * download_firmware runs the die's PCIe pre-init, which programs the rings
+ * through hci_setup, then the FWDL). */
+static int probe_kestrel(RtlAdapter &adapter, Logger_t logger, int want,
+                         kestrel::ChipVariant variant, uint16_t pci_did) {
+  const bool is_c = variant == kestrel::ChipVariant::C8852C;
+  const char *tag = is_c ? "8852C" : "8852B";
   const uint8_t die_id = adapter.rtw_read8(0x00FC);
-  kestrel::HalKestrel hal(adapter, logger, kestrel::ChipVariant::C8852C);
+  kestrel::HalKestrel hal(adapter, logger, variant);
   const uint8_t cut = hal.read_cut();
-  const bool id_ok = die_id == 0x52;
-  logger->info("M0 (8852C): die-id=0x{:02x} (want 0x52) cut={}", die_id, cut);
+  const uint8_t want_die = is_c ? 0x52 : 0x51;
+  const bool id_ok = die_id == want_die;
+  logger->info("M0 ({}): die-id=0x{:02x} (want 0x{:02x}) cut={}", tag, die_id,
+               want_die, cut);
   devourer::Ev(logger->events(), "pcie.id")
       .f("ok", id_ok)
-      .f("chip", "8852c")
+      .f("chip", is_c ? "8852c" : "8852b")
       .hexf("chip_id", die_id, 2)
       .f("cut", static_cast<int>(cut));
   if (!id_ok || want < 1)
@@ -74,17 +90,17 @@ static int probe_8852c(RtlAdapter &adapter, Logger_t logger, int want) {
   try {
     power_ok = hal.power_on() && hal.read_efuse(ef);
   } catch (const std::exception &e) {
-    logger->error("M1 (8852C): power-on failed: {}", e.what());
+    logger->error("M1 ({}): power-on failed: {}", tag, e.what());
   }
   char mac[18];
   snprintf(mac, sizeof(mac), "%02x:%02x:%02x:%02x:%02x:%02x", ef.mac[0],
            ef.mac[1], ef.mac[2], ef.mac[3], ef.mac[4], ef.mac[5]);
-  const bool ids_ok = ef.pci_vid == 0x10EC && ef.pci_did == 0xC852;
+  const bool ids_ok = ef.pci_vid == 0x10EC && ef.pci_did == pci_did;
   const bool ok = power_ok && ef.autoload_ok && ids_ok;
-  logger->info("M1 (8852C): power_ok={} autoload={} efuse pci={:04x}:{:04x} "
-               "MAC(0x400)={} rfe={} xtal=0x{:02x}",
-               power_ok, ef.autoload_ok, ef.pci_vid, ef.pci_did, mac,
-               ef.rfe_type, ef.xtal_cap);
+  logger->info("M1 ({}): power_ok={} autoload={} efuse pci={:04x}:{:04x} "
+               "(config space {:04x}) MAC(0x400)={} rfe={} xtal=0x{:02x}",
+               tag, power_ok, ef.autoload_ok, ef.pci_vid, ef.pci_did, pci_did,
+               mac, ef.rfe_type, ef.xtal_cap);
   devourer::Ev(logger->events(), "pcie.power")
       .f("ok", ok)
       .hexf("efuse_vid", ef.pci_vid, 4)
@@ -105,11 +121,31 @@ static int probe_8852c(RtlAdapter &adapter, Logger_t logger, int want) {
   try {
     fw_ok = hal.download_firmware(cut);
   } catch (const std::exception &e) {
-    logger->error("M2 (8852C): FWDL failed: {}", e.what());
+    logger->error("M2 ({}): FWDL failed: {}", tag, e.what());
   }
   const uint32_t wcpu = adapter.rtw_read32(0x01E0); /* R_AX_WCPU_FW_CTRL */
   const uint32_t err = hal.fw_err_state("pcieprobe-fw");
-  logger->info("M2 (8852C): fw_ok={} WCPU_FW_CTRL=0x{:08x} ser-err=0x{:08x}",
+  if (!fw_ok && !is_c) {
+    /* 8852B PCIe DMA state after a failed FWDL: the engine gates and the
+     * FWCMD ring registers (vendor _pcie_8852b.c names). */
+    struct { const char *n; uint16_t r; } regs[] = {
+        {"PCIE_INIT_CFG1", 0x1000}, {"PCIE_INIT_CFG2", 0x1004},
+        {"PCIE_PS_CTRL", 0x1008},   {"PCIE_DMA_STOP1", 0x1010},
+        {"TXBD_RWPTR_CLR1", 0x1014}, {"PCIE_DMA_BUSY1", 0x101C},
+        {"CH12_NUM(16)", 0x1038},    {"CH12_IDX", 0x1080},
+        {"CH12_BDRAM_CTRL", 0x1228}, {"CH12_DESA_L", 0x1160},
+        {"BD_ADDR_H", 0x10E0},       {"DBG_ERR_FLAG", 0x11C4},
+        {"PCIE_INFO", 0x10F8},       {"LBC_WATCHDOG", 0x11D8},
+        {"HCI_FUNC_EN", 0x8380},     {"DMAC_FUNC_EN", 0x8400},
+        {"PLATFORM_EN", 0x0088},     {"SYS_SDIO_CTRL", 0x0070},
+        {"HCI_OPT_CTRL", 0x0074},    {"PCIE_EXP_CTRL", 0x13F0},
+        {"TX_ADDR_INFO_MODE", 0x8810}, {"PKTIN_SETTING", 0x9A00},
+        {"PCIE_HISR00", 0x10B4}};
+    for (const auto &x : regs)
+      logger->info("  dump {:>18} 0x{:04x} = 0x{:08x}", x.n, x.r,
+                   adapter.rtw_read32(x.r));
+  }
+  logger->info("M2 ({}): fw_ok={} WCPU_FW_CTRL=0x{:08x} ser-err=0x{:08x}", tag,
                fw_ok, wcpu, err);
   devourer::Ev(logger->events(), "pcie.fw")
       .f("ok", fw_ok)
@@ -117,8 +153,14 @@ static int probe_8852c(RtlAdapter &adapter, Logger_t logger, int want) {
       .hexf("ser_err", err, 8);
   if (!fw_ok)
     return 1;
-  if (want >= 3) {
-    /* M3 (bb): is the BB register window (+0x10000, halbb/halrf's plane)
+  if (want >= 3 && !is_c) {
+    logger->error("M3 (8852B): the bb stage is written for the 8852C's BB "
+                  "window probe only — not run");
+    devourer::Ev(logger->events(), "pcie.bb").f("ok", false).f("skipped", true);
+    return 1;
+  }
+  if (want >= 3 && is_c) {
+    /* M3 (bb, 8852C): is the BB register window (+0x10000, halbb/halrf's plane)
      * reachable through BAR2? set_enable_bb_rf then read a few BB registers
      * both ways (adapter wide path vs raw BAR offset) plus a MAC register. */
     hal.enable_bb_rf();
@@ -170,6 +212,73 @@ static int probe_8852c(RtlAdapter &adapter, Logger_t logger, int want) {
 }
 #endif
 
+#if defined(DEVOURER_HAVE_JAGUAR3_8822C)
+/* RTL8822CE (Jaguar3): M1 = rings -> pre-init -> PCIe power-on -> chip
+ * version -> EFUSE logical map (MAC at 0x120, rtw8822ce_efuse), with the
+ * PCIe link cfg (DBI CLKDLY) ahead of power-on as rtw88 orders it; M2 = the
+ * identity-dependent PCIe interface cfg + init_system_cfg + DLFW over the
+ * BCN ring. The same calls
+ * HalJaguar3::rtw_hal_init makes, exposed one layer at a time. */
+static int probe_8822c(RtlAdapter &adapter, Logger_t logger, int want) {
+  jaguar3::HalJaguar3 hal(adapter, logger, jaguar3::ChipVariant::C8822C, {});
+  jaguar3::HalmacJaguar3MacInit macinit(adapter, logger);
+  bool power_ok = false;
+  std::vector<uint8_t> efuse(0x200, 0x00);
+  try {
+    adapter.hci_setup();
+    macinit.pcie_link_cfg(); /* rtw88 order: link cfg precedes power-on */
+    macinit.pre_init_system_cfg();
+    hal.probe_power_on();
+    hal.read_chip_version();
+    hal.probe_efuse_logical_map(efuse.data(), efuse.size());
+    power_ok = true;
+  } catch (const std::exception &e) {
+    logger->error("M1 (8822C): power-on failed: {}", e.what());
+  }
+  char mac[18];
+  snprintf(mac, sizeof(mac), "%02x:%02x:%02x:%02x:%02x:%02x", efuse[0x120],
+           efuse[0x121], efuse[0x122], efuse[0x123], efuse[0x124],
+           efuse[0x125]);
+  const uint16_t efuse_id =
+      static_cast<uint16_t>(efuse[0] | (efuse[1] << 8));
+  const uint16_t efuse_did =
+      static_cast<uint16_t>(efuse[0x128] | (efuse[0x129] << 8));
+  const auto ver = hal.chip_version();
+  logger->info("M1 (8822C): power_ok={} cut={} efuse id=0x{:04x} "
+               "efuse pci-did=0x{:04x} MAC(0x120)={} rfe=0x{:02x}",
+               power_ok, static_cast<int>(ver.cut), efuse_id, efuse_did, mac,
+               efuse[0xCA]);
+  devourer::Ev(logger->events(), "pcie.power")
+      .f("ok", power_ok)
+      .f("chip", "8822c")
+      .f("cut", static_cast<int>(ver.cut))
+      .hexf("efuse_id", efuse_id, 4)
+      .hexf("efuse_did", efuse_did, 4)
+      .f("mac", mac)
+      .f("rfe", static_cast<int>(efuse[0xCA]));
+  if (!power_ok || want < 2)
+    return power_ok ? 0 : 1;
+
+  bool fw_ok = false;
+  try {
+    macinit.pcie_intf_cfg(ver.cut, efuse[0xCA]);
+    macinit.init_system_cfg(CHANNEL_WIDTH_20, ver.cut);
+    jaguar3::HalmacJaguar3Fw fw(adapter, logger, jaguar3::ChipVariant::C8822C);
+    fw_ok = fw.download_default_firmware();
+  } catch (const std::exception &e) {
+    logger->error("M2 (8822C): DLFW failed: {}", e.what());
+  }
+  const uint16_t mcufw = adapter.rtw_read16(0x0080);
+  logger->info("M2 (8822C): fw_ok={} MCUFW_CTRL=0x{:04x} (want 0xC078)", fw_ok,
+               mcufw);
+  devourer::Ev(logger->events(), "pcie.fw")
+      .f("ok", fw_ok)
+      .f("chip", "8822c")
+      .hexf("mcufw", mcufw, 4);
+  return fw_ok ? 0 : 1;
+}
+#endif
+
 int main(int argc, char **argv) {
   if (argc < 2) {
     fprintf(stderr, "usage: %s <bdf e.g. 0000:01:00.0> [id|power|fw|bb]\n",
@@ -190,42 +299,82 @@ int main(int argc, char **argv) {
 
   /* ---- stage id (M0): pure MMIO register plane, no power, no DMA ---- */
   RtlAdapter adapter(transport, logger, {});
-  if (pci_device_id(bdf) == 0xC852) {
-#if defined(DEVOURER_HAVE_KESTREL_8852C)
-    return probe_8852c(adapter, logger, want);
+  const uint16_t did = pci_device_id(bdf);
+  if (did == 0xC852 || did == 0xB852) {
+#if defined(PCIEPROBE_HAVE_KESTREL)
+    const auto variant = did == 0xC852 ? kestrel::ChipVariant::C8852C
+                                       : kestrel::ChipVariant::C8852B;
+#if !defined(DEVOURER_HAVE_KESTREL_8852C)
+    if (did == 0xC852) { logger->error("RTL8852CE found but 8852C support not compiled in"); return 1; }
+#endif
+#if !defined(DEVOURER_HAVE_KESTREL_8852B)
+    if (did == 0xB852) { logger->error("RTL8852BE found but 8852B support not compiled in"); return 1; }
+#endif
+    return probe_kestrel(adapter, logger, want, variant, did);
 #else
-    logger->error("RTL8852CE found but 8852C support not compiled in");
+    logger->error("Kestrel PCIe card found but neither 8852B nor 8852C support is compiled in");
     return 1;
 #endif
   }
-#if !defined(DEVOURER_HAVE_JAGUAR2_8821C)
-  logger->error("PCI device {:04x} is not an RTL8852CE and 8821C support is not "
-                "compiled in", pci_device_id(bdf));
+#if !defined(PCIEPROBE_HAVE_JAGUAR2) && !defined(DEVOURER_HAVE_JAGUAR3_8822C)
+  logger->error("PCI device {:04x} is not an RTL8852CE and no 88xx-plane chip "
+                "(8821C, 8822B, 8822C) is compiled in", pci_device_id(bdf));
   return 1;
 #else
   const uint8_t chip_id = adapter.rtw_read8(0x00FC);
   const uint32_t sys_cfg1 = adapter.rtw_read32(0x00F0);
   const uint8_t cr = adapter.rtw_read8(0x0100);
-  const bool id_ok = chip_id == 0x09;
-  logger->info("M0: chip-id=0x{:02x} (want 0x09) SYS_CFG1=0x{:08x} CR=0x{:02x}",
+  const bool is_8821c = chip_id == 0x09;
+  /* 8822B chip-ids exactly as the factory accepts them (WiFiDriver
+   * is_8822b_chip_id: 0x0a steady-state, 0x50 cold). */
+  const bool is_8822b = chip_id == 0x0a || chip_id == 0x50;
+  const bool is_8822c = chip_id == 0x13;
+  const bool id_ok = is_8821c || is_8822b || is_8822c;
+  logger->info("M0: chip-id=0x{:02x} (want 0x09 = 8821C, 0x0a = 8822B or "
+               "0x13 = 8822C) SYS_CFG1=0x{:08x} CR=0x{:02x}",
                chip_id, sys_cfg1, cr);
   devourer::Ev(logger->events(), "pcie.id")
       .f("ok", id_ok)
+      .f("chip", is_8822c ? "8822c" : is_8822b ? "8822b" : is_8821c ? "8821c" : "unknown")
       .hexf("chip_id", chip_id, 2)
       .hexf("sys_cfg1", sys_cfg1, 8)
       .hexf("cr", cr, 2);
   if (!id_ok || want < 1)
     return id_ok ? 0 : 1;
 
+  if (is_8822c) {
+#if defined(DEVOURER_HAVE_JAGUAR3_8822C)
+    return probe_8822c(adapter, logger, want);
+#else
+    logger->error("RTL8822CE found but 8822C support not compiled in");
+    return 1;
+#endif
+  }
+#if !defined(PCIEPROBE_HAVE_JAGUAR2)
+  logger->error("Jaguar2 PCIe part found but neither 8821C nor 8822B support is "
+                "compiled in");
+  return 1;
+#else
+#if !defined(DEVOURER_HAVE_JAGUAR2_8821C)
+  if (is_8821c) { logger->error("RTL8821CE found but 8821C support not compiled in"); return 1; }
+#endif
+#if !defined(DEVOURER_HAVE_JAGUAR2_8822B)
+  if (is_8822b) { logger->error("RTL8822BE found but 8822B support not compiled in"); return 1; }
+#endif
+  const auto variant = is_8822b ? jaguar2::ChipVariant::C8822B
+                                : jaguar2::ChipVariant::C8821C;
   /* ---- stage power (M1): rings -> pre-init -> PCIe power-on -> EFUSE ---- */
-  jaguar2::HalJaguar2 hal(adapter, logger, jaguar2::ChipVariant::C8821C, {});
-  jaguar2::HalmacJaguar2MacInit macinit(adapter, logger,
-                                        jaguar2::ChipVariant::C8821C);
+  jaguar2::HalJaguar2 hal(adapter, logger, variant, {});
+  jaguar2::HalmacJaguar2MacInit macinit(adapter, logger, variant);
   bool power_ok = false;
   std::vector<uint8_t> efuse(0x200, 0xFF);
   try {
-    /* rtw88 order: hci_setup (ring registers) precedes mac_power_on. */
+    /* rtw88 order: hci_setup (ring registers), the interface-PHY MDIO cfg
+     * (cut-gated; the cut is readable pre-power), then mac_power_on. */
     transport->setup_trx_rings();
+    hal.read_chip_version(); /* SYS_CFG1 reads on the unpowered MAC */
+    if (!macinit.pcie_phy_cfg(hal.chip_version().cut))
+      logger->warn("M1: PCIe MDIO table incomplete");
     macinit.pre_init_system_cfg();
     hal.power_on();
     hal.read_chip_version();
@@ -234,17 +383,20 @@ int main(int argc, char **argv) {
   } catch (const std::exception &e) {
     logger->error("M1: power-on failed: {}", e.what());
   }
-  /* 8821CE efuse: MAC at logical 0xD0 (rtw8821ce_efuse; the USB variant keeps
-   * it elsewhere). Cross-check against the kernel-reported MAC. */
+  /* PCIe efuse layout (rtw8821ce_efuse == rtw8822be_efuse): MAC at logical
+   * 0xD0 (the USB variants keep it at 0x107). Cross-check against the
+   * kernel-reported MAC. */
   char mac[18];
   snprintf(mac, sizeof(mac), "%02x:%02x:%02x:%02x:%02x:%02x", efuse[0xD0],
            efuse[0xD1], efuse[0xD2], efuse[0xD3], efuse[0xD4], efuse[0xD5]);
   const uint16_t efuse_id =
       static_cast<uint16_t>(efuse[0] | (efuse[1] << 8));
-  logger->info("M1: power_ok={} efuse id=0x{:04x} MAC(0xD0)={}", power_ok,
-               efuse_id, mac);
+  logger->info("M1: power_ok={} cut={} efuse id=0x{:04x} MAC(0xD0)={}", power_ok,
+               static_cast<int>(hal.chip_version().cut), efuse_id, mac);
   devourer::Ev(logger->events(), "pcie.power")
       .f("ok", power_ok)
+      .f("chip", is_8822b ? "8822b" : "8821c")
+      .f("cut", static_cast<int>(hal.chip_version().cut))
       .hexf("efuse_id", efuse_id, 4)
       .f("mac", mac);
   if (!power_ok || want < 2)
@@ -254,7 +406,7 @@ int main(int argc, char **argv) {
   bool fw_ok = false;
   try {
     macinit.init_system_cfg(CHANNEL_WIDTH_20, hal.chip_version().cut);
-    jaguar2::HalmacJaguar2Fw fw(adapter, logger, jaguar2::ChipVariant::C8821C);
+    jaguar2::HalmacJaguar2Fw fw(adapter, logger, variant);
     fw_ok = fw.download_default_firmware();
   } catch (const std::exception &e) {
     logger->error("M2: DLFW failed: {}", e.what());
@@ -263,5 +415,6 @@ int main(int argc, char **argv) {
   logger->info("M2: fw_ok={} MCUFW_CTRL=0x{:04x} (want 0xC078)", fw_ok, mcufw);
   devourer::Ev(logger->events(), "pcie.fw").f("ok", fw_ok).hexf("mcufw", mcufw, 4);
   return fw_ok ? 0 : 1;
-#endif /* DEVOURER_HAVE_JAGUAR2_8821C */
+#endif /* PCIEPROBE_HAVE_JAGUAR2 */
+#endif /* 88xx plane */
 }

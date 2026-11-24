@@ -96,6 +96,7 @@ bool is_8822b_chip_id(uint8_t id) {
  * with the Jaguar1 ids (0x04/05/08) it used to be lumped with, nor 8822B (0x0a)
  * or Jaguar3 (0x13/0x17). */
 constexpr uint8_t kChipId8821C = 0x09;
+constexpr uint8_t kChipId8822C = 0x13;
 
 } /* namespace */
 
@@ -354,25 +355,33 @@ std::unique_ptr<IRadio> WiFiDriver::CreateRadioPcie(
    * factory's PID-first Kestrel dispatch. */
   if (auto kvariant = kestrel::variant_for_pci_id(transport->pci_vendor_id(),
                                                   transport->pci_device_id())) {
-    if (*kvariant != kestrel::ChipVariant::C8852C) {
-      _logger->error("PCI {:04x}:{:04x} at {} is an RTL8852BE: its PCIe power "
-                     "sequence is unported — refusing rather than running the "
-                     "USB one",
-                     transport->pci_vendor_id(), transport->pci_device_id(),
-                     transport->bdf());
+    const bool is_c = *kvariant == kestrel::ChipVariant::C8852C;
+#if defined(DEVOURER_HAVE_KESTREL)
+#if !defined(DEVOURER_HAVE_KESTREL_8852C)
+    if (is_c) {
+      _logger->error("RTL8852CE detected but 8852C support not compiled in "
+                     "(DEVOURER_KESTREL_8852C=OFF)");
       return nullptr;
     }
-#if defined(DEVOURER_HAVE_KESTREL_8852C)
-    _logger->info("Creating RtlKestrelDevice C8852C over PCIe ({}; PCI "
+#endif
+#if !defined(DEVOURER_HAVE_KESTREL_8852B)
+    if (!is_c) {
+      _logger->error("RTL8852BE detected but 8852B support not compiled in "
+                     "(DEVOURER_KESTREL_8852B=OFF)");
+      return nullptr;
+    }
+#endif
+    _logger->info("Creating RtlKestrelDevice {} over PCIe ({}; PCI "
                   "{:04x}:{:04x})",
-                  transport->bdf(), transport->pci_vendor_id(),
-                  transport->pci_device_id());
+                  is_c ? "C8852C" : "C8852B", transport->bdf(),
+                  transport->pci_vendor_id(), transport->pci_device_id());
     return std::make_unique<RtlKestrelDevice>(
-        RtlAdapter(std::move(transport), _logger, cfg), _logger,
-        kestrel::ChipVariant::C8852C, cfg);
+        RtlAdapter(std::move(transport), _logger, cfg), _logger, *kvariant,
+        cfg);
 #else
-    _logger->error("RTL8852CE detected but 8852C support not compiled in "
-                   "(DEVOURER_KESTREL_8852C=OFF)");
+    _logger->error("{} detected but no Kestrel support is compiled in "
+                   "(DEVOURER_KESTREL_8852B/8852C both OFF)",
+                   is_c ? "RTL8852CE" : "RTL8852BE");
     return nullptr;
 #endif
   }
@@ -397,8 +406,46 @@ std::unique_ptr<IRadio> WiFiDriver::CreateRadioPcie(
 #endif
   }
 
+  if (is_8822b_chip_id(chip_id)) {
+#if defined(DEVOURER_HAVE_JAGUAR2_8822B)
+    /* RTL8822BE: the Jaguar2 HAL's 8822B variant over the 88xx ring plane. */
+    _logger->info("Creating RtlJaguar2Device C8822B over PCIe ({}; chip-id "
+                  "0x{:02x}, PCI {:04x}:{:04x})",
+                  transport->bdf(), chip_id, transport->pci_vendor_id(),
+                  transport->pci_device_id());
+    return std::make_unique<RtlJaguar2Device>(
+        RtlAdapter(std::move(transport), _logger, cfg), _logger,
+        jaguar2::ChipVariant::C8822B, cfg);
+#else
+    _logger->error("RTL8822B[E] (chip-id 0x{:02x}) detected but 8822B support "
+                   "not compiled in (DEVOURER_JAGUAR2_8822B=OFF)",
+                   chip_id);
+    return nullptr;
+#endif
+  }
+
+  if (chip_id == kChipId8822C) {
+#if defined(DEVOURER_HAVE_JAGUAR3_8822C)
+    /* RTL8822CE: the Jaguar3 HAL over the same 88xx ring plane as the
+     * 8821CE — the HAL's PCIe gates (power sequence, queue map, EFUSE MAC
+     * offset) key off RtlAdapter::is_usb(). */
+    _logger->info("Creating RtlJaguar3Device C8822C over PCIe ({}; chip-id "
+                  "0x{:02x}, PCI {:04x}:{:04x})",
+                  transport->bdf(), chip_id, transport->pci_vendor_id(),
+                  transport->pci_device_id());
+    return std::make_unique<RtlJaguar3Device>(
+        RtlAdapter(std::move(transport), _logger, cfg), _logger,
+        jaguar3::ChipVariant::C8822C, cfg);
+#else
+    _logger->error("RTL8822C[E] (chip-id 0x13) detected but 8822C support not "
+                   "compiled in (DEVOURER_JAGUAR3_8822C=OFF)");
+    return nullptr;
+#endif
+  }
+
   _logger->error("PCIe chip-id 0x{:02x} at {} is not supported over PCIe "
-                 "(RTL8821C[E] chip-id 0x09, or RTL8852CE by PCI id 10ec:c852)",
+                 "(RTL8821C[E] chip-id 0x09, RTL8822B[E] chip-id 0x0a, "
+                 "RTL8822C[E] chip-id 0x13, or RTL8852CE by PCI id 10ec:c852)",
                  chip_id, transport->bdf());
   return nullptr;
 }

@@ -568,6 +568,33 @@ quiesce must still return, and a `tx.quiesce_timeout` event in the log says it
 never drained. `BUILD=<dir>` points at another tree, which is how a fix is
 shown to fix something rather than asserted to.
 
+### `stop_during_init.sh`: a stop that lands inside `Init()`
+
+Drives `build/StopDuringInitProbe` through the `StopRxLoop` contract stated
+on its declaration in `src/IRadio.h`: a stop at 100 / 400 / 1000 / 2500 ms
+into `Init` (each must find Init still running, end it, and leave a chip
+that then receives on a standalone loop), a standalone restart after a stop,
+and a stale stop before `Init`. The frame checks need a channel with
+traffic; ambient beacons do.
+
+```bash
+sudo tests/stop_during_init.sh                                       # 8822BU, ch6
+sudo env PID=0xa81a CHANNEL=36 tests/stop_during_init.sh             # 8812EU
+sudo env VID=0x35bc PID=0x0101 CHANNEL=36 NO_RESET=1 tests/stop_during_init.sh
+sudo env VID=0x0e8d PID=0x7612 FW_DIR=reference/mt76/firmware tests/stop_during_init.sh
+```
+
+`sudo env VAR=...`, not `VAR=... sudo`: sudo scrubs the environment the
+script reads its knobs from. A `DEADLOCK` line means `Init` never came back;
+the probe drops the USB lock and exits, so the adapter may need a re-plug.
+The Kestrel run needs `NO_RESET=1`: a USB reset on its running firmware
+re-enumerates the adapter out from under the probe. The MT7612U needs
+`FW_DIR` (its firmware is not embedded); a bring-up that throws is reported
+as `INIT_THREW` rather than counted. On that part the stop call itself
+blocks on the lock its bring-up holds, so the reported return time is near
+zero: the stop returns when bring-up ends, and `Init` leaves right behind
+it. Measured 18/18 on each of the six backends.
+
 ### `kestrel_prich_onair.sh`: Kestrel per-channel BB programming
 
 Counts delivered frames across the configurations that the vendored
@@ -626,6 +653,18 @@ rather than PASS because a carry inside the low word cannot tear a read.
 One adapter is enough to verify the claim; the second only buys another unit
 and the wall-clock. A run can end with no verdict (rc 3) when the wrap lands in
 the other gap — that is a re-run, which the script does once, not a defect.
+
+### `mt7612u_busy_bringup.sh`: MT7612U bring-up on a channel already in use
+
+A Realtek peer under `txdemo` floods the channel at zero gap, then the MT7612U
+is brought up `REPS` times under it with `rxdemo` and each bring-up is timed to
+its RX ring starting; one bring-up before the peer starts is the control. It
+guards the RXDCOC / EP 4 stall (`src/mt7612u/CLAUDE.md`, "MCU replies and
+EP 4"): without the drain a loaded bring-up took ~27 s instead of ~1 s. Needs a build
+with `-DDEVOURER_MT7612U=ON` and runs as root under `mt7612u_sta_lib.sh`'s rules
+(private `OUT`, one run per `OUT`, recorded-PID kills, both adapters handed
+back). A lighter peer makes a pass meaningless - the stall's odds fall with the
+peer's load; numbers in `docs/mt7612u.md`, "Bring-up on a busy channel".
 
 ## Supported DUTs
 

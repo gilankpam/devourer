@@ -47,6 +47,19 @@ the PCIe cell ships the probe to the remote rig, vfio-binds, runs, restores).
 | Jaguar2 8812BU (sync USB3) | 14 µs | 64 µs | 1.7 ms | 3.1 ms | 3.3 ms |
 | Jaguar3 8822CU (sync USB3) | 16 µs | 61 µs | 2.2 ms | 3.2 ms | 3.3 ms |
 | 8821CE (PCIe, vfio) | 11 µs | 54 µs | 2.4 ms | 3.2 ms | 3.3 ms |
+| Kestrel 8852CE (PCIe, vfio), ch36 | 2.0 µs | 4.1 µs | 0.25 ms | 2.7 ms | 5.1 ms |
+| Kestrel 8852CE (PCIe, vfio), ch149 | 1.3 µs | 2.3 µs | 34 µs | 0.46 ms | 4.8 ms |
+
+The Kestrel rows are the epic-254 rig (TX and an 8852CE witness in two
+J6412 boxes, ~2400 frames per cell, `DEVOURER_PCIE_BDF` through
+`examples/common/radio_open.h`). ch36 carries a foreign AP (two BSSIDs at
+~−83 dBm); ch149 had no decodable traffic in a channel survey. On ch36 about
+60% of the frames later than 50 µs fell in two 10 ms bins of a 102.4 ms
+period, i.e. phase-locked to that AP's beacons — even with carrier sense off
+(`SetCcaMode(true)`). Keeping carrier sense on (`DL_CSMA=1`) did not change the
+picture on either channel (ch149: p99 41 µs, p99.9 1.6 ms, max 4.3 ms); the
+few ms-class frames remain on the clean channel and their cause is not
+established.
 
 Crystal ppm sane (−17 ppm, same reference witness) on every cell — the robust
 fits locked. The tail is run-to-run ambient-dependent: the same J1 cell has
@@ -88,6 +101,11 @@ beacons **autonomously**, so a beaconing session that ends without a device
 power-cycle must call it — a killed process leaves the beacon airing
 indefinitely (bench-bitten: a stale beacon with the same SA contaminated the
 next test's witness).
+On Kestrel it must also undo the port's TBTT protection (`TBTT_PROHIB_EN`,
+`BRK_SETUP`), which `StartBeacon` turns on. Left set, the port went on
+holding the UE's later injected frames to a fixed phase of its old beacon
+grid. A stopped UE re-joining through the RACH sent every msgA ~6 ms past
+the slot (M6 rig, `docs/cell-m6.md`).
 
 Per generation: Jaguar2 replaces the retained `_bcn_mpdu` and re-downloads via
 the steer path (the J2 engine loses the bcn-valid latch on re-latch, so the
@@ -109,6 +127,13 @@ separating update-caused missing slots from background witness loss.
 | Jaguar1 8812AU | 30/30 | 0.0 | 0 | 0 | 40 ms | 67 ms |
 | Jaguar2 8812BU | 30/30 | 0.0 | 0 | 0 | 63 ms | 174 ms |
 | Jaguar3 8822CU | 30/30 | 0.0 | 0 | 0 | 72 ms | 99 ms |
+| Kestrel 8852CE (PCIe), ch149 | 30/30 | 0.0 | 0 | 0 | 13 ms | 16 ms |
+
+Kestrel row: TX and witness are the two 8852CEs of one J6412 (shared host
+clock). The update is the same `BCN_UPD_V1` H2C `StartBeacon` sends, with no
+port or TBTT reprogramming. The probe's updates come at a fixed spacing of 10
+intervals, so their phase against the TBTT barely moves and the latency here
+samples one point of the grid: every update aired on the next beacon.
 
 ### The contract
 
@@ -201,10 +226,14 @@ scheduled MAC runs TX+RX anyway, so this is the relevant session shape.
 | Jaguar1 8812AU | 1.00 / 0.34 | 1.00 / 0.25 | yes (12) | 1.00 | n/a (8812 fmt) |
 | Jaguar2 8812BU | 0.91 / 2.1 (run-to-run 0.12–0.91) | 0.64 / 5.3 | yes (12) | 0.86 | 0 |
 | Jaguar3 8822CU | 1.00 / 0.24 | 1.00 / 0.13 | yes (12) | 0.96 | 0 |
+| RTL8733B 8733BU (8822BU responder) | 1.00 / 0.01 | 1.00 / 0.02 | yes (12, pin rate 1.00) | 0.98 | 0 |
 
-The RTL8733B is deliberately absent from this CCX table: no `tx.report` events
-arrive on that backend, so these columns cannot be filled for it. Independent
-airtime evidence does cover its soliciting side: a passive RTL8812CU witness
+The RTL8733B row is a later measurement (`CELLS="8733b:0x0bda:0xb733"
+RESP_PID=0xb812`, same ch36/MCS3/retry-12 shape, the RTL8822BU as responder
+because the 8814AU was not on that bench). Its reports exist only on a
+firmware the session loaded itself — bring-up reloads for that reason
+(`src/rtl8733b/CLAUDE.md`). Independent airtime evidence also covers its
+soliciting side, measured before the reports were reached: a passive RTL8812CU witness
 measured 1.032 copies/frame with an RTL8812AU responder armed versus 12.948
 with it off at MCS3; at 11M CCK the corresponding values were 1.002/11.908.
 Its dead-peer retry dose response was 0/3/12 -> 1.00/4.00/12.32–12.33 copies/frame.
@@ -294,9 +323,14 @@ nonzero limit for absolute numbers; 8821AU row re-measured ch6):
 | 8812EU | 98% | 0% | works |
 | 8812CU | 69% | 0% | works |
 | 8733B | unmeasured | 0% | works (closed-loop 1725/1725 at retry 12; single-shot cell never run) |
-| 8852CU (Kestrel) | 0% | 0% | not implemented on the AX generation |
+| 8852CU (Kestrel) | 0% | 0% | measured before the AX responder existed; see [kestrel-ack-responder.md](kestrel-ack-responder.md) |
+| 8852CE (Kestrel, PCIe) | 100% (closed loop, retry 8) | 0% (9 copies) | works |
 
-Unmeasured for lack of plugged hardware: 8821CU / PCIe 8821CE (recipe-shared
+8852CE row (epic-254 rig, ch149, MCS3, 200-byte QoS-Data at a 20 ms gap): Kestrel has
+no CCX report, so a third 8852CE counted on-air copies per payload counter
+(the `tests/kestrel_retry_witness.sh` method). Responder armed: 1036/1036
+frames aired once. Not armed: 184 of 185 aired 9 times (limit 8 = 9
+attempts). Unmeasured for lack of plugged hardware: 8821CU / PCIe 8821CE (recipe-shared
 with the 8822B; their `AdapterCaps.ack_responder_ok` stays false-as-unmeasured
 until a cell runs). The `ack_responder_ok` / `tx_retry_limit_ok` caps flags
 carry this table per die.
@@ -344,10 +378,10 @@ carry this table per die.
    stalled spsc-fat pool drained ~3 k frames in one receipt interval; the
    8192 default clears that bench worst case ~2.7×).
 2. **Closed-loop hardware ACK + autonomous retry is GO on Jaguar1, Jaguar3 and
-   the RTL8733B** (the CCX delivery/retry figures apply to the Jaguars; the
-   one-sample 8733B closes the loop as responder at 1725/1725 and as soliciting
-   TX collapses from 12.948 to 1.032 witnessed copies/frame at MCS3, but has no
-   per-frame report of its own — `docs/rtl8733b.md`)
+   the RTL8733B** (the one-sample 8733B closes the loop as responder at
+   1725/1725, as soliciting TX collapses from 12.948 to 1.032 witnessed
+   copies/frame at MCS3, and its own CCX reports fill the table above —
+   `docs/rtl8733b.md`)
    including retargeting an
    arbitrary UE MAC mid-session (re-arm `SetAckResponder`, change the
    descriptor RA — both fully dynamic). Requires a nonzero
@@ -400,6 +434,26 @@ witness (8812BU), 12 s. The probe attributed the streams separately —
 TX1 2955 frames at −51 dBm mean, TX2 741 frames at −44 dBm mean, a 4.0×
 count ratio exactly matching the 4× cadence ratio — confirming per-UE frame
 counts and per-UE signal statistics don't bleed between transmitters.
+
+**Kestrel (8852CE PCIe DU, two 8852CE UEs, ch149, 10 ms / 40 ms gaps):** the
+counts separate (ratio 3.90 against 4), but the first runs showed the signal
+statistics *did* bleed. With UE2 attenuated by `DEVOURER_TX_PWR_OFFSET_QDB=-40`,
+UE1's window read −58.6 dBm / 32.7 dB SNR and UE2's −55.0 dBm / 38.2 dB, the
+opposite of the change made. Cause: the Kestrel RX loop attached each PPDU-status
+report to the WIFI frames that followed it, but the MAC delivers a PPDU's
+frames *first* and its status after them (traced on the 8852CE: the status
+with the same `ppdu_cnt` arrives in the next RX buffer, ~140 µs later). So
+every frame carried the previous PPDU's RSSI/SNR/EVM. The RX loop now pairs them
+the vendor way (`phl_rx.c` `sts_ent` queues): it holds the PPDU's frames until the status
+with the same `ppdu_cnt`, rate, bandwidth, GI/LTF and PPDU type arrives. Frames whose
+status never comes are delivered without one (RSSI 0 = no sample) on the next
+PPDU, after 2 ms idle, or at loop exit. After the fix, the same sweep reads
+UE1 −55.0 dBm / 38 dB in every arm and UE2 −55.0 → −71.5 dBm (SNR 38.9 → 13.4
+dB) at −40 qdB. At −80 qdB UE2 was not decoded at all. Two observations are not
+explained: the drop is 16.5 dB for a nominal 10 dB offset, and both full-power UEs read
+exactly −55 dBm at desk range (possibly a reporting ceiling). The same fix
+corrects `GetRxQuality` and `GetActiveRxPaths` on Kestrel, which folded the
+same misattributed values.
 
 ### Tooling
 

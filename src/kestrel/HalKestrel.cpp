@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstring>
+#include <exception>
 #include <thread>
 #include <utility>
 
@@ -389,12 +390,10 @@ bool HalKestrel::pcie_ltr_silence() {
 }
 
 bool HalKestrel::pcie_pre_init() {
+  if (_variant == ChipVariant::C8852B)
+    return pcie_b_pre_init();
   /* rtw89_pci_ops_mac_pre_init_ax, the 8852C branches in order. Runs after
    * dmac_pre_init (HAXI DMA_MODE=PCIE_1B, HCI enables) and before FWDL. */
-  if (_variant != ChipVariant::C8852C) {
-    _logger->error("Kestrel PCIe: pre-init is ported for the 8852C only");
-    return false;
-  }
   /* Before anything can arm it: a chip the host forbids LTR must never send
    * one (an Unsupported Request behind a non-LTR switch → AER link reset). */
   if (!_device.ltr_allowed())
@@ -441,6 +440,8 @@ bool HalKestrel::pcie_pre_init() {
 }
 
 void HalKestrel::pcie_init() {
+  if (_variant == ChipVariant::C8852B)
+    return pcie_b_init();
   /* rtw89_pci_ops_mac_post_init_ax: LTR on, every TX channel open, release
    * the WPDMA + PCIe IO stops. */
   /* Report what actually happened, not the permission bit. */
@@ -457,6 +458,8 @@ void HalKestrel::pcie_init() {
 }
 
 void HalKestrel::pcie_deinit() {
+  if (_variant == ChipVariant::C8852B)
+    return pcie_b_deinit();
   /* rtw89_pci_ops_deinit: LTR off, DMA stopped, indices cleared. The rtw89
    * off path itself requests an idle LTR, so a host-forbidden function is
    * silenced instead. */
@@ -467,6 +470,199 @@ void HalKestrel::pcie_deinit() {
   pcie_ctrl_dma_all(false);
   pcie_clr_idx_all();
   _logger->info("Kestrel PCIe: HAXI DMA stopped");
+}
+
+/* ---- PCIe host-interface bring-up, RTL8852BE (vendor _pcie_8852b.c) -----
+ * The 8852B drives the older AX PCIe DMA engine: INIT_CFG1/CFG2 at 0x1000/
+ * 0x1004, STOP1/BUSY1 at 0x1010/0x101C, the BDRAM_CTRL_V2 bank, LTR v0. The
+ * vendor drop has every MAC-side function used here but not the generic
+ * _pcie.c that orders them; the order below is the 8852C's in-tree sequence
+ * with the 8852B's own steps (no PHY EQ — pcie_set_oobs_8852b is empty; LBC
+ * on; io_rcy off per intf_info_def_8852b). */
+
+void HalKestrel::pcie_b_ctrl_trxdma(bool tx, bool rx, bool io) {
+  /* ctrl_trxdma_pcie_8852b */
+  uint32_t init = _device.rtw_read32(r::R_AX_PCIE_INIT_CFG1);
+  init = tx ? (init | r::B_AX_TXHCI_EN) : (init & ~r::B_AX_TXHCI_EN);
+  init = rx ? (init | r::B_AX_RXHCI_EN) : (init & ~r::B_AX_RXHCI_EN);
+  uint32_t stop1 = _device.rtw_read32(r::R_AX_PCIE_DMA_STOP1);
+  stop1 = io ? (stop1 & ~r::B_AX_STOP_PCIEIO) : (stop1 | r::B_AX_STOP_PCIEIO);
+  _device.rtw_write32(r::R_AX_PCIE_INIT_CFG1, init);
+  _device.rtw_write32(r::R_AX_PCIE_DMA_STOP1, stop1);
+}
+
+bool HalKestrel::pcie_b_poll_dma_idle() {
+  /* poll_dma_all_idle_pcie_8852b: the seven TX channels then RXQ/RPQ, all
+   * in DMA_BUSY1. */
+  auto idle = [&](uint32_t mask, const char *what) {
+    for (int i = 0; i < 10; i++) {
+      if ((_device.rtw_read32(r::R_AX_PCIE_DMA_BUSY1) & mask) == 0)
+        return true;
+      delay_us(10);
+    }
+    _logger->error("Kestrel PCIe(8852B): {} DMA busy (0x101C=0x{:08x})", what,
+                   _device.rtw_read32(r::R_AX_PCIE_DMA_BUSY1));
+    return false;
+  };
+  return idle(r::PCIE_DMA_BUSY1_TX_8852B, "txdma ch") &&
+         idle(r::PCIE_DMA_BUSY1_RX_8852B, "rxdma");
+}
+
+void HalKestrel::pcie_b_clr_idx_all() {
+  /* clr_idx_ch_pcie_8852b with every channel enabled. */
+  _device.rtw_write32(r::R_AX_TXBD_RWPTR_CLR1, r::TXBD_RWPTR_CLR1_8852B);
+  _device.rtw_write32(r::R_AX_RXBD_RWPTR_CLR, r::RXBD_RWPTR_CLR_8852B);
+}
+
+void HalKestrel::pcie_b_mode_op() {
+  /* mode_op_pcie_8852b with intf_info_def_8852b: RXBD_PKT, TX burst 2048 B,
+   * RX burst 128 B, multi-tag × 8, WD DMA intervals 256 ns. The BD trunc
+   * mode (intf_info_def: TRUNC for both directions) is set here too — its
+   * writer is the absent generic _pcie.c — together with the host 8-byte
+   * addr-info select the 8852C path also programs (rtw89 mode_op). */
+  uint32_t v = _device.rtw_read32(r::R_AX_PCIE_INIT_CFG1);
+  v &= ~r::B_AX_RXBD_MODE;
+  v = r::set_clr_word(v, r::MAC_AX_TX_BURST_2048B, r::B_AX_PCIE_MAX_TXDMA_MSK,
+                      r::B_AX_PCIE_MAX_TXDMA_SH);
+  v = r::set_clr_word(v, r::MAC_AX_RX_BURST_128B, r::B_AX_PCIE_MAX_RXDMA_MSK,
+                      r::B_AX_PCIE_MAX_RXDMA_SH);
+  v |= r::B_AX_LATENCY_CONTROL | r::B_AX_TX_TRUNC_MODE | r::B_AX_RX_TRUNC_MODE;
+  _device.rtw_write32(r::R_AX_PCIE_INIT_CFG1, v);
+  uint32_t v2 = _device.rtw_read32(r::R_AX_PCIE_INIT_CFG2);
+  v2 = r::set_clr_word(v2, r::MAC_AX_WD_DMA_INTVL_256NS, r::B_AX_WD_ITVL_IDLE_MSK,
+                       r::B_AX_WD_ITVL_IDLE_SH);
+  v2 = r::set_clr_word(v2, r::MAC_AX_WD_DMA_INTVL_256NS, r::B_AX_WD_ITVL_ACT_MSK,
+                       r::B_AX_WD_ITVL_ACT_SH);
+  _device.rtw_write32(r::R_AX_PCIE_INIT_CFG2, v2);
+  field32(r::R_AX_PCIE_EXP_CTRL, r::MAC_AX_TAG_NUM_8, r::B_AX_MAX_TAG_NUM_MSK,
+          r::B_AX_MAX_TAG_NUM_SH);
+  set32(r::R_AX_TX_ADDRESS_INFO_MODE_SETTING, r::B_AX_HOST_ADDR_INFO_8B_SEL);
+  clr32(r::R_AX_PKTIN_SETTING, r::B_AX_WD_ADDR_INFO_LENGTH);
+}
+
+bool HalKestrel::pcie_b_rst_bdram() {
+  /* rst_bdram_pcie_8852b: the reset bit is polled with the link forced to
+   * L0 (PS_CTRL FORCE_L0) for its duration. */
+  set32(r::R_AX_PCIE_INIT_CFG1, r::B_AX_RST_BDRAM);
+  set32(r::R_AX_PCIE_PS_CTRL, r::B_AX_PCIE_FORCE_L0);
+  bool ok = false;
+  for (int i = 0; i < 100; i++) {
+    if (!(_device.rtw_read32(r::R_AX_PCIE_INIT_CFG1) & r::B_AX_RST_BDRAM)) {
+      ok = true;
+      break;
+    }
+    delay_us(1);
+  }
+  clr32(r::R_AX_PCIE_PS_CTRL, r::B_AX_PCIE_FORCE_L0);
+  if (!ok)
+    _logger->error("Kestrel PCIe(8852B): BDRAM reset did not clear (0x1000=0x{:08x})",
+                   _device.rtw_read32(r::R_AX_PCIE_INIT_CFG1));
+  return ok;
+}
+
+void HalKestrel::pcie_b_ctrl_txdma_ch(bool enable) {
+  /* ctrl_txdma_ch_pcie_8852b, all seven channels at once. */
+  if (enable)
+    clr32(r::R_AX_PCIE_DMA_STOP1, r::PCIE_DMA_STOP1_CHANS_8852B);
+  else
+    set32(r::R_AX_PCIE_DMA_STOP1, r::PCIE_DMA_STOP1_CHANS_8852B);
+}
+
+bool HalKestrel::pcie_b_ltr_set(bool enable) {
+  /* pcie_ltr_write_8852b with pcie_ltr_param_def_8852b (LTR v0): on =
+   * LTR_EN + HW_EN + WD_NOEMP_CHK, space 500 us, idle timer 3.2 ms, RX
+   * thresholds 0x28, the two latency words; off = the enables cleared. */
+  const uint32_t c0 = _device.rtw_read32(r::R_AX_LTR_CTRL_0);
+  const uint32_t c1 = _device.rtw_read32(r::R_AX_LTR_CTRL_1);
+  const uint32_t idle = _device.rtw_read32(r::R_AX_LTR_IDLE_LATENCY);
+  const uint32_t act = _device.rtw_read32(r::R_AX_LTR_ACTIVE_LATENCY);
+  for (uint32_t v : {c0, c1, idle, act})
+    if (v == 0xFFFFFFFFu || v == 0xEAEAEAEAu) {
+      _logger->error("Kestrel PCIe(8852B): LTR registers unreadable");
+      return false;
+    }
+  uint32_t ctrl0 = c0;
+  const uint32_t en_bits = r::B_AX_LTR_EN | r::B_AX_LTR_HW_EN | r::B_AX_LTR_WD_NOEMP_CHK;
+  ctrl0 = enable ? (ctrl0 | en_bits) : (ctrl0 & ~en_bits);
+  ctrl0 = r::set_clr_word(ctrl0, r::PCI_LTR_SPC_500US, r::B_AX_LTR_SPACE_IDX_MSK,
+                          r::B_AX_LTR_SPACE_IDX_SH);
+  ctrl0 = r::set_clr_word(ctrl0, r::PCI_LTR_IDLE_TIMER_3_2MS,
+                          r::B_AX_LTR_IDLE_TIMER_IDX_MSK, r::B_AX_LTR_IDLE_TIMER_IDX_SH);
+  uint32_t ctrl1 = c1;
+  ctrl1 = r::set_clr_word(ctrl1, r::LTR_RX_TH_8852B, r::B_AX_LTR_RX0_TH_MSK,
+                          r::B_AX_LTR_RX0_TH_SH);
+  ctrl1 = r::set_clr_word(ctrl1, r::LTR_RX_TH_8852B, r::B_AX_LTR_RX0_TH_MSK,
+                          r::B_AX_LTR_RX1_TH_SH_8852B);
+  _device.rtw_write32(r::R_AX_LTR_CTRL_0, ctrl0);
+  _device.rtw_write32(r::R_AX_LTR_CTRL_1, ctrl1);
+  _device.rtw_write32(r::R_AX_LTR_IDLE_LATENCY, r::LTR_IDLE_LATENCY_8852B);
+  _device.rtw_write32(r::R_AX_LTR_ACTIVE_LATENCY, r::LTR_ACTIVE_LATENCY_8852B);
+  return true;
+}
+
+bool HalKestrel::pcie_b_pldr_fix() {
+  /* clr_pcie_avoid_pldr_polling_fail (init.c): 8852A/8852B/8851B/8852BT run
+   * this right after power-on, before hci_func_en — TX/RX HCI and PCIe IO
+   * off, every ring index cleared, DMA polled idle. */
+  pcie_b_ctrl_trxdma(false, false, false);
+  pcie_b_clr_idx_all();
+  return pcie_b_poll_dma_idle();
+}
+
+bool HalKestrel::pcie_b_pre_init() {
+  /* A host that forbids LTR must never see one (DEVCTL2 LTR_EN=0 — an LTR
+   * message behind a non-LTR port is an Unsupported Request and resets the
+   * link). The LTR block is the same v0 register set on/off here, so
+   * "silence" = off, and an unreadable block means it cannot be proven off:
+   * stop here rather than open the TX channels on such a host. */
+  if (!_device.ltr_allowed() && !pcie_b_ltr_set(false)) {
+    _logger->error("Kestrel PCIe(8852B): host forbids LTR and the LTR block "
+                   "could not be disabled — refusing to bring the DMA up");
+    return false;
+  }
+  set32(r::R_AX_HCI_OPT_CTRL, r::B_AX_WAKE_CTRL); /* power_wake */
+  /* intf_info_def_8852b: LBC on, 2 ms (R_AX_LBC_WATCHDOG); io_rcy off. */
+  {
+    uint32_t v = _device.rtw_read32(r::R_AX_LBC_WATCHDOG);
+    v = r::set_clr_word(v, r::MAC_AX_LBC_TMR_2MS, r::B_AX_LBC_TIMER_MSK,
+                        r::B_AX_LBC_TIMER_SH) | r::B_AX_LBC_EN;
+    _device.rtw_write32(r::R_AX_LBC_WATCHDOG, v);
+  }
+  set32(r::R_AX_PCIE_DMA_STOP1, r::B_AX_STOP_WPDMA);
+  pcie_b_ctrl_trxdma(false, false, false);
+  if (!pcie_b_poll_dma_idle())
+    return false;
+  pcie_b_clr_idx_all();
+  pcie_b_mode_op();
+  /* Ring base/num/BDRAM registers + host indices — the transport's memory. */
+  _device.hci_setup();
+  if (!pcie_b_rst_bdram())
+    return false;
+  /* Only the FWCMD channel open until the firmware is up. Unlike the HAXI,
+   * this engine's DMA reads ride the PCIe IO path: with STOP_PCIEIO left
+   * set the FWCMD channel reports BUSY and never consumes a descriptor
+   * (measured on the BL-M8852BP4), so IO is released here, not post-init. */
+  pcie_b_ctrl_txdma_ch(false);
+  clr32(r::R_AX_PCIE_DMA_STOP1, r::B_AX_STOP_CH12);
+  pcie_b_ctrl_trxdma(true, true, true);
+  _logger->info("Kestrel PCIe(8852B): pre-init done (DMA + IO up, CH12 open)");
+  return true;
+}
+
+void HalKestrel::pcie_b_init() {
+  const bool allowed = _device.ltr_allowed();
+  const bool ok = pcie_b_ltr_set(allowed);
+  pcie_b_ctrl_txdma_ch(true);
+  clr32(r::R_AX_PCIE_DMA_STOP1, r::B_AX_STOP_WPDMA | r::B_AX_STOP_PCIEIO);
+  _logger->info("Kestrel PCIe(8852B): post-init done (LTR {}, all TX channels open)",
+                !ok ? "FAILED" : allowed ? "on" : "off");
+}
+
+void HalKestrel::pcie_b_deinit() {
+  pcie_b_ltr_set(false);
+  pcie_b_ctrl_trxdma(false, false, false);
+  pcie_b_clr_idx_all();
+  _logger->info("Kestrel PCIe(8852B): DMA stopped");
 }
 
 bool HalKestrel::power_on_8852c() {
@@ -563,13 +759,9 @@ bool HalKestrel::power_on_8852c() {
 }
 
 bool HalKestrel::power_on() {
-  /* USB for both dies; PCIe for the 8852C only (mac_pwr_on_nic_pcie_8852c —
-   * three deltas inside power_on_8852c). The 8852B PCIe sequence is unported
-   * and untested, so keep refusing it rather than run the USB one. */
-  if (!_device.is_usb() && _variant != ChipVariant::C8852C) {
-    _logger->error("Kestrel: PCIe power-on is ported for the 8852C only");
-    return false;
-  }
+  /* USB for both dies; PCIe through the same per-die functions: the 8852C's
+   * three deltas sit inside power_on_8852c (mac_pwr_on_nic_pcie_8852c), the
+   * 8852B's two inside the sequence below (mac_pwr_on_pcie_8852b). */
   /* mac_set_dut_env_mode (init.c:26, the first thing mac_hal_init does):
    * WCPU_FW_CTRL FW_ENV[29:28] = 0 (normal DUT mode). */
   field32(r::R_AX_WCPU_FW_CTRL, 0, r::B_AX_FW_ENV_MSK, r::B_AX_FW_ENV_SH);
@@ -655,6 +847,9 @@ bool HalKestrel::power_on() {
   plat(true);
   plat(false);
   plat(true);
+  /* PCIe (mac_pwr_on_pcie_8852b): 0x70[12] PCIE_CALIB_EN = 0. */
+  if (_pcie)
+    clr32(r::R_AX_SYS_SDIO_CTRL, r::B_AX_PCIE_CALIB_EN);
 
   /* 0x18[6]=1 then XTAL_SI ANAPAR_WL[6]=1 */
   set32(r::R_AX_SYS_ADIE_PAD_PWR_CTRL, r::B_AX_SYM_PADPDN_WL_PTA_1P3);
@@ -712,6 +907,17 @@ bool HalKestrel::power_on() {
     field32(r::R_AX_SPS_DIG_ON_CTRL0, 0x9, r::B_AX_VOL_L1_MSK, r::B_AX_VOL_L1_SH);
     field32(r::R_AX_SPS_DIG_ON_CTRL0, 0xA, r::B_AX_VREFPFM_L_MSK,
             r::B_AX_VREFPFM_L_SH);
+    /* PCIe (mac_pwr_on_pcie_8852b): _patch_ck_buf_level, enabled on CAV and
+     * CBV only (eco_patch_check.c chk_patch_ck_buf_level) — HCI LDO VADJ =
+     * 0xA under the PMCR write-mask bit. */
+    if (_pcie && read_cut() <= 1) {
+      set32(r::R_AX_PMC_DBG_CTRL2, r::B_AX_SYSON_DIS_PMCR_AX_WRMSK);
+      uint16_t ldo = _device.rtw_read16(r::R_AX_HCI_LDO_CTRL);
+      ldo = static_cast<uint16_t>((ldo & ~(r::B_AX_R_AX_VADJ_MSK << r::B_AX_R_AX_VADJ_SH)) |
+                                  (r::HCI_LDO_VADJ_CK_BUF_8852B << r::B_AX_R_AX_VADJ_SH));
+      _device.rtw_write16(r::R_AX_HCI_LDO_CTRL, ldo);
+      clr32(r::R_AX_PMC_DBG_CTRL2, r::B_AX_SYSON_DIS_PMCR_AX_WRMSK);
+    }
   }
 
   /* Enable DMAC (0x8400) + CMAC (0xC000) function blocks — the pwr-seq tail
@@ -816,11 +1022,37 @@ uint32_t HalKestrel::fw_err_state(const char *where) {
   const uint32_t ctrl = _device.rtw_read32(r::R_AX_HALT_C2H_CTRL);
   if (ctrl == 0)
     return 0;
-  const uint32_t err = _device.rtw_read32(r::R_AX_HALT_C2H);
-  _logger->error("Kestrel FW-SER at [{}]: HALT_C2H_CTRL=0x{:08x} err=0x{:08x} "
-                 "(0x2010=L2_AH_HCI 0x1000=L1_DMAC 0x2000=L2_AH_DMA)",
-                 where, ctrl, err);
-  return err;
+  /* The halt is established by now: everything below is diagnostics, and a
+   * failed read here (the USB transport throws) must not hide it from the
+   * caller, so it is logged and the halt still returned. */
+  uint32_t err = 0;
+  try {
+    err = _device.rtw_read32(r::R_AX_HALT_C2H);
+    _logger->error("Kestrel FW-SER at [{}]: HALT_C2H_CTRL=0x{:08x} err=0x{:08x} "
+                   "(0x2010=L2_AH_HCI 0x1000=L1_DMAC 0x2000=L2_AH_DMA)",
+                   where, ctrl, err);
+    /* Which DMAC error raised it (dbgpkg.c dump_err_status_dmac), then on the
+     * 8852C the HAXI block its USB DMA runs through
+     * (dump_err_status_haxidma_ax, which the vendor builds for the AXI dies
+     * only). */
+    auto rd = [&](uint16_t a) { return _device.rtw_read32(a); };
+    _logger->error("Kestrel FW-SER dmac_isr=0x{:08x} ser_dbg=0x{:08x}",
+                   rd(r::R_AX_DMAC_ERR_ISR), rd(r::R_AX_SER_DBG_INFO));
+    if (_variant == ChipVariant::C8852C)
+      _logger->error("Kestrel FW-SER haxi_idct=0x{:08x}/msk 0x{:08x} "
+                     "dbg_err_v1=0x{:08x} haxi cfg1=0x{:08x} stop1=0x{:08x} "
+                     "busy1=0x{:08x} busy3=0x{:08x} hdp_dbg2=0x{:08x}",
+                     rd(r::R_AX_HAXI_IDCT), rd(r::R_AX_HAXI_IDCT_MSK),
+                     rd(r::R_AX_DBG_ERR_FLAG_V1), rd(r::R_AX_HAXI_INIT_CFG1),
+                     rd(r::R_AX_HAXI_DMA_STOP1), rd(r::R_AX_HAXI_DMA_BUSY1),
+                     rd(r::R_AX_HAXI_DMA_BUSY3), rd(r::R_AX_HDP_DBG_INFO_2_V1));
+  } catch (const std::exception &e) {
+    _logger->error("Kestrel FW-SER at [{}]: HALT_C2H_CTRL=0x{:08x}, error "
+                   "registers unreadable ({})",
+                   where, ctrl, e.what());
+  }
+  /* A posted halt with no (readable) error code still counts as a halt. */
+  return err != 0 ? err : ctrl;
 }
 
 void HalKestrel::fw_err_settle(const char *where, uint32_t ms) {
@@ -878,6 +1110,10 @@ bool HalKestrel::download_firmware(uint8_t cut) {
   /* mac_hal_init order (init.c:406-434): hci_func_en -> dmac_pre_init (DLFW
    * DLE/HFC) -> intf_pre_init (usb_pre_init / pcie_pre_init) -> chk_sec_rec
    * -> fwdl. */
+  /* init.c: the 8852A/B PCIe parts clear a stuck DMA before hci_func_en
+   * (clr_pcie_avoid_pldr_polling_fail). */
+  if (_pcie && _variant == ChipVariant::C8852B && !pcie_b_pldr_fix())
+    return false;
   if (!_fw.fw_pre_init())
     return false;
   if (!(_pcie ? pcie_pre_init() : usb_pre_init()))
@@ -936,23 +1172,32 @@ bool HalKestrel::dle_init_nic() {
    * wde_qt18 / ple_qt46,47) is a different budget from either USB row — the
    * host-interface pages are 64 B WDE × 3328 with a 3228-page HIF quota. */
   const bool pc = c && _pcie;
+  /* 8852B over PCIe: the dle_mem_pcie_8852b SCC_TURBO row (the same qta_mode
+   * the USB path runs; same 11-queue PLE shape). */
+  const bool pb = !c && _pcie;
   const uint16_t wde_lnk = pc  ? r::PCIE_SCC_WDE_LNK_PAGE_8852C
                            : c ? r::SCC_WDE_LNK_PAGE_8852C
+                           : pb ? r::PCIE_TURBO_WDE_LNK_PAGE_8852B
                                : r::SCC_WDE_LNK_PAGE;
   const uint16_t wde_unlnk = pc  ? r::PCIE_SCC_WDE_UNLNK_PAGE_8852C
                              : c ? r::SCC_WDE_UNLNK_PAGE_8852C
+                             : pb ? r::PCIE_TURBO_WDE_UNLNK_PAGE_8852B
                                  : r::SCC_WDE_UNLNK_PAGE;
   const uint16_t ple_lnk = pc  ? r::PCIE_SCC_PLE_LNK_PAGE_8852C
                            : c ? r::SCC_PLE_LNK_PAGE_8852C
+                           : pb ? r::PCIE_TURBO_PLE_LNK_PAGE_8852B
                                : r::SCC_PLE_LNK_PAGE;
   const uint16_t wde_hif = pc  ? r::PCIE_SCC_WDE_QT_HIF_8852C
                            : c ? r::SCC_WDE_QT_HIF_8852C
+                           : pb ? r::PCIE_TURBO_WDE_QT_HIF_8852B
                                : r::SCC_WDE_QT_HIF;
   const uint16_t wde_wcpu = pc  ? r::PCIE_SCC_WDE_QT_WCPU_8852C
                             : c ? r::SCC_WDE_QT_WCPU_8852C
+                            : pb ? r::PCIE_TURBO_WDE_QT_WCPU_8852B
                                 : r::SCC_WDE_QT_WCPU;
   const uint16_t wde_cpuio = pc  ? r::PCIE_SCC_WDE_QT_CPU_IO_8852C
                              : c ? r::SCC_WDE_QT_CPU_IO_8852C
+                             : pb ? r::PCIE_TURBO_WDE_QT_CPU_IO_8852B
                                  : r::SCC_WDE_QT_CPU_IO;
   /* The 8852C has a DEDICATED USB2 DLE quota (dle.c selects dle_mem_usb2_8852c
    * vs dle_mem_usb3_8852c by get_usb_mode). On a USB2 8832CU the USB3 quota
@@ -964,11 +1209,13 @@ bool HalKestrel::dle_init_nic() {
     const uint32_t st = _device.rtw_read32(r::R_AX_USB_STATUS_V1);
     usb2 = !(st & r::B_AX_R_USB2_SEL) && (st & r::B_AX_MODE_HS);
   }
-  const uint16_t *ple_min = !c   ? r::SCC_PLE_MIN
+  const uint16_t *ple_min = pb   ? r::PCIE_TURBO_PLE_MIN_8852B
+                            : !c   ? r::SCC_PLE_MIN
                             : pc   ? r::PCIE_SCC_PLE_MIN_8852C
                             : usb2 ? r::SCC_PLE_MIN_8852C_USB2
                                    : r::SCC_PLE_MIN_8852C;
-  const uint16_t *ple_max = !c   ? r::SCC_PLE_MAX
+  const uint16_t *ple_max = pb   ? r::PCIE_TURBO_PLE_MAX_8852B
+                            : !c   ? r::SCC_PLE_MAX
                             : pc   ? r::PCIE_SCC_PLE_MAX_8852C
                             : usb2 ? r::SCC_PLE_MAX_8852C_USB2
                                    : r::SCC_PLE_MAX_8852C;
@@ -1082,30 +1329,41 @@ bool HalKestrel::hfc_init_nic() {
    * H2C and WP full conditions at X1, and MODE = POH — the host owns the
    * pages until the release report, not store-and-forward. */
   const bool pc = c && _pcie;
+  /* 8852B over PCIe: hfc_chcfg_pcie_8852b_turbo / hfc_pubcfg_pcie_8852b_turbo
+   * / hfc_preccfg_pcie, MODE = POH (hci_fc.c 8852B PCIe SCC_TURBO row). */
+  const bool pb = !c && _pcie;
+  const bool pcie_any = pc || pb;
   const uint16_t ch_min = pc  ? r::HFC_PCIE_CH_MIN_8852C
                           : c ? r::HFC_NIC_CH_MIN_8852C
+                          : pb ? r::HFC_PCIE_TURBO_ACH_MIN_8852B
                               : r::HFC_NIC_CH_MIN;
   const uint16_t ch_max = pc  ? r::HFC_PCIE_CH_MAX_8852C
                           : c ? r::HFC_NIC_CH_MAX_8852C
+                          : pb ? r::HFC_PCIE_TURBO_ACH_MAX_8852B
                               : r::HFC_NIC_CH_MAX;
+  /* B0MGQ/B0HIQ take the ACH pair except on the 8852B PCIe row ({15,743}). */
+  const uint16_t mg_min = pb ? r::HFC_PCIE_TURBO_MG_MIN_8852B : ch_min;
+  const uint16_t mg_max = pb ? r::HFC_PCIE_TURBO_MG_MAX_8852B : ch_max;
   const uint16_t pub_g0 = pc  ? r::HFC_PCIE_PUB_G0_8852C
                           : c ? r::HFC_NIC_PUB_G0_8852C
+                          : pb ? r::HFC_PCIE_TURBO_PUB_8852B
                               : r::HFC_NIC_PUB_G0;
   const uint16_t pub_g1 = pc ? r::HFC_PCIE_PUB_G1_8852C : r::HFC_NIC_PUB_G1;
   const uint16_t pub_max = pc  ? r::HFC_PCIE_PUB_MAX_8852C
                            : c ? r::HFC_NIC_PUB_MAX_8852C
+                           : pb ? r::HFC_PCIE_TURBO_PUB_8852B
                                : r::HFC_NIC_PUB_MAX;
-  const uint16_t wp07 = pc  ? r::HFC_PCIE_WP_PREC
+  const uint16_t wp07 = pcie_any ? r::HFC_PCIE_WP_PREC
                         : c ? r::HFC_NIC_WP_CH07_PREC_8852C
                             : r::HFC_NIC_WP_CH07_PREC;
-  const uint16_t wp811 = pc  ? r::HFC_PCIE_WP_PREC
+  const uint16_t wp811 = pcie_any ? r::HFC_PCIE_WP_PREC
                          : c ? r::HFC_NIC_WP_CH811_PREC_8852C
                              : r::HFC_NIC_WP_CH811_PREC;
-  const uint16_t ch011_prec = pc ? r::HFC_PCIE_CH011_PREC : r::HFC_NIC_CH011_PREC;
-  const uint16_t h2c_prec = pc ? r::HFC_PCIE_H2C_PREC : r::HFC_USB_H2C_PREC_8852B;
-  const uint8_t h2c_cond = pc ? r::HFC_FULL_COND_X1 : r::HFC_FULL_COND_X2;
-  const uint8_t wp_cond = pc ? r::HFC_FULL_COND_X1 : r::HFC_FULL_COND_X2;
-  const uint32_t fc_mode = pc ? r::MAC_AX_HCIFC_POH : 1u /* MAC_AX_HCIFC_STF */;
+  const uint16_t ch011_prec = pcie_any ? r::HFC_PCIE_CH011_PREC : r::HFC_NIC_CH011_PREC;
+  const uint16_t h2c_prec = pcie_any ? r::HFC_PCIE_H2C_PREC : r::HFC_USB_H2C_PREC_8852B;
+  const uint8_t h2c_cond = pcie_any ? r::HFC_FULL_COND_X1 : r::HFC_FULL_COND_X2;
+  const uint8_t wp_cond = pcie_any ? r::HFC_FULL_COND_X1 : r::HFC_FULL_COND_X2;
+  const uint32_t fc_mode = pcie_any ? r::MAC_AX_HCIFC_POH : 1u /* MAC_AX_HCIFC_STF */;
 
   /* set_fc_func_en(0, 0): disable FC + CH12 while reprogramming. */
   clr32(fc_ctrl, r::B_AX_HCI_FC_EN | r::B_AX_HCI_FC_CH12_EN);
@@ -1113,12 +1371,13 @@ bool HalKestrel::hfc_init_nic() {
   /* Per-channel page ctrl: ACH0-3 + B0MGQ(8) + B0HIQ(9) = {min,max,grp0};
    * on PCIe also ACH4-7 + B1MGQ(10) + B1HIQ(11) in group 1. */
   const uint32_t ch = min_max_grp(ch_min, ch_max);
+  const uint32_t mg = min_max_grp(mg_min, mg_max);
   w(ach0, ch);
   w(ach1, ch);
   w(ach2, ch);
   w(ach3, ch);
-  w(ch8, ch);
-  w(ch9, ch);
+  w(ch8, mg);
+  w(ch9, mg);
   if (pc) {
     const uint32_t ch_g1 = ch | r::B_AX_ACH_GRP;
     w(r::R_AX_ACH4_PAGE_CTRL_V1, ch_g1);
@@ -1382,12 +1641,23 @@ void HalKestrel::scheduler_init() {
   field32(r::R_AX_CCA_CFG_0, 0x6a,
           c ? r::B_AX_R_SIFS_AGGR_TIME_V1_MSK : r::B_AX_R_SIFS_AGGR_TIME_MSK,
           c ? r::B_AX_R_SIFS_AGGR_TIME_V1_SH : r::B_AX_R_SIFS_AGGR_TIME_SH);
-  /* Beacon-queue EDCA (path BCN): W16 at BCNQ_PARAM+2 = CW|AIFS. */
-  const uint8_t cw = static_cast<uint8_t>((3u << 4) | 2u); /* ecw_max/min */
+  /* Beacon-queue EDCA (path BCN). */
+  set_beacon_backoff(_bcn_backoff_random);
+}
+
+bool HalKestrel::set_beacon_backoff(bool random) {
+  /* W16 at BCNQ_PARAM+2 = CW|AIFS, a native 16-bit access (a 32-bit access
+   * to this 2-byte-aligned register is a malformed TLP over PCIe). The
+   * cached mode changes only once the write went through. */
+  const uint8_t cw = random ? static_cast<uint8_t>((3u << 4) | 2u) /* ecw_max/min */
+                            : static_cast<uint8_t>(0);
   uint16_t edca = static_cast<uint16_t>(
       ((cw & r::B_AX_BE_0_CW_MSK) << r::B_AX_BE_0_CW_SH) |
       ((r::BCN_IFS_25US & r::B_AX_BE_0_AIFS_MSK) << r::B_AX_BE_0_AIFS_SH));
-  _device.rtw_write16(r::R_AX_EDCA_BCNQ_PARAM + 2, edca);
+  if (!_device.rtw_write16(r::R_AX_EDCA_BCNQ_PARAM + 2, edca))
+    return false;
+  _bcn_backoff_random = random;
+  return true;
 }
 
 bool HalKestrel::addr_cam_init() {
@@ -1709,6 +1979,27 @@ bool HalKestrel::start_beacon(const uint8_t *body, uint32_t len,
                 "PORT_CFG_P0=0x{:08x})",
                 interval_tu, bss_color, p);
   return true;
+}
+
+bool HalKestrel::update_beacon(const uint8_t *body, uint32_t len,
+                               uint16_t rate_ax) {
+  return _fw.fw_send_beacon(body, len, /*macid=*/0, rate_ax, /*ntx_path_en=*/1,
+                            /*path_map_a=*/0);
+}
+
+bool HalKestrel::stop_beacon() {
+  namespace r = kestrel::reg;
+  /* Beacon TX off, and the port back to the NO_LINK injection identity
+   * start_beacon moved it from (IRadio StopBeacon contract). The port stays
+   * FUNC-enabled, as the injection setup leaves it. */
+  uint32_t p = _device.rtw_read32(r::R_AX_PORT_CFG_P0);
+  p = r::set_clr_word(p, r::MAC_AX_NET_TYPE_NO_LINK, r::B_AX_NET_TYPE_P0_MSK,
+                      r::B_AX_NET_TYPE_P0_SH);
+  p &= ~r::B_AX_BCNTX_EN_P0;
+  /* And the TBTT protection start_beacon turned on (BCN_PRCT): left set, the
+   * port keeps prohibiting TX around a TBTT no beacon uses any more. */
+  p &= ~(r::B_AX_TBTT_PROHIB_EN_P0 | r::B_AX_BRK_SETUP_P0);
+  return _device.rtw_write32(r::R_AX_PORT_CFG_P0, p);
 }
 
 void HalKestrel::mac_enable_imr() {
@@ -2281,7 +2572,8 @@ void HalKestrel::vnd_bb_set_gain(uint8_t channel, uint8_t band_type) {
 void HalKestrel::vnd_bb_ctrl_tx_path() {
   if (_halbb_ctx && _variant == ChipVariant::C8852C) {
     kestrel_halbb_ctrl_tx_path(_halbb_ctx);
-    _logger->info("Kestrel PHY: T-MAC TX path-com routed (vendored, 8852C)");
+    _logger->info("Kestrel PHY: T-MAC TX path-com routed (vendored, 8852C), "
+                  "TX path enable/map from P-MAC (A+B)");
   }
 }
 
@@ -2295,23 +2587,38 @@ void HalKestrel::vnd_bb_ctrl_bw_ch(uint8_t pri_ch, uint8_t center,
                 : bw == CHANNEL_WIDTH_10 ? 7
                                          : static_cast<uint8_t>(bw);
   kestrel_halbb_ctrl_bw_ch(_halbb_ctx, pri_ch, center, hbw, band_type);
-  /* 6 GHz: with the BB table's EDCCA level the MAC EDCCA gate latches busy
-   * (measured: 1/300 delivered vs 300/300 with that one gate cleared, both
-   * buses, both 8852CE cards and the 8852CU) because the receiver's own
-   * floor as the BB measures it (-67..-69 dBm, every radio, every band)
-   * sits inside the default's hysteresis band. Program the vendor's
-   * unlinked EDCCA_NORMAL_MODE level (never busy) there; 2.4/5 GHz keep the
-   * table default the carrier-sense TX measurement was taken with. The
-   * report line is the per-band evidence (pwdB = the BB's energy reading). */
-  if (band_type == 2)
-    kestrel_halbb_edcca_6g(_halbb_ctx, hbw);
+  /* 5 and 6 GHz: with the BB table's EDCCA level the MAC EDCCA gate latches
+   * busy because the receiver's own floor as the BB measures it (-65..-69
+   * dBm, every radio; no DIG runs here) sits inside the default's hysteresis
+   * band. 6 GHz: 1/300 delivered vs 300/300 with that one gate cleared (both
+   * buses, both 8852CE cards and the 8852CU). 5 GHz, 8832CU, 8812CU witness,
+   * 20 ms gap: ch6/36/44 ~50% witnessed, ch52 52%, ch60 21%, ch64 3%,
+   * ch100/149/157/161 0 of ~435 with 0.0% SDR airtime and the injector
+   * stalling on bulk-OUT timeouts; clearing the EDCCA gate alone restores
+   * ch64-161 to the ch6 rate, clearing the primary gate alone restores
+   * nothing. Program the vendor's unlinked EDCCA_NORMAL_MODE level (never
+   * busy) on both bands — the vendor's own level for an unassociated device;
+   * preamble carrier sense stays on and still defers (ch161 after the change,
+   * max-duty 6M injector, 8 s: 19063 frames sent on a quiet channel; under a
+   * co-channel max-duty MCS1 flood 7327 sent / 7086 witnessed with the gates
+   * on vs 15676 / 10639 with DEVOURER_DIS_CCA=1). 2.4 GHz
+   * keeps the table default the carrier-sense TX measurement was taken with
+   * (its floor reads -82 dBm, busy=0). The report line is the per-band
+   * evidence (pwdB = the BB's energy reading). */
+  bool restored = false;
+  if (band_type == 2 || band_type == 1)
+    kestrel_halbb_edcca_park(_halbb_ctx, band_type, hbw);
+  else
+    restored = kestrel_halbb_edcca_restore(_halbb_ctx, hbw) != 0;
   delay_us(5000);
   int rpt[8] = {0};
   kestrel_halbb_edcca_report(_halbb_ctx, rpt);
-  _logger->info("Kestrel PHY: EDCCA band{} pwdB fb={} p20={} path0={} busy={}{}",
-                band_type, rpt[0], rpt[1], rpt[6], rpt[3],
-                band_type == 2 ? " (6 GHz: energy-detect parked at the vendor's "
-                                 "unlinked level; preamble CCA stays on)"
+  _logger->info("Kestrel PHY: EDCCA band{} level={} pwdB fb={} p20={} path0={} busy={}{}",
+                band_type, kestrel_halbb_edcca_level(_halbb_ctx), rpt[0], rpt[1],
+                rpt[6], rpt[3],
+                band_type != 0 ? " (5/6 GHz: energy-detect parked at the vendor's "
+                                  "unlinked level; preamble CCA stays on)"
+                : restored     ? " (2.4 GHz: table level restored after a parked band)"
                                : "");
 }
 
@@ -2331,6 +2638,21 @@ HalKestrel::~HalKestrel() {
   if (_halbb_ctx)
     kestrel_halbb_destroy(_halbb_ctx);
   delete static_cast<kestrel_halbb_bridge *>(_halbb_bridge);
+}
+
+void HalKestrel::reset_for_rebringup() {
+  if (_halrf_ctx)
+    kestrel_halrf_destroy(_halrf_ctx);
+  if (_halbb_ctx)
+    kestrel_halbb_destroy(_halbb_ctx);
+  delete static_cast<kestrel_halbb_bridge *>(_halbb_bridge);
+  _halrf_ctx = nullptr;
+  _halbb_ctx = nullptr;
+  _halbb_bridge = nullptr;
+  _halrf_rfk_inited = false;
+  _kfr_primed = false;
+  _last_gain_bucket = -1;
+  _fw.reset_h2c_seq();
 }
 
 namespace {
@@ -2532,15 +2854,19 @@ void HalKestrel::fast_retune(uint8_t channel) {
 
 void HalKestrel::fast_set_bw(ChannelWidth_t bw) {
   /* Lean 20 <-> 5/10 MHz toggle (same channel). Only the BB small-BW field
-   * (0x49C4[13:12]) + ACI-detect (0x4738/0x4AA4[16]) differ between 20 MHz and
-   * narrowband; RF_BW stays 0 and RF18[11:10] stays "both" for all of 20/5/10,
-   * so no RF re-tune or gain re-apply is needed. */
+   * ([13:12], per-die address below) + ACI-detect (0x4738/0x4AA4[16])
+   * differ between 20 MHz and narrowband; RF_BW stays 0 and RF18[11:10]
+   * stays "both" for all of 20/5/10, so no RF re-tune or gain re-apply is
+   * needed. */
   const uint32_t smallbw = bw == CHANNEL_WIDTH_5    ? 0x1
                            : bw == CHANNEL_WIDTH_10 ? 0x2
                                                     : 0x0;      /* 20 MHz */
   const uint32_t aci = bw == CHANNEL_WIDTH_20 ? 0x1 : 0x0;      /* off for NB */
-  bb_rmw(0x49C0, 0xC0000000u, 0x0); /* RF_BW = 0 */
-  bb_rmw(0x49C4, 0x3000u, smallbw);
+  /* RF_BW and small-BW sit at 0x4974/0x4978 on the 8852C and 0x49C0/0x49C4 on
+   * the 8852B (halbb_ctrl_bw_8852{c,b}); the ACI bits are shared. */
+  const bool c = _variant == ChipVariant::C8852C;
+  bb_rmw(c ? 0x4974 : 0x49C0, 0xC0000000u, 0x0); /* RF_BW = 0 */
+  bb_rmw(c ? 0x4978 : 0x49C4, 0x3000u, smallbw);
   bb_rmw(0x4738, 0x10000u, aci);
   bb_rmw(0x4AA4, 0x10000u, aci);
   bb_reset_all();
@@ -2595,6 +2921,121 @@ void HalKestrel::bb_reset_all() {
   bb_rmw(0xc3c, 1u << 9, 0);
 }
 
+namespace {
+/* rtw89_phy_get_txsc: which sub-channel of a `cbw` channel a `dbw`-wide PPDU
+ * airs on, from the primary channel number vs the block center. 0 when the
+ * PPDU is as wide as the channel. */
+uint8_t phy_get_txsc(uint8_t pri, uint8_t center, ChannelWidth_t cbw,
+                     ChannelWidth_t dbw) {
+  if (cbw == dbw || cbw == CHANNEL_WIDTH_20)
+    return 0;
+  const bool above = pri > center;
+  const uint8_t idx20 = static_cast<uint8_t>(
+      above ? (pri - center) >> 1 : ((center - pri) >> 1) + 1);
+  switch (cbw) {
+  case CHANNEL_WIDTH_40:
+    return above ? 1 : 2;
+  case CHANNEL_WIDTH_80:
+    return dbw == CHANNEL_WIDTH_20 ? idx20 : (above ? 9 : 10);
+  case CHANNEL_WIDTH_160:
+    if (dbw == CHANNEL_WIDTH_20)
+      return idx20;
+    if (dbw == CHANNEL_WIDTH_40) {
+      if (idx20 == 1 || idx20 == 3)
+        return 9;
+      if (idx20 == 5 || idx20 == 7)
+        return 11;
+      if (idx20 == 2 || idx20 == 4)
+        return 10;
+      if (idx20 == 6 || idx20 == 8)
+        return 12;
+      return 0xff;
+    }
+    return above ? 13 : 14;
+  default:
+    return 0;
+  }
+}
+} /* namespace */
+
+void HalKestrel::mac_set_bw_txsc(uint8_t channel, uint8_t center,
+                                 ChannelWidth_t bw) {
+  /* The MAC side of a tune, as rtw89 rtw8852c_set_channel_mac does it:
+   * R_AX_WMAC_RFMOD carries the channel width, and R_AX_TX_SUB_CARRIER_VALUE
+   * the sub-channel each narrower PPDU airs on. Left at its cmac_com_init
+   * zeros, a 20 MHz frame on an 80 MHz channel airs at the block center,
+   * where nothing listening on the primary hears it. */
+  uint8_t rfmod = 0;
+  uint32_t txsc = 0;
+  const auto field = [](uint8_t v, uint8_t sh) {
+    return (uint32_t{v} & r::B_AX_TXSC_MSK) << sh;
+  };
+  switch (bw) {
+  case CHANNEL_WIDTH_160:
+    rfmod = 3;
+    txsc = field(phy_get_txsc(channel, center, bw, CHANNEL_WIDTH_20),
+                 r::B_AX_TXSC_20M_SH) |
+           field(phy_get_txsc(channel, center, bw, CHANNEL_WIDTH_40),
+                 r::B_AX_TXSC_40M_SH) |
+           field(phy_get_txsc(channel, center, bw, CHANNEL_WIDTH_80),
+                 r::B_AX_TXSC_80M_SH);
+    break;
+  case CHANNEL_WIDTH_80:
+    rfmod = 2;
+    txsc = field(phy_get_txsc(channel, center, bw, CHANNEL_WIDTH_20),
+                 r::B_AX_TXSC_20M_SH) |
+           field(phy_get_txsc(channel, center, bw, CHANNEL_WIDTH_40),
+                 r::B_AX_TXSC_40M_SH);
+    break;
+  case CHANNEL_WIDTH_40:
+    rfmod = 1;
+    txsc = field(phy_get_txsc(channel, center, bw, CHANNEL_WIDTH_20),
+                 r::B_AX_TXSC_20M_SH);
+    break;
+  default: /* 20 MHz and the 5/10 MHz small-BW modes: RF in 20 MHz mode */
+    break;
+  }
+  const uint8_t m = _device.rtw_read8(r::R_AX_WMAC_RFMOD);
+  _device.rtw_write8(r::R_AX_WMAC_RFMOD,
+                     static_cast<uint8_t>((m & ~r::B_AX_WMAC_RFMOD_MSK) | rfmod));
+  _device.rtw_write32(r::R_AX_TX_SUB_CARRIER_VALUE, txsc);
+  if (rfmod)
+    _logger->info("Kestrel set_channel: pri {} center {} rfmod {} txsc 0x{:03x}",
+                  channel, center, rfmod, txsc);
+}
+
+void HalKestrel::fast_set_primary_80(uint8_t channel, uint8_t center) {
+  /* Move the primary 20 inside the 80 MHz block the RF already sits on: the
+   * pieces of halbb_ctrl_bw_ch_8852{b,c} that read pri_ch at 80 MHz -- the
+   * [11:8] sub-band index and the 5 MHz edge mask (halbb_5m_mask_8852{b,c})
+   * -- and the MAC TXSC, then a BB reset. No RF tune, no IQK: the ~210 ms of
+   * the full path. Same steps on both dies, at the registers each one's
+   * halbb uses; the mask's 0x3f field is 0x4 on both (the 8852D's 0x5 is not
+   * handled). */
+  const bool c = _variant == ChipVariant::C8852C;
+  const uint32_t pri_reg = c ? 0x4978 : 0x49C4;
+  const uint32_t mask_regs[2] = {c ? 0x4c4cu : 0x46f8u, c ? 0x4d10u : 0x47b8u};
+  const uint32_t mask_en_reg = c ? 0x4450 : 0x4440;
+  const uint32_t mask_en_bit = c ? 1u << 24 : 1u << 31;
+  const int d = int(channel) - int(center);
+  const uint8_t idx = static_cast<uint8_t>(d > 0 ? d / 2 : -d / 2 + 1);
+  bb_rmw(pri_reg, 0xf00, idx);
+  const bool mask_en = idx == 3 || idx == 4, mask_low = idx == 4;
+  for (const uint32_t a : mask_regs) {
+    if (mask_en) {
+      bb_rmw(a, 0x3f, 0x4);
+      bb_rmw(a, 1u << 12, 1);
+      bb_rmw(a, 1u << 8, mask_low ? 0 : 1);
+      bb_rmw(a, 1u << 6, mask_low ? 1 : 0);
+    } else {
+      bb_rmw(a, 1u << 12, 0);
+    }
+  }
+  bb_rmw(mask_en_reg, mask_en_bit, mask_en ? 1 : 0);
+  mac_set_bw_txsc(channel, center, CHANNEL_WIDTH_80);
+  bb_reset_all();
+}
+
 bool HalKestrel::set_channel(uint8_t channel, ChannelWidth_t bw,
                              uint8_t offset, uint8_t band) {
   /* band: 0 = auto (2.4 GHz if ch<=14 else 5 GHz), 6 = 6 GHz. band_type is the
@@ -2646,6 +3087,7 @@ bool HalKestrel::set_channel(uint8_t channel, ChannelWidth_t bw,
                     "MHz for 6 GHz TX.");
   }
 
+  mac_set_bw_txsc(channel, center, bw);
 
   if (_variant == ChipVariant::C8852C) {
     /* DIG PD lower-bound disable (halbb_dig_init_io_en -> dyn_pd_th, set_en=0):

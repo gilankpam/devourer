@@ -90,7 +90,13 @@ public:
   virtual void StartRxLoop(Action_ParsedRadioPacket packetProcessor) = 0;
 
   /* Ask a running StartRxLoop to exit (sets a flag; the caller then joins
-   * whatever thread runs StartRxLoop). Default no-op. */
+   * whatever thread runs StartRxLoop). Default no-op.
+   *
+   * A stop issued while Init() is still bringing the chip up is honoured:
+   * Init returns without starting its loop. A stop issued before Init() or
+   * before a standalone StartRxLoop() is stale and cleared by them (both are
+   * restartable), which includes a stop that lands between InitWrite() and a
+   * StartRxLoop() on another thread (DEVOURER_TX_WITH_RX=thread). */
   virtual void StopRxLoop() {}
   virtual void SetMonitorChannel(SelectedChannel channel) = 0;
 
@@ -298,9 +304,10 @@ public:
    * TRANSMISSION IS NOT PART OF THE ARM. This covers what the MAC receives
    * and acknowledges. A station's own unicast (management, EAPOL, data) must
    * request an ACK in its radiotap - build_stream_radiotap(mode, false),
-   * the no_ack argument; the default stream radiotap is NOACK, which never
-   * retries - and the hardware retransmits an unacknowledged frame only
-   * DeviceConfig::tx.retry_limit times, whose default is 0. A station
+   * the no_ack argument; the default stream radiotap is NOACK, which only the
+   * MT7612U reads (RadiotapBuilder.h) - and the Realtek hardware retransmits
+   * an unacknowledged unicast frame DeviceConfig::tx.retry_limit times,
+   * whatever that flag says, with a default of 0. A station
    * session sets a nonzero limit explicitly; left at the default it sends
    * each unicast frame once.
    *
@@ -497,6 +504,19 @@ public:
    * docs/time-distribution.md. */
   virtual bool WriteTsf(uint64_t tsf) { (void)tsf; return false; }
 
+  /* Read the port TSF and a free-running µs counter that WriteTsf never
+   * moves, back to back (Kestrel: R_AX_FREERUN_CNT). tsf - freerun is then the
+   * TSF's exact offset, including every step ever applied, so a controller
+   * that steps the TSF can fit its reference against the free-running counter
+   * instead of booking the steps it believes it applied (a read-add-write lands
+   * a few µs off, varying with host scheduling). The two reads are a few MMIO
+   * reads apart, which is a constant bias. False where unsupported (default). */
+  virtual bool ReadTsfAndFreeRun(uint64_t &tsf, uint64_t &freerun) {
+    (void)tsf;
+    (void)freerun;
+    return false;
+  }
+
   /* Load a beacon into the beacon reserved-page + enable the MAC beacon function,
    * so the chip AUTO-TRANSMITS it at each TBTT — hardware-timed and
    * hardware-TSF-stamped (the MAC inserts the live 64-bit TSF into the beacon
@@ -541,6 +561,20 @@ public:
    * failure must be retried (or followed by hardware shutdown) before its
    * shared port is reused. */
   virtual bool StopBeacon() { return false; }
+
+  /* Random backoff for the hardware beacon (default true: the vendor EDCA,
+   * which spreads each beacon over AIFS + 0..CW slots after its TBTT so that
+   * uncoordinated co-channel APs don't collide on every beacon). false makes
+   * the departure deterministic: a fixed AIFS after the TBTT. That is right only
+   * when co-channel cells' TBTTs are coordinated (staggered by a schedule, as
+   * a scheduled RAN does) — two uncoordinated APs with the backoff off and
+   * coinciding TBTTs collide every beacon. Persists until changed, including
+   * across a re-init. Check AdapterCaps::beacon_backoff_ctl; returns false where
+   * unsupported (default). */
+  virtual bool SetBeaconBackoff(bool random) {
+    (void)random;
+    return false;
+  }
 
   /* Disable / restore the MAC carrier-sense gate that defers TX — both primary
    * CCA (0x520[14], carrier-sense of a decodable preamble) and EDCCA (0x520[15],
@@ -766,7 +800,17 @@ public:
    * A spoiled or completed window is consumed by
    * the read; a not-yet-elapsed one stays armed, so the caller reads again
    * at the end of its dwell instead of re-arming. Single control thread, like
-   * every other control-plane entry point. */
+   * every other control-plane entry point.
+   *
+   * On the Realtek USB backends a failed register read throws
+   * std::ios_base::failure out of either call. A read that fails inside the
+   * arm leaves nothing armed, so the caller re-arms rather than reads: with
+   * nothing armed, GetChannelBusy falls back to its sampled path (a ~2 ms
+   * reading, or none where that path is not ported). A
+   * failed read of the window leaves it as it was. A failed write is not
+   * reported at all, so an arm can succeed over an engine it did not fully
+   * program. A poller catches, skips that window and carries on - rxdemo's
+   * DEVOURER_RX_BUSY_MS thread is the reference (examples/common/poll_skip.h). */
   virtual uint32_t ArmChannelBusy(uint32_t window_us) {
     (void)window_us;
     return 0;

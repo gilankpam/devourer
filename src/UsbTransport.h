@@ -8,6 +8,7 @@
  * that discovers the bulk endpoints. The exclusive per-adapter UsbDeviceLock
  * rides here too — its lifetime is the transport's. */
 
+#include <array>
 #include <atomic>
 #include <memory>
 #include <mutex>
@@ -109,12 +110,16 @@ public:
   bool tx_async(uint8_t ep, uint8_t *buf, size_t len,
                 unsigned timeout_ms) override;
   int tx_sync(uint8_t ep, uint8_t *buf, size_t len, int timeout_ms) override;
+  void set_tx_sync_zlp(bool on) override {
+    _tx_sync_zlp.store(on, std::memory_order_relaxed);
+  }
   int tx_sync_data(uint8_t ep, uint8_t *buf, size_t len,
                    int timeout_ms) override;
   void rx_loop(int buf_size, int n_urbs,
                const std::function<void(const uint8_t *, int)> &on_data,
                const std::function<bool()> &should_stop) override;
   int rx_raw(uint8_t *buf, int len, int timeout_ms) override;
+  void set_rx_max_wait_us(unsigned us) override { _rx_max_wait_us = us; }
   void clear_halt(uint8_t ep) override { libusb_clear_halt(_dev_handle, ep); }
   void quiesce_tx() override;
 
@@ -228,6 +233,12 @@ private:
    * issued; per instance, so two adapters in one process do not
    * cross-attribute their InitTimer stage counts. */
   std::atomic<uint64_t> _ctrl_xfers{0};
+  /* set_tx_sync_zlp. While it is on, each endpoint's sync sends are
+   * serialized: a second thread's frame slipping in between a transfer and
+   * its zero-length packet would be read by the chip as that transfer's
+   * continuation. */
+  std::atomic<bool> _tx_sync_zlp{false};
+  std::array<std::mutex, 16> _tx_sync_ep_mu;
   void discover_endpoints(); /* was InitDvObj */
   const char *speed_str() const;
   static void transfer_callback(struct libusb_transfer *transfer);
@@ -237,12 +248,17 @@ private:
   Logger_t _logger;
   UsbLinkInfo _info;
 
-  /* Set by transfer_callback when an async TX bulk-OUT completes non-OK
-   * (TIMED_OUT / stall). Consumed at the top of the next tx_async on the TX
-   * thread to re-clear_halt the endpoint — a mid-stream stall (e.g. hardware
-   * NDP generation on some xhci hosts) would otherwise stay wedged, since the
-   * first-send clear_halt only runs once. */
-  std::atomic<bool> _tx_wedged{false};
+  /* One bit per bulk-OUT endpoint number (address & 0x0f), set by
+   * transfer_callback when an async TX on that endpoint completes with a
+   * STALL. Consumed at the top of the next tx_async, which re-clear_halts
+   * every endpoint flagged, not only its own: with per-queue routing
+   * (send_packet_ep) the next frame may use a different endpoint, and a
+   * mid-stream stall (e.g. hardware NDP generation on some xhci hosts) would
+   * otherwise stay wedged. */
+  std::atomic<uint32_t> _tx_wedged_eps{0};
+  /* Bulk-OUT endpoints already given the first-use clear_halt (same bit
+   * layout). Touched only by tx_async. */
+  uint32_t _tx_cleared_eps = 0;
 
   /* TX submission counters (the driver-drop / congestion signal, TxStats.h).
    * The async transfer_callback increments them from the libusb event thread. */
@@ -287,6 +303,7 @@ private:
   RxMode _rx_mode = RxMode::Async;
   int _pool_spare = 0;
   int _ring_ms = 0;
+  std::atomic<unsigned> _rx_max_wait_us{0}; /* set_rx_max_wait_us; 0 = default */
   PoolExhaust _pool_exhaust = PoolExhaust::Backpressure;
 
   /* rx_loop helpers for the servicing strategies dispatched off _rx_mode. */
@@ -310,12 +327,16 @@ template <typename T> T UsbTransport::ctrl_read(uint16_t reg_num) {
                    reg_num);
   }
   _ctrl_xfers.fetch_add(1, std::memory_order_relaxed);
-  if (libusb_control_transfer(_dev_handle, REALTEK_USB_VENQT_READ, 5, reg_num,
-                              0, (uint8_t *)&data, sizeof(T),
-                              USB_TIMEOUT) == sizeof(T)) {
+  const int rc = libusb_control_transfer(_dev_handle, REALTEK_USB_VENQT_READ,
+                                         5, reg_num, 0, (uint8_t *)&data,
+                                         sizeof(T), USB_TIMEOUT);
+  if (rc == static_cast<int>(sizeof(T)))
     return data;
-  }
-  _logger->error("rtw_read({:04x}), sizeof(T) = {}", reg_num, sizeof(T));
+  /* The rc is the diagnosis: LIBUSB_ERROR_PIPE is the device stalling the
+   * request (it answers at once), LIBUSB_ERROR_TIMEOUT a request it never
+   * answered, a non-negative rc a short read. */
+  _logger->error("rtw_read({:04x}), sizeof(T) = {}, rc = {} ({})", reg_num,
+                 sizeof(T), rc, rc < 0 ? libusb_error_name(rc) : "short read");
   throw std::ios_base::failure("rtw_read");
   return 0;
 }

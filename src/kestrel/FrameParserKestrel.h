@@ -45,7 +45,7 @@ struct KestrelRxFrame {
   bool a1_match = false;
   uint16_t rx_rate = 0; /* 9-bit datarate code (legacy/HT/VHT/HE) */
   uint8_t gi_ltf = 0;
-  uint8_t bw = 0;       /* 0=20 1=40 2=80 */
+  uint8_t bw = 0;       /* 0=20 1=40 2=80 3=160 (3 bits on the 8852C) */
   uint8_t ppdu_type = 0xf; /* RX_DESC_PPDU_T_*: 7=HE_SU 8=HE_ERSU (15=unknown) */
   uint8_t ppdu_cnt = 0;
   uint32_t freerun_cnt = 0; /* free-running counter (TSF-ish) */
@@ -87,7 +87,11 @@ inline bool parse_rx_8852b(const uint8_t *buf, size_t buflen,
   out.ppdu_cnt = static_cast<uint8_t>((d1 >> 4) & 0x7);
   out.rx_rate = static_cast<uint16_t>((d1 >> 16) & 0x1ff);
   out.gi_ltf = static_cast<uint8_t>((d1 >> 25) & 0x7);
-  out.bw = static_cast<uint8_t>((d1 >> 30) & 0x3);
+  /* The 8852C widens the field to [31:29] (rtw89 AX_RXD_BW_v1_MASK); reading
+   * [31:30] there halves every width (80 MHz reads as 40, 40 as 20). The
+   * 16-byte drv_info unit is what marks that die here. */
+  out.bw = drv_info_unit == 16 ? static_cast<uint8_t>((d1 >> 29) & 0x7)
+                               : static_cast<uint8_t>((d1 >> 30) & 0x3);
 
   out.freerun_cnt = detail::rd_le32(buf + 8);
 
@@ -109,6 +113,26 @@ inline bool parse_rx_8852b(const uint8_t *buf, size_t buflen,
   out.payload = buf + frame_off;
   out.next_offset = (static_cast<uint32_t>(end) + 7) & ~0x7u;
   return true;
+}
+
+/* Do two sub-packet descriptors describe the same PPDU? The vendor pairing
+ * check (phl_rx.c): the 3-bit ppdu_cnt wraps every 8 PPDUs, so rate, bw,
+ * GI/LTF and PPDU type must match too. Used both to grow a held batch of WIFI
+ * frames and to pair a PPDU-status report with it. */
+inline bool same_ppdu(const KestrelRxFrame &a, const KestrelRxFrame &b) {
+  return a.ppdu_cnt == b.ppdu_cnt && a.rx_rate == b.rx_rate && a.bw == b.bw &&
+         a.gi_ltf == b.gi_ltf && a.ppdu_type == b.ppdu_type;
+}
+
+/* Length of a leading radiotap header on a beacon buffer, or 0 (IRadio beacon
+ * contract: StartBeacon / UpdateBeaconPayload strip one). A beacon MPDU starts
+ * with FC byte 0x80; radiotap starts with version 0 and its little-endian
+ * it_len at bytes 2..3, which must leave at least one byte of MPDU. */
+inline size_t beacon_radiotap_len(const uint8_t *b, size_t len) {
+  if (b == nullptr || len < 8 || b[0] != 0)
+    return 0;
+  const size_t rt = static_cast<size_t>(b[2] | (b[3] << 8));
+  return (rt >= 8 && rt < len) ? rt : 0;
 }
 
 /* --- PPDU-status (halbb physts) parse: per-path RSSI / SNR / EVM ---

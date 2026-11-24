@@ -1,6 +1,7 @@
 #include "UsbTransport.h"
 
 #include <algorithm>
+#include <bit>
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
@@ -1046,7 +1047,10 @@ void UsbTransport::rx_loop(
   auto last_ring = std::chrono::steady_clock::now();
   while (!should_stop() && sh.active > 0 &&
          !sh.dead.load(std::memory_order_relaxed)) {
+    const unsigned cap = _rx_max_wait_us.load(std::memory_order_relaxed);
     struct timeval tv {0, 100000};
+    if (cap > 0 && cap < 100000) /* suseconds_t is int on macOS: no narrowing init */
+      tv.tv_usec = static_cast<decltype(tv.tv_usec)>(cap);
     libusb_handle_events_timeout_completed(_ctx, &tv, nullptr);
     if (sh.telemetry) {
       const auto now = std::chrono::steady_clock::now();
@@ -1147,7 +1151,9 @@ void UsbTransport::rx_loop_sync(
   auto last_ring = std::chrono::steady_clock::now();
   long long cb_max_us = 0;
   while (!should_stop()) {
-    int n = rx_raw(buf.data(), buf_size, 200);
+    const unsigned cap = _rx_max_wait_us.load(std::memory_order_relaxed);
+    const int wait_ms = cap > 0 && cap < 200000 ? static_cast<int>(cap / 1000 > 0 ? cap / 1000 : 1) : 200;
+    int n = rx_raw(buf.data(), buf_size, wait_ms);
     if (n > 0) {
       if (telemetry) {
         const auto t0 = std::chrono::steady_clock::now();
@@ -1320,7 +1326,8 @@ void UsbTransport::transfer_callback(struct libusb_transfer *transfer) {
      * wedge would fire a ~ms clear_halt control transfer per hiccup — a
      * clear_halt storm — now that completions are actually reaped. */
     if (transfer->status == LIBUSB_TRANSFER_STALL)
-      self->_tx_wedged.store(true, std::memory_order_relaxed);
+      self->_tx_wedged_eps.fetch_or(1u << (transfer->endpoint & 0x0f),
+                                    std::memory_order_relaxed);
     /* A CANCELLED completion is quiesce_tx doing its job, not a failure —
      * counting it would show phantom drops at the end of every session. */
     if (transfer->status != LIBUSB_TRANSFER_CANCELLED) {
@@ -1450,10 +1457,19 @@ bool UsbTransport::tx_async(uint8_t tx_ep, uint8_t *packet, size_t length,
   /* Recover a bulk-OUT that a prior async TX wedged (TIMED_OUT / stall). Only
    * the first send used to clear_halt; a mid-stream stall (e.g. hardware NDP
    * generation on some xhci hosts) then stayed wedged forever. */
-  if (_tx_wedged.exchange(false)) {
-    int hr = libusb_clear_halt(_dev_handle, tx_ep);
-    _logger->info("TX EP 0x{:02X} re-clear_halt after wedge rc={}", (int)tx_ep,
-                  hr);
+  for (uint32_t w = _tx_wedged_eps.exchange(0); w; w &= w - 1) {
+    const uint8_t ep = static_cast<uint8_t>(std::countr_zero(w)); /* OUT: bit 7 clear */
+    int hr = libusb_clear_halt(_dev_handle, ep);
+    _logger->info("TX EP 0x{:02X} re-clear_halt after wedge rc={}", (int)ep, hr);
+  }
+  /* Clear any HALT state on a bulk-OUT endpoint before its first use. The
+   * fwdl process can leave a TX EP stalled from the chip side; without
+   * clear_halt the USB controller would NAK every bulk OUT URB to it. Per
+   * endpoint, since per-queue routing sends on more than one. */
+  if (!(_tx_cleared_eps & (1u << (tx_ep & 0x0f)))) {
+    _tx_cleared_eps |= 1u << (tx_ep & 0x0f);
+    int chr = libusb_clear_halt(_dev_handle, tx_ep);
+    _logger->info("libusb_clear_halt(EP 0x{:02X}) rc={}", (int)tx_ep, chr);
   }
 
   /* On the FIRST send only, dump the bulk-OUT bytes to compare against
@@ -1461,11 +1477,6 @@ bool UsbTransport::tx_async(uint8_t tx_ep, uint8_t *packet, size_t length,
   static bool first_pkt_dump = true;
   if (first_pkt_dump) {
     first_pkt_dump = false;
-    /* Clear any HALT state on the TX EP. The fwdl process can leave the
-     * TX EP in a stalled state from the chip side; without clear_halt the
-     * USB controller would NAK every subsequent bulk OUT URB. */
-    int chr = libusb_clear_halt(_dev_handle, tx_ep);
-    _logger->info("libusb_clear_halt(EP 0x{:02X}) rc={}", (int)tx_ep, chr);
     size_t dump_len = std::min<size_t>(length, 64);
     char hex[64 * 2 + 1] = {0};
     for (size_t k = 0; k < dump_len; ++k) {
@@ -1554,9 +1565,35 @@ int UsbTransport::tx_sync(uint8_t ep, uint8_t *packet, size_t length,
    * normal TX-queue operation, not the per-send hot path. Resetting the
    * data toggle bit corrupts the chip's state machine. */
   int actual = 0;
+  const bool zlp_mode = _tx_sync_zlp.load(std::memory_order_relaxed);
+  std::unique_lock<std::mutex> ep_lk(_tx_sync_ep_mu[ep & 0x0f],
+                                     std::defer_lock);
+  if (zlp_mode)
+    ep_lk.lock();
   _tx_submitted.fetch_add(1, std::memory_order_relaxed);
   int rc = libusb_bulk_transfer(_dev_handle, ep, packet,
                                 static_cast<int>(length), &actual, timeout_ms);
+  if (rc == LIBUSB_SUCCESS && actual == static_cast<int>(length) && zlp_mode &&
+      length != 0 && _bulk_out_mps != 0 && length % _bulk_out_mps == 0) {
+    /* The transfer ended on a full packet, so the chip is still waiting for
+     * its end. Without the zero-length packet the frame never airs and the
+     * endpoint stops accepting data a few hundred frames later. A failed
+     * terminator is a failed send: the frame is not complete on the bus. */
+    int zl = 0;
+    rc = libusb_bulk_transfer(_dev_handle, ep, packet, 0, &zl, timeout_ms);
+    if (rc != LIBUSB_SUCCESS) {
+      /* Its own log line: the shared one below would read as a failure
+       * after a complete write. */
+      _tx_failed.fetch_add(1, std::memory_order_relaxed);
+      _tx_last_rc.store(rc, std::memory_order_relaxed);
+      _tx_last_timeout.store(rc == LIBUSB_ERROR_TIMEOUT,
+                             std::memory_order_relaxed);
+      _logger->error("bulk_send EP {} FAIL rc={} on the zero-length packet "
+                     "ending a {}-byte transfer",
+                     (int)ep, rc, (int)length);
+      return rc;
+    }
+  }
   if (rc != LIBUSB_SUCCESS) {
     _tx_failed.fetch_add(1, std::memory_order_relaxed);
     _tx_last_rc.store(rc, std::memory_order_relaxed);

@@ -5,6 +5,8 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <climits>
+#include <algorithm>
 #include <cstring>
 #include <string>
 
@@ -111,6 +113,8 @@ devourer::DeviceConfig devourer_config_from_env() {
 
   /* ---- rx ---- */
   cfg.rx.keep_corrupted = env_flag("DEVOURER_RX_KEEP_CORRUPTED");
+  cfg.rx.drop_ctrl = env_flag("DEVOURER_RX_DROP_CTRL");
+  cfg.rx.own_addr_only = env_flag("DEVOURER_RX_OWN_ADDR_ONLY");
   cfg.rx.enable_with_tx = env_str("DEVOURER_TX_WITH_RX") != nullptr;
   if (const char *e = env_str("DEVOURER_RX_CSI_MASK"))
     cfg.rx.csi_mask = e;
@@ -178,6 +182,11 @@ devourer::DeviceConfig devourer_config_from_env() {
     cfg.tx.ack_timeout_us = static_cast<int>(v > 255 ? 255 : v);
   if (env_long_strict("DEVOURER_TX_RETRY_LIMIT", &v))
     cfg.tx.retry_limit = static_cast<int>(v < 0 ? 0 : (v > 63 ? 63 : v));
+  cfg.tx.data_on_be = env_flag("DEVOURER_TX_DATA_BE");
+  cfg.tx.be_fast_retry = env_flag("DEVOURER_TX_BE_FAST_RETRY");
+  if (env_long_strict("DEVOURER_TX_AC_LIFETIME_US", &v) && v > 0)
+    cfg.tx.ac_lifetime_us = static_cast<unsigned>(
+        std::min<unsigned long long>(static_cast<unsigned long long>(v), UINT_MAX));
   if (const char *e = env_str("DEVOURER_TX_RETRY_FALLBACK")) {
     if (str_ieq(e, "off")) {
       cfg.tx.retry_fallback = devourer::RetryFallback::Off;
@@ -230,6 +239,8 @@ devourer::DeviceConfig devourer_config_from_env() {
   cfg.tuning.skip_trx_reassert = env_flag("DEVOURER_SKIP_TRX_REASSERT");
   cfg.tuning.skip_rfe_init = env_flag("DEVOURER_SKIP_RFEINIT");
   cfg.tuning.skip_coex = env_flag("DEVOURER_SKIP_COEX");
+  if (const char *e = env_str("DEVOURER_J3_RUNTIME"))
+    cfg.tuning.j3_runtime_thread = std::strcmp(e, "0") != 0;
   cfg.tuning.skip_dig = env_flag("DEVOURER_SKIP_DIG");
   /* Default-on knob: unset = tracking on; only "0" disables it. */
   if (const char *e = env_str("DEVOURER_THERMAL_TRACK"))

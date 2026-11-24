@@ -1,5 +1,7 @@
+#include "RxFilter.h"
 #include "RtlJaguar2Device.h"
 #include "PktBufWindow.h"
+#include "AcTxQueue.h"
 
 #include <algorithm>
 #include <climits>
@@ -51,6 +53,7 @@ RtlJaguar2Device::~RtlJaguar2Device() {
   StopCwTone();
   stop_pwrtrack();
   stop_dig();
+  pcie_quiesce();
   /* Safety net: a station arm the caller did not clear ends with the
    * device, not with whatever state the chip is left in. */
   try {
@@ -88,9 +91,19 @@ void RtlJaguar2Device::bring_up(SelectedChannel channel) {
    * pre-init -> power-on -> system-cfg -> DLFW, giving the chip a clean slate. */
   bool fw_ok = false;
   constexpr int kBringupTries = 4;
-  /* rtw88 applies the PCIe interface-PHY MDIO config once at probe. */
-  if (!_device.is_usb())
-    _macinit.pcie_phy_cfg();
+  /* rtw88 applies the PCIe interface-PHY MDIO config once at probe, before
+   * the first power-on of the session. SYS_CFG1 (the cut) is readable on
+   * the unpowered MAC over MMIO, so the cut-gated 8822B tables and the
+   * cut-independent 8821C write both run here, ahead of power_on(). A timed-
+   * out MDIO row is retried once as a whole table; rtw88 only warns on it. */
+  _pcie_quiesced = false; /* a new session re-arms the chip; teardown must run again */
+  if (!_device.is_usb()) {
+    _hal.read_chip_version();
+    if (!_macinit.pcie_phy_cfg(_hal.chip_version().cut) &&
+        !_macinit.pcie_phy_cfg(_hal.chip_version().cut))
+      _logger->warn("RtlJaguar2Device: PCIe interface-PHY MDIO table incomplete "
+                    "after retry — continuing (rtw88 warns here too)");
+  }
   for (int attempt = 0; attempt < kBringupTries && !fw_ok; attempt++) {
     if (attempt > 0)
       _logger->error("RtlJaguar2Device: DLFW failed — full power-cycle retry "
@@ -266,6 +279,7 @@ void RtlJaguar2Device::bring_up(SelectedChannel channel) {
       _cfg.tx.ack_timeout_us > 255   ? 255
       : _cfg.tx.ack_timeout_us < 1 ? 1
                                      : _cfg.tx.ack_timeout_us));
+  apply_ac_tx_queue_knobs();
 
   /* DEVOURER_XTAL_CAP — apply the crystal-cap trim once the AFE is up
    * (issue #217, the narrowband CFO lever). */
@@ -295,6 +309,7 @@ void RtlJaguar2Device::start_pwrtrack() {
     /* ~2 s cadence via steady_clock, polled in short slices so the dtor join
      * returns promptly on shutdown. */
     auto next = std::chrono::steady_clock::now();
+    uint64_t skipped = 0;
     while (!_pwrtrack_stop && !g_devourer_should_stop) {
       std::this_thread::sleep_for(std::chrono::milliseconds(200));
       if (std::chrono::steady_clock::now() < next)
@@ -308,11 +323,14 @@ void RtlJaguar2Device::start_pwrtrack() {
       int cck = -1, ofdm = -1, mcs7 = -1;
       _hal.txagc_shadow(cck, ofdm, mcs7);
       /* Same hazard as the DIG thread: a register read that throws under RX
-       * load must skip this tick, not terminate the process. */
+       * load must skip this tick, not terminate the process. Counted and
+       * rate-limited the same way. */
       try {
         _cal->pwr_track(ofdm);
       } catch (const std::exception &e) {
-        _logger->warn("Jaguar2 thermal track: tick skipped ({})", e.what());
+        if (skipped++ % 100 == 0)
+          _logger->warn("Jaguar2 thermal track: tick skipped after a failed "
+                        "register access ({}), {} so far", e.what(), skipped);
       }
     }
   });
@@ -510,6 +528,8 @@ void RtlJaguar2Device::ClearAmpduMode() { SetAmpduMode(devourer::AmpduMode{}); }
 
 void RtlJaguar2Device::Init(Action_ParsedRadioPacket packetProcessor,
                             SelectedChannel channel) {
+  _rx_stop = false;
+
   /* A window armed before a (re-)bring-up describes a chip state that no
    * longer exists; leaving it armed would make the next unrelated
    * GetChannelBusy() take the armed branch and report a stale period. */
@@ -544,6 +564,11 @@ void RtlJaguar2Device::Init(Action_ParsedRadioPacket packetProcessor,
      * RA has nothing to match. Give the beamformee a known identity here so
      * the sounder can address it; log it for the test harness. */
     static const uint8_t kBfeeMac[6] = {0x00, 0xe0, 0x4c, 0x88, 0x22, 0xbb};
+    if (devourer::own_addr_identity_conflict(_cfg, kBfeeMac))
+      throw std::runtime_error(
+          "Jaguar2: rx.own_addr_only cannot serve a beamformee and an ACK "
+          "responder on different addresses (one MACID); give the responder "
+          "the beamformee address 00:e0:4c:88:22:bb");
     for (uint16_t i = 0; i < 6; ++i)
       _device.rtw_write8(0x0610 + i, kBfeeMac[i]);
     /* bf.mu upgrades the responder to an MU beamformee, whose report appends
@@ -590,13 +615,28 @@ void RtlJaguar2Device::Init(Action_ParsedRadioPacket packetProcessor,
     std::lock_guard<std::mutex> lk(_reg_mu);
     _station_ready = true; /* every port-0 write of this bring-up is done */
   }
-  StartRxLoop(std::move(packetProcessor));
+  start_rx_loop(std::move(packetProcessor), false);
 }
 
 void RtlJaguar2Device::StartRxLoop(Action_ParsedRadioPacket packetProcessor) {
+  start_rx_loop(std::move(packetProcessor), true);
+}
+
+void RtlJaguar2Device::start_rx_loop(Action_ParsedRadioPacket packetProcessor, bool clear_stale) {
+  /* A signal has already landed: skip the setup below rather than build it
+   * for a loop whose own predicate would exit on its first pass. */
+  if (g_devourer_should_stop)
+    return;
+
   _packetProcessor = std::move(packetProcessor);
-  /* Restartable: clear any stop request left by a prior StopRxLoop(). */
-  _rx_stop = false;
+
+  if (clear_stale) {
+    _rx_stop = false;
+  } else if (_rx_stop) {
+    /* Stop requested during Init must prevent its receive loop from starting */
+    return;
+  }
+
   /* Start the DIG thread: track IGI to the false-alarm rate so weak signals are
    * caught without an FA storm (a fixed IGI can't span the range). */
   _dig_stop = false;
@@ -629,6 +669,16 @@ void RtlJaguar2Device::StartRxLoop(Action_ParsedRadioPacket packetProcessor) {
       _device, _logger, devourer::tonemask::Family::AC2_8822B, _channel, 2,
       _cfg.rx.csi_mask ? _cfg.rx.csi_mask->c_str() : nullptr,
       _cfg.rx.nbi ? _cfg.rx.nbi->c_str() : nullptr);
+  if (_cfg.rx.csi_mask || _cfg.rx.nbi)
+    _hal.note_tone_mask_armed();
+
+  /* rx.own_addr_only passes only unicast to MACID, which this bring-up never
+   * programs: say so if nothing has armed an identity by now. */
+  static constexpr uint8_t kNoMac[6] = {};
+  if (_cfg.rx.own_addr_only && devourer::ack::macid_is(_device, kNoMac))
+    _logger->warn("Jaguar2: rx.own_addr_only with MACID 00:00:00:00:00:00: no "
+                  "unicast passes until SetAckResponder or a station or beacon "
+                  "arm sets an identity");
 
   _logger->info("RtlJaguar2Device: entering RX loop (ch={})", _channel.Channel);
 
@@ -760,12 +810,49 @@ void RtlJaguar2Device::StartRxLoop(Action_ParsedRadioPacket packetProcessor) {
   int rx_urb_bytes = _cfg.rx.urb_bytes.value_or(16 * 1024);
   if (rx_urb_bytes < 4096)
     rx_urb_bytes = 4096;
+  struct RunningGuard {
+    std::atomic<bool> &f;
+    explicit RunningGuard(std::atomic<bool> &flag) : f(flag) { f = true; }
+    ~RunningGuard() { f = false; }
+  } running_guard{_rx_running};
   _device.bulk_read_async_loop(rx_urb_bytes, 8, on_data, [this]() -> bool {
     return _rx_stop || g_devourer_should_stop;
   });
   stop_dig();
   _logger->info("RtlJaguar2Device: RX loop exited ({} frames, {} reads)", frames,
                 reads);
+}
+
+/* PCIe teardown. This generation leaves the chip powered after Stop() on
+ * USB (the beacon keeps airing until re-enumeration), but over PCIe the
+ * chip's RX DMA keeps fetching buffer descriptors from the slab the
+ * transport is about to unmap: the 8822BE logged an IOMMU read fault at the
+ * RXBD ring IOVA on every session exit until this ran. rtw88's order:
+ * rtw_pci_stop (interrupts off, rings reset) then rtw_mac_power_off — the
+ * card-disable sequence is what stops the DMA engine, so it runs here after
+ * the RX reap loop has returned. Idempotent; USB is untouched. */
+void RtlJaguar2Device::pcie_quiesce() {
+  if (_device.is_usb() || _pcie_quiesced || !_brought_up)
+    return;
+  _rx_stop = true;
+  for (int i = 0; i < 200 && _rx_running.load(); i++)
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  if (_rx_running.load())
+    _logger->warn("Jaguar2 PCIe: RX loop still running after 2 s — stopping "
+                  "DMA under it");
+  try {
+    std::lock_guard<std::mutex> lk(_reg_mu);
+    _device.rtw_write32(0x0608, 0);    /* RCR: accept nothing more */
+    _device.rtw_write16(0x0100, 0);    /* CR: MACRXEN/MACTXEN off */
+    _hal.power_off();                  /* card-disable: TRX DMA stops */
+    _device.rtw_write32(0x00B0, 0);    /* HIMR0: no further RX interrupts */
+  } catch (const std::exception &e) {
+    /* Left un-marked so the destructor's call retries the card-disable. */
+    _logger->warn("Jaguar2 PCIe: quiesce incomplete: {}", e.what());
+    return;
+  }
+  _pcie_quiesced = true;
+  _logger->info("Jaguar2 PCIe: DMA quiesced (card-disable) before transport teardown");
 }
 
 void RtlJaguar2Device::stop_dig() {
@@ -1349,6 +1436,8 @@ devourer::AdapterCaps RtlJaguar2Device::GetAdapterCaps() {
    * die is measured on both counts; the 8821C shares the recipe but has no
    * bench cell yet, so its flags stay false-as-unmeasured. */
   c.ack_responder_ok = _variant == jaguar2::ChipVariant::C8822B;
+  c.rx_mac_filters_ok = true;
+  c.tx_ac_lifetime_ok = c.tx_be_fast_retry_ok = ac_queue_ok();
   c.tx_retry_limit_ok = _variant == jaguar2::ChipVariant::C8822B;
   /* station_mode_ok: the 8822B die only - both halves measured on one
    * RTL8812BU by tests/realtek_station_onair.sh (numbers and limits at the
@@ -1389,7 +1478,8 @@ devourer::AdapterCaps RtlJaguar2Device::GetAdapterCaps() {
     c.variant = "C8821C";
   } else {
     c.chip_name = "RTL8822B";
-    c.marketing_names = "RTL8822BU/RTL8812BU";
+    c.marketing_names = c.transport[0] == 'p' ? "RTL8822BE"
+                                              : "RTL8822BU/RTL8812BU";
     c.chip_id = 0x0a;
     c.variant = "C8822B";
     /* 8822BU on air: VHT 1SS MCS0 and 2SS MCS0 on 2.4 GHz, every sampled frame
@@ -1453,6 +1543,48 @@ devourer::ThermalStatus RtlJaguar2Device::GetThermalStatus() {
   return t;
 }
 
+/* The AC-queue knobs are measured on the RTL8822B with three bulk-OUT
+ * endpoints only; the 8821C shares this code but not a measurement. */
+bool RtlJaguar2Device::ac_queue_ok() const {
+  return _variant == jaguar2::ChipVariant::C8822B &&
+         _device.bulk_out_ep_count() == 3;
+}
+
+/* DEVOURER_TX_BE_FAST_RETRY / _AC_LIFETIME_US, from bring_up, so both Init
+ * and InitWrite program them: data_on_be routes DATA to BE after either.
+ * After MAC init, before a configured A-MPDU mode and the debug replay. */
+void RtlJaguar2Device::apply_ac_tx_queue_knobs() {
+  if (!devourer::ac_tx_queue_requested(_cfg.tx))
+    return;
+  if (!ac_queue_ok()) {
+    _logger->warn("Jaguar2: tx.data_on_be / be_fast_retry / ac_lifetime_us "
+                  "not applied: measured on the RTL8822B with three "
+                  "bulk-OUT endpoints only");
+    return;
+  }
+  std::lock_guard<std::mutex> lk(_reg_mu);
+  if (!devourer::apply_ac_tx_queue(_device, _cfg.tx))
+    throw std::runtime_error("Jaguar2: AC-queue options could not be set");
+}
+
+/* Bulk-OUT endpoint for a built TXDMA block. Every frame leaves on the
+ * first endpoint, as it always has, unless DEVOURER_TX_DATA_BE is set: then
+ * the block follows its descriptor QSEL through the 3-bulk-OUT TXDMA_PQ_MAP
+ * init_trx_cfg writes (BE/BK -> LOW, VI/VO -> NORMAL, the rest -> HIGH), as
+ * Jaguar3 routes, so queue and endpoint agree. */
+uint8_t RtlJaguar2Device::tx_ep_for(const uint8_t *txdesc) const {
+  if (!_cfg.tx.data_on_be || !ac_queue_ok())
+    return _device.first_bulk_out_ep();
+  switch (txdesc[0x05] & 0x1f) { /* QSEL: dword1 [12:8], SET_TX_DESC_QSEL_8822B */
+  case 0: case 1: case 2: case 3:
+    return _device.nth_bulk_out_ep(2);
+  case 4: case 5: case 6: case 7:
+    return _device.nth_bulk_out_ep(1);
+  default:
+    return _device.first_bulk_out_ep();
+  }
+}
+
 bool RtlJaguar2Device::send_packet(const uint8_t *packet, size_t length) {
   /* Build one TXDMA block (48-byte descriptor + frame, build_tx_block) and
    * synchronously bulk-OUT. The TX antenna paths are enabled during bring_up,
@@ -1460,11 +1592,19 @@ bool RtlJaguar2Device::send_packet(const uint8_t *packet, size_t length) {
   const uint16_t rlen = devourer::radiotap_hdr_len(packet, length);
   if (rlen == 0)
     return false;
-  std::vector<uint8_t> usb_frame(jaguar2::TXDESC_SIZE_8822B + (length - rlen),
-                                 0);
-  if (build_tx_block(packet, length, usb_frame.data(), 0) == 0)
+  /* A transfer of an exact bulk-MPS multiple never airs on this sync path
+   * (no ZLP): pad 8 bytes behind the descriptor then (TxAggPlan.h). */
+  const size_t frame_len = length - rlen;
+  const uint8_t pkt_offset =
+      _device.is_usb()
+          ? devourer::single_block_pkt_offset(
+                jaguar2::TXDESC_SIZE_8822B, frame_len, devourer::usb_bulk_mps(_device.speed()))
+          : 0;
+  std::vector<uint8_t> usb_frame(
+      jaguar2::TXDESC_SIZE_8822B + static_cast<size_t>(pkt_offset) * 8 + frame_len, 0);
+  if (build_tx_block(packet, length, usb_frame.data(), pkt_offset) == 0)
     return false;
-  int rc = _device.bulk_send_data_sync_ep(_device.first_bulk_out_ep(),
+  int rc = _device.bulk_send_data_sync_ep(tx_ep_for(usb_frame.data()),
                                      usb_frame.data(), usb_frame.size(),
                                      /*timeout_ms=*/20);
   /* bulk_send_sync_ep returns BYTES SUBMITTED, so `rc >= 0` would also cover
@@ -1487,9 +1627,7 @@ size_t RtlJaguar2Device::send_packets(const TxPacketView *pkts, size_t count) {
 
   devourer::TxAggLimits lim;
   lim.desc_size = jaguar2::TXDESC_SIZE_8822B;
-  lim.bulk_size = _device.speed() >= devourer::kUsbSpeedSuper  ? 1024
-                  : _device.speed() >= devourer::kUsbSpeedHigh ? 512
-                                                               : 64;
+  lim.bulk_size = devourer::usb_bulk_mps(_device.speed());
   /* HalMAC chips parse at most 3 descriptors per bulk transfer (rtw88
    * usb_tx_agg_desc_num / halmac BLK_DESC_NUM) — beyond that the TXDMA
    * misparses (bench-proven on the 8822BU: block 1 re-aired agg-num times).
@@ -1506,6 +1644,7 @@ size_t RtlJaguar2Device::send_packets(const TxPacketView *pkts, size_t count) {
      * build_tx_block when that frame leads the next URB. */
     std::vector<size_t> lens;
     int run_chan = 0; /* 0 = no per-packet CHANNEL seen yet (current channel) */
+    bool run_data = false;
     for (size_t i = done; i < count && lens.size() < lim.max_frames; ++i) {
       const uint16_t rlen =
           devourer::radiotap_hdr_len(pkts[i].data, pkts[i].len);
@@ -1513,6 +1652,16 @@ size_t RtlJaguar2Device::send_packets(const TxPacketView *pkts, size_t count) {
         if (lens.empty())
           ++done; /* skip a malformed leading frame (contract: skipped) */
         break;
+      }
+      /* DEVOURER_TX_DATA_BE: DATA and the rest leave on different endpoints
+       * and one URB goes to one — a change of frame type ends the run. */
+      if (_cfg.tx.data_on_be && ac_queue_ok()) {
+        const bool data =
+            pkts[i].len > rlen && devourer::dot11_is_data(pkts[i].data[rlen]);
+        if (lens.empty())
+          run_data = data;
+        else if (data != run_data)
+          break;
       }
       const int want =
           devourer::radiotap_peek_channel(pkts[i].data, pkts[i].len);
@@ -1560,7 +1709,7 @@ size_t RtlJaguar2Device::send_packets(const TxPacketView *pkts, size_t count) {
     SET_TX_DESC_DMA_TXAGG_NUM_8822B(first, plan.frames());
     jaguar2::cal_txdesc_chksum_8822b(first);
 
-    const int rc = _device.bulk_send_data_sync_ep(_device.first_bulk_out_ep(),
+    const int rc = _device.bulk_send_data_sync_ep(tx_ep_for(first),
                                              urb.data(), urb.size(),
                                              /*timeout_ms=*/50);
     /* Full write or nothing submitted: a truncated URB means the chip got a
@@ -1572,8 +1721,7 @@ size_t RtlJaguar2Device::send_packets(const TxPacketView *pkts, size_t count) {
     if (rc >= 0 && !sent_all)
       _logger->error("8822B aggregated TX short on EP 0x{:02x}: {}/{} "
                      "({} frames dropped)",
-                     _device.first_bulk_out_ep(), rc, urb.size(),
-                     plan.frames());
+                     tx_ep_for(first), rc, urb.size(), plan.frames());
     devourer::Ev(_logger->events(), "tx.agg")
         .f("frames", (unsigned long long)plan.frames())
         .f("bytes", (unsigned long long)urb.size())
@@ -1806,6 +1954,13 @@ size_t RtlJaguar2Device::build_tx_block(const uint8_t *packet, size_t length,
    * has the measurement). Same checksummed span as the retry limit. */
   if (_cfg.tx.retry_fallback == devourer::RetryFallback::Off)
     SET_TX_DESC_DISDATAFB_8822B(out, 1);
+  /* DEVOURER_TX_DATA_BE: DATA frames ride BE (QSEL 0) and tx_ep_for routes
+   * the block to that queue's endpoint; a SetAmpduMode TID or
+   * DEVOURER_TX_QSEL below wins, and the endpoint follows it. Checksummed
+   * span. */
+  if (_cfg.tx.data_on_be && ac_queue_ok() && frame_len >= 1 &&
+      devourer::dot11_is_data(dot11[0]))
+    SET_TX_DESC_QSEL_8822B(out, 0);
   jaguar2::cal_txdesc_chksum_8822b(out);
   const devourer::AmpduMode am = _ampdu; /* one lock-free load */
   if (am.enabled || _cfg.debug.tx_qsel || _cfg.debug.tx_ampdu_max) {
@@ -2337,6 +2492,7 @@ void RtlJaguar2Device::Stop() {
     if (_station.armed())
       (void)_station.clear(_device, _logger, "Jaguar2");
   }
+  pcie_quiesce();
 }
 
 void RtlJaguar2Device::SetTxMode(const devourer::TxMode &mode) {

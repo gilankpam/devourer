@@ -14,10 +14,11 @@
 #include <unistd.h>
 
 #include "Event.h"
-#if defined(DEVOURER_HAVE_JAGUAR2_8821C)
+#if defined(DEVOURER_HAVE_JAGUAR2_8821C) || defined(DEVOURER_HAVE_JAGUAR2_8822B) || \
+    defined(DEVOURER_HAVE_JAGUAR3_8822C)
 #include "PcieDma88xx.h"
 #endif
-#if defined(DEVOURER_HAVE_KESTREL_8852C)
+#if defined(DEVOURER_HAVE_KESTREL_8852C) || defined(DEVOURER_HAVE_KESTREL_8852B)
 #include "PcieDmaAx.h"
 #endif
 
@@ -26,6 +27,10 @@ namespace devourer {
 namespace {
 constexpr uint16_t kPciDidRtl8852ce = 0xC852;
 constexpr uint16_t kPciDidRtl8852be = 0xB852;
+/* RTL8821CE (rtw8821ce.c) — the one part whose PCIe completion timeout rtw88
+ * disables (rtw_pci_phy_cfg). */
+constexpr uint16_t kPciDidRtl8821ce = 0xC821;
+constexpr uint16_t kPciDidRtl8821ceAlt = 0xB821;
 } /* namespace */
 
 std::shared_ptr<PcieTransport> PcieTransport::Open(const std::string &bdf,
@@ -48,6 +53,7 @@ std::shared_ptr<PcieTransport> PcieTransport::Open(const std::string &bdf,
     return nullptr;
   if (!t->init_dma())
     return nullptr;
+  t->enable_bus_master();
   if (cfg.use_msi && t->_dma->uses_msi() && !t->setup_msi())
     logger->warn("PcieTransport: MSI setup failed — RX falls back to polling");
   logger->info("PcieTransport: {} ready ({} plane, BAR2 {} KiB, DMA slab {} "
@@ -58,11 +64,19 @@ std::shared_ptr<PcieTransport> PcieTransport::Open(const std::string &bdf,
   return t;
 }
 
+void PcieTransport::enable_bus_master() {
+  uint16_t cmd = 0;
+  cfg_read(0x04, &cmd, 2);
+  cmd |= 0x4 /* MASTER */;
+  cfg_write(0x04, &cmd, 2);
+}
+
 bool PcieTransport::select_dma_plane() {
   switch (_pci_did) {
   case kPciDidRtl8852ce:
 #if defined(DEVOURER_HAVE_KESTREL_8852C)
-    _dma = std::make_unique<PcieDmaAx>(*this, _logger, _cfg.rx_poll_us);
+    _dma = std::make_unique<PcieDmaAx>(*this, _logger, _cfg.rx_poll_us,
+                                       AxDie::C8852C);
     return true;
 #else
     _logger->error("PcieTransport: RTL8852CE ({:04x}:{:04x}) needs "
@@ -71,20 +85,31 @@ bool PcieTransport::select_dma_plane() {
     return false;
 #endif
   case kPciDidRtl8852be:
-    _logger->error("PcieTransport: RTL8852BE ({:04x}:{:04x}) is not ported "
-                   "(its PCIe power sequence and single-BDRAM ring table are "
-                   "unported; the 8852CE is)",
+#if defined(DEVOURER_HAVE_KESTREL_8852B)
+    /* The 8852B die's older AX PCIe DMA engine: same plane class, its own
+     * channel set / register bank / WD layout. */
+    _dma = std::make_unique<PcieDmaAx>(*this, _logger, _cfg.rx_poll_us,
+                                       AxDie::C8852B);
+    return true;
+#else
+    _logger->error("PcieTransport: RTL8852BE ({:04x}:{:04x}) needs "
+                   "DEVOURER_KESTREL_8852B=ON",
                    _pci_vid, _pci_did);
     return false;
+#endif
   default:
-#if defined(DEVOURER_HAVE_JAGUAR2_8821C)
-    /* The HalMAC 88xx ring plane; the factory still checks the chip-id. */
+#if defined(DEVOURER_HAVE_JAGUAR2_8821C) || defined(DEVOURER_HAVE_JAGUAR2_8822B) || \
+    defined(DEVOURER_HAVE_JAGUAR3_8822C)
+    /* The HalMAC 88xx ring plane (RTL8821CE, RTL8822BE and RTL8822CE share
+     * its register map and BD geometry); the factory still checks the
+     * chip-id. */
     _dma = std::make_unique<PcieDma88xx>(*this, _logger, _cfg.rx_ring_len,
                                          _cfg.rx_buf_size, _cfg.rx_poll_us);
     return true;
 #else
     _logger->error("PcieTransport: PCI device {:04x}:{:04x} has no DMA plane "
-                   "in this build (DEVOURER_JAGUAR2_8821C=OFF)",
+                   "in this build (DEVOURER_JAGUAR2_8821C, _8822B and "
+                   "DEVOURER_JAGUAR3_8822C all OFF)",
                    _pci_vid, _pci_did);
     return false;
 #endif
@@ -295,7 +320,12 @@ bool PcieTransport::setup_config_space() {
    * but no DMA moves — the classic silent-failure trap. */
   uint16_t cmd = 0;
   cfg_read(0x04, &cmd, 2);
-  cmd |= 0x2 /* MEMORY */ | 0x4 /* MASTER */;
+  /* MEMORY now; bus mastering only once init_dma has mapped the slab (see
+   * Open): a chip the previous session left armed — or one a kernel driver
+   * owned — fetches its ring descriptors the instant mastering turns on,
+   * and before the mapping exists that is an IOMMU fault at the stale IOVA
+   * (seen on an RTL8822BE whose prior session had not quiesced). */
+  cmd = static_cast<uint16_t>((cmd | 0x2 /* MEMORY */) & ~0x4 /* MASTER off */);
   cfg_write(0x04, &cmd, 2);
 
   /* Find the PCI Express capability (id 0x10) for LNKCTL / DEVCTL2. */
@@ -326,9 +356,9 @@ bool PcieTransport::setup_config_space() {
     /* Disable completion timeout (DEVCTL2 bit4) — rtw88 does this specifically
      * for the 8821C (rtw_pci_phy_cfg). Only there: with the timeout off, a
      * read of a device that stops answering never completes and the CPU
-     * hangs in the MMIO load instead of seeing all-ones, so the AX parts
-     * (rtw89 leaves the timeout alone) keep it. */
-    if (_pci_did != kPciDidRtl8852ce) {
+     * hangs in the MMIO load instead of seeing all-ones, so every other part
+     * (the 8822CE under rtw88, the AX parts under rtw89) keeps it. */
+    if (_pci_did == kPciDidRtl8821ce || _pci_did == kPciDidRtl8821ceAlt) {
       uint16_t devctl2 = 0;
       cfg_read(pcie_cap + 0x28, &devctl2, 2);
       devctl2 |= 1u << 4;

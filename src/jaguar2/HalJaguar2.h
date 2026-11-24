@@ -164,6 +164,13 @@ public:
    * clock spur and program the NBI notch + CSI mask above threshold. 8822B
    * only. `cch` = central channel (notch center frequency). */
   void spur_calibration(uint8_t channel, uint8_t cch, uint8_t bw);
+  /* The RX loop armed the DEVOURER_RX_CSI_MASK / _NBI registers (the ones
+   * spur_calibration resets): the next fast_retune clears them, as a full set
+   * does on the 8822B. */
+  void note_tone_mask_armed() {
+    if (_variant != ChipVariant::C8821C)
+      _notch_armed = true;
+  }
 
   /* Lean intra-band, same-bandwidth hop retune — the Jaguar2 FastRetune core
    * (see docs/frequency-hopping.md), variant-dispatched like set_channel_bw.
@@ -319,9 +326,30 @@ private:
   /* Central channel of the wide channel (shared full/fast paths): 20 MHz ->
    * primary; 40 MHz -> ±2 by primary_ch_idx; 80 MHz -> +6/+2/-2/-6. */
   static uint8_t central_ch(uint8_t channel, uint8_t bw, uint8_t primary_ch_idx);
+  /* One-shot warning for a 5 GHz central channel outside the characterized
+   * range (shared by the full and both fast paths). */
+  void warn_uncharacterized(uint8_t channel, uint8_t cch);
   /* RF 0xBE[17:15] per-5G-channel phase-noise / VCO-band value (8822B); 0 for
-   * 2.4 GHz, 0xff = no write (shared full/fast paths). */
+   * 2.4 GHz (shared full/fast paths). */
   static uint8_t rf_be_for_8822b(uint8_t cch);
+  /* 5G AGC table index (1 low / 2 mid / 3 high) and CFO-tracking fc
+   * (0x860[28:17]) for any 5G central channel (shared full/fast paths, both
+   * variants). Defined for every channel so no retune inherits a stale
+   * value. */
+  uint8_t agc_table_5g(uint8_t cch) const;
+  static uint32_t cfo_fc_5g(uint8_t cch);
+  /* 8822B CCA thresholds (phydm_ccapar_by_rfe_8822b): the table word for row
+   * 0/1/2 = 0x82c/0x830/0x838 on the given band, and 0x838[7:4] with the
+   * 20 MHz DFS-channel adjust (shared full/fast paths). */
+  uint32_t cca_word(int row, bool g2) const;
+  uint32_t cca_838_nib(uint8_t cch, uint8_t bw) const;
+  bool _cca_rfe_tab = false; /* RFE type takes the cca_ifem_ccut_rfe table */
+  /* NBI notch / CSI mask reset (spur_calibration's entry half). */
+  void notch_reset();
+  /* A notch, CSI mask or the dsde 0x82c CCA tweak is armed — set by
+   * spur_calibration on a spur channel and by note_tone_mask_armed, cleared
+   * by notch_reset. fast_retune clears it on the next hop (8822B). */
+  bool _notch_armed = false;
 
   /* fast_retune write-on-change caches. Invalidated by every full
    * set_channel_bw (either variant); they only ever mirror fast-path writes —
@@ -335,12 +363,13 @@ private:
    * dwords — zero per-hop reads (every masked write is otherwise a read+write
    * USB round-trip). _cw_rfbe is the 8822B RF 0xBE 20-bit word. */
   bool _cw_primed = false;
-  uint32_t _cw_agc = 0, _cw_fc = 0, _cw_rfbe = 0;
+  uint32_t _cw_agc = 0, _cw_fc = 0, _cw_rfbe = 0, _cw_838 = 0;
   int _last_agc_bucket = -1;
   uint32_t _last_fc = 0xffffffff;
   int _last_rf_be = -1;
   int _last_df18 = -1;   /* 8822B ch144 RF 0xdf[18] state */
   int _last_cck_key = -1; /* 2G spur (8822B) / CCK-filter (8821C) key: ch14? */
+  int _last_838_nib = -1; /* 8822B 0x838[7:4] (20 MHz DFS-channel adjust) */
   bool _warned_uncharacterized = false; /* one-shot extended-channel warning */
   uint8_t _h2c_box = 0; /* round-robin HMEBOX index for send_h2c_raw */
   uint8_t _fw_sw_pending = 0; /* central ch of an unconfirmed fw switch */
@@ -351,11 +380,11 @@ private:
    * or calibrations. _fbw_8ac_20m is the 20 MHz-state 0x8ac (captured on a
    * bw==0 set) — the base the narrowband/20 compose masks are applied to.
    * Invalidated (validity flags) by every full set_channel_bw. */
-  uint32_t _fbw_rf18 = 0;   /* final RF18 the full path wrote (20 MHz-mode) */
+  uint32_t _fbw_rf18 = 0;   /* RF18 of the current channel (full set or sw hop) */
   uint32_t _fbw_8ac_20m = 0;
   uint8_t _fbw_cch = 0;
   bool _fbw_g2 = false, _fbw_r2t2r = false;
-  bool _fbw_cache_valid = false; /* rf18/cch/g2/r2t2r captured this channel */
+  bool _fbw_cache_valid = false; /* rf18/cch/g2/r2t2r current; a fw hop clears it */
   bool _fbw_8ac_valid = false;   /* _fbw_8ac_20m holds a real 20 MHz snapshot */
   uint8_t _fbw_cur_bw = 0xff;    /* bw of the last full/fast set (0/5/6/...) */
 

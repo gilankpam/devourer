@@ -4,6 +4,7 @@
 #include <atomic>
 #include <cstdint>
 #include <cstring>
+#include <functional>
 #include <mutex>
 #include <optional>
 #include <span>
@@ -91,19 +92,24 @@ public:
    * once the firmware has COMMITTED a valid ADDR_CAM entry for it, and it does
    * that only for a station registered the way a real association registers
    * one (HalKestrel::register_infra_sta). The arm programs that station with
-   * `mac` as its own address, clears the response-abort CCA gates, and is
-   * verified by reading the physical CAM entry back -- false when the entry
-   * did not commit, which is the 8852C today. Post-bring-up only. Clear puts
-   * macid 0 back to the bring-up NO_LINK entry and verifies the CAM no
-   * longer holds `mac`; an address still held after a failed clear (or a
-   * failed retarget, which checks the old address too) stays recorded, so a
-   * later ClearAckResponder retries it. Arm and clear are serialized.
-   *
-   * The responder shares macid 0 / ADDR_CAM entry 0 with injection: while
-   * armed, injected frames (whose WD carries macid 0) go out under the
-   * station context the arm registered, and clear restores the bring-up
-   * entry. A second macid for the responder is untested: whether the
-   * firmware commits an entry other than 0 has not been measured. */
+   * `mac` as its own address, on its own macid / ADDR_CAM entry (ack_slot())
+   * so the injection context at macid 0 / entry 0 (what every injected frame's
+   * WD points at) is left as bring-up programmed it, and RegisterPeerSta /
+   * RegisterBeamformee refuse that slot so a peer cannot take it; clears the
+   * response-abort CCA gates; and is verified by reading the physical CAM
+   * entry back -- false when the entry did not commit. The 8852C firmware
+   * ignores the addr_cam H2C, so on that die the host writes the same entry
+   * itself (HalKestrel::write_addr_cam_sta, the vendor's no-firmware path) and
+   * no H2C is sent. Post-bring-up only. Clear disconnects that station (8852B
+   * only) and clears the entry's VALID bit from the host (the 8852B firmware
+   * leaves a disconnected station's entry valid), and succeeds only once the
+   * entry has read back empty for 50 ms; an address still held after a failed
+   * clear (or a failed retarget, which checks the old address too) stays
+   * recorded, so a later ClearAckResponder retries it. Arm and clear are
+   * serialized. On the 8852C the response also depends on the bring-up
+   * taking the TX path selection from the BB's P-MAC registers
+   * (kestrel_halbb_ctrl_tx_path); without it some bring-ups armed and
+   * answered no ACK (docs/kestrel-ack-responder.md). */
   bool SetAckResponder(const devourer::MacAddr &mac) override;
   void ClearAckResponder() override;
   /* rxdemo's live-disarm measurement hook (DEVOURER_ACK_DISARM_AFTER_MS): the
@@ -167,6 +173,12 @@ public:
    * beacon's TBTT with it, the Jaguar1 model. PCIe-measured only. */
   bool WriteTsf(uint64_t tsf) override;
 
+  /* Port-0 TSF, then R_AX_FREERUN_CNT (never moved by WriteTsf), each with a
+   * hi/lo/hi wrap guard. */
+  bool ReadTsfAndFreeRun(uint64_t &tsf, uint64_t &freerun) override;
+  /* Beacon EDCA random backoff on/off (HalKestrel::set_beacon_backoff). */
+  bool SetBeaconBackoff(bool random) override;
+
   /* Jaguar1 semantics (see IRadio): the AX TBTT already sits on the TSF grid,
    * so offset 0 holds natively and a nonzero TSF-preserving pin is physically
    * unavailable — refused with a one-time warning. Discipline the TSF itself
@@ -203,6 +215,10 @@ public:
    * prior InitWrite. `beacon` is a full 802.11 beacon; the MAC airs it every
    * `interval_tu` TU with the live TSF inserted. */
   bool StartBeacon(const uint8_t *beacon, size_t len, int interval_tu) override;
+  /* New content for the armed beacon (BCN_UPD H2C; port/TBTT untouched). */
+  bool UpdateBeaconPayload(const uint8_t *beacon, size_t len) override;
+  /* BCNTX_EN off; returns false when no beacon is armed. */
+  bool StopBeacon() override;
   int _bcn_interval_tu = 0; /* >0 while a HW beacon is armed (StartBeacon) */
 
   /* 802.11ax scheduled UL: air an HE Basic Trigger (UL-OFDMA grant), program
@@ -217,7 +233,8 @@ public:
 
   /* Register an associated peer STA (macid/addr-cam) so a Trigger's per-user
    * grant scores against it — the AP-side companion to SendTrigger for the
-   * end-to-end UL path. */
+   * end-to-end UL path. Refuses the ACK responder's slot (ack_slot()) and an
+   * `addr_cam_idx` past the 128-entry CAM, as does RegisterBeamformee. */
   bool RegisterPeerSta(const uint8_t peer_mac[6], uint8_t macid,
                        uint8_t addr_cam_idx) override;
 
@@ -268,6 +285,20 @@ public:
   void EnableTxScheduler();
 
 private:
+  /* One pass of BringUpMonitor, no firmware-halt check. */
+  bool BringUpMonitorOnce(SelectedChannel channel);
+  /* The TX half of InitWrite, run after BringUpMonitorOnce. */
+  void InitWriteTail(SelectedChannel channel);
+  /* Run `once` (a full bring-up from power_on), then read HALT_C2H_CTRL. A
+   * bring-up can end with the firmware halted (L1 pre-error 0x999, then an
+   * assertion) while every step reported success; the radio then works for a
+   * while and its TX queues stop draining for good. Redo the bring-up, up to
+   * kFwHaltAttempts in all on USB (PCIe: no redo). False, with the bulk-IN
+   * drain stopped, when `once` fails or every attempt halts. */
+  bool BringUpCheckingFwHalt(const char *what,
+                             const std::function<bool()> &once);
+  static constexpr int kFwHaltAttempts = 3;
+
   /* Route a C2H firmware message (RPKT_TYPE_C2H payload). Currently decodes the
    * USR_TX_RPT_INFO report and emits its freerun TX-egress timestamp. */
   void handle_c2h(const uint8_t *payload, uint32_t len);
@@ -280,6 +311,9 @@ private:
   SelectedChannel _channel{};
   kestrel::EfuseInfo _efuse{};
   volatile bool _rx_stop = false;
+
+  void start_rx_loop(Action_ParsedRadioPacket packetProcessor, bool clear_stale);
+
   /* WP-release drain (Kestrel STF USB): the fw returns each transmitted frame's
    * WD/PLE pages as an RX packet (rpkt_type=7, TX_PD_RELEASE_HOST) on the bulk-
    * IN. A TX-only path must still drain the bulk-IN or the pages never recycle
@@ -316,6 +350,27 @@ private:
    * timeout, nullopt once gone. Caller holds _ack_mutex. */
   std::optional<devourer::MacAddr>
   disarm_ack_locked(std::span<const devourer::MacAddr> held);
+  /* The ACK responder's own macid and ADDR_CAM entry (the same number), past
+   * the injection context at macid 0 / entry 0 and the low slots peer
+   * registrations take by convention (RegisterPeerSta callers use 1, 2, ...).
+   * 127 on the 8852B, where the firmware commits and the RMAC answers there
+   * (measured); 63 on the 8852C, where the host writes it and the RMAC
+   * answers there (measured). Both dies have 128 entries. */
+  uint8_t ack_slot() const {
+    return _variant == kestrel::ChipVariant::C8852C ? 63 : 127;
+  }
+  /* Address-CAM entries (vendor ADDRCAM_NUM): 128 on both dies. */
+  static constexpr unsigned kAddrCamEntries = 128;
+  /* The 8852C firmware ignores the addr_cam H2C, so the ACK responder's
+   * station entry is written (and cleared) by the host on that die. */
+  bool host_written_ack_cam() const {
+    return _variant == kestrel::ChipVariant::C8852C;
+  }
+  /* True (and logged) when a peer registration would take the ACK
+   * responder's reserved macid or ADDR_CAM entry, or an ADDR_CAM entry past
+   * the CAM (kAddrCamEntries). */
+  bool peer_slot_reserved(const char *who, uint8_t macid,
+                          uint8_t addr_cam_idx) const;
   std::optional<uint32_t> _ack_disarm_after_ms;
   std::jthread _ack_disarm_thread;
   /* DEVOURER_ACK_RESPONDER: arm at the end of bring-up, throw if refused. */
@@ -340,11 +395,6 @@ private:
    *     (a fixed-rate stream pays once and then nothing). */
   std::atomic<bool> _rate_diffs_on{false};
   std::atomic<int8_t> _rate_diff_qdb[10]{};
-  /* Per-path RSSI/SNR/EVM (rx_pkt_attrib raw conventions) parsed from the last
-   * PPDU-status physts blob (kestrel::parse_physts_8852), attached to the
-   * following WIFI frame(s) in the aggregate. snr_avg (raw dB*2, IE01) feeds
-   * the passive noise floor (rssi_dbm - snr_db). 0 = not measured. */
-  kestrel::KestrelPhySts _last_physts{};
   /* Windowed RX link-quality accumulator (passive noise floor + LinkHealth),
    * fed per decoded frame from the RX loop; drained by GetRxQuality. */
   devourer::RxQualityAccumulator _rxq;

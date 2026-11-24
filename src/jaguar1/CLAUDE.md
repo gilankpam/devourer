@@ -37,6 +37,27 @@ methods), `RadioManagementModule` (channel/BW/TX power, up to 4 RF paths),
   8814A decodes LDPC but reports no per-frame flag (`ldpc_rx_flag=0`,
   `RxAtrib.ldpc` reads 0).
 
+## Monitor RX filters
+
+`DeviceConfig::Rx::drop_ctrl` and `own_addr_only` are applied in
+`RadioManagementModule::hw_var_set_monitor`. Two things differ from the
+HalMAC generations. Control frames are gated by RCR `ACF` here: closing
+RXFLTMAP1 alone left every control subtype arriving on an 8812AU (4184 of
+4234), while clearing `ACF` took a 10 s cell from 4951 to 143 — and every one
+of the 143 was a BlockAck, which this MAC passes with data frames, so
+`rx.blockack` readers still see them. And bring-up programs MACID from EFUSE,
+so `own_addr_only` works without an identity arm. With `drop_ctrl` on, the
+8812AU as transmitter still consumed its peer's ACKs and BlockAcks (reports
+OK 87% vs 86% open, 0% with no responder; A-MPDU 77% vs 78%, 0%). One unit,
+ch36; the 8812AU as ACK *responder* under `drop_ctrl` is unmeasured (the
+cross-rig loop did not close with the knobs off either).
+
+Under `own_addr_only` a beamformee arm and an ACK responder cannot share a
+session on the 8812 die: the beamformee answers on the EFUSE address, a
+responder on another address is refused at bring-up because it moves MACID,
+and a responder on the EFUSE address is refused by the arm itself (this die
+cannot be armed to its pre-arm MACID).
+
 ## Teardown
 
 **`Stop()` forgets any armed busy window** — the rule, and the residual it
@@ -121,3 +142,38 @@ session therefore walks IGI not at all, a stiffer reference than Jaguar3's
 4-step clamp, so `nhm_env` should behave like the 8812CU rather than the
 8822BU — and should degrade toward the 8822BU once the watchdog is enabled and
 hands DIG 14 steps of travel. Predicted from those constants, not measured.
+
+## AC lifetime (`tx.data_on_be`, `tx.ac_lifetime_us`)
+
+Applied on the RTL8812A with three bulk-OUT endpoints only (`ac_queue_ok`);
+the 8814A, 8821A and two-endpoint parts log that the knobs are not applied.
+DATA moves to QSEL 0 (BE) and the LOW endpoint; VI goes to NORMAL and
+VO/MGT/HIGH to HIGH, as `_InitNormalChipThreeOutEpPriority_8812AUsb` maps
+them. The lifetime registers are the halmac addresses; the unit is 256 us by
+measurement, not the 128 the vendor header names.
+
+Measured on one 8812AU sending to an MT7612U, channel 100, near field:
+
+| | Stock upstream | This change, knobs off | Knobs on |
+|---|---|---|---|
+| Peer never ACKs, delivered age max (10 s run) | 3.3 s | 3.1 s | 21.0 ms at 20000, 68.8 ms at 68000 |
+| Saturated MCS2, Mbit/s (7 s runs, interleaved) | 9.5 / 10.6 / 10.9 | 10.1 / 10.7 | 11.6 / 11.8 |
+| Unicast CCX reports seen as unicast | 0 | all | all |
+
+Stock's age grows with the run (9.5 s in a 14 s run): frames wait out every
+retry. Run-to-run spread on the saturated cell is about 2 Mbit/s.
+
+The cost: with the knobs on, a frame still queued at the lifetime is dropped,
+including one a slow-to-ACK peer would still have taken, and the drop is
+reported nowhere; count delivery at the receiver (the full statement is at
+`DeviceConfig::Tx::ac_lifetime_us`).
+
+Clearing the BE TXOP (the "fast retry" the halmac generations can pair with
+a lifetime) is deliberately not offered here: on the 8812A it cut saturated
+MCS2 to 3.5-10.1 Mbit/s, and the lifetime alone holds the bound (68.7 ms
+with it, 68.9 ms without).
+
+The TX descriptor's BMC bit follows addr1 on the 8812A. It was a constant 1,
+which the firmware echoes into the CCX report, so every unicast report read
+as a group frame. Delivery and retries were unchanged across the switch. The
+8814A and 8821A keep the constant: unmeasured.

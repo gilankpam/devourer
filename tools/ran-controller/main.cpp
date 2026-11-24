@@ -1,0 +1,1657 @@
+// ran-controller — the M5 (#259) CU: collects the DUs' F1 reports, plans
+// the facility-wide slot map with src/cell/Coord.h, and pushes each DU its
+// schedule (src/cell/F1.h). It never touches a radio; it needs no PTP
+// clock either: the DUs report the network superframe they are in.
+//
+// Per plan round (RAN_PLAN_MS) with every expected DU reporting and locked:
+//   - the interference relation from the reports: UE u of cell c is heard
+//     by DU o when o reports (c, u) at RSSI >= RAN_EDGE_DBM;
+//   - the plan (RAN_PLAN=1), or the identity (RAN_PLAN=0: every UE stays
+//     where its DU put it — the uncoordinated baseline, with the CU present
+//     so the DUs still run coordinated, deterministic access);
+//   - a DU whose assignment changed gets a new schedule version; every
+//     changed DU takes effect on ONE network superframe (now + RAN_LEAD_SF);
+//     unchanged ones get their current schedule again (the keepalive).
+// A DU that answers Stale / Late / Invalid gets a fresh version next round.
+// Channel separation the planner proposes is logged (ran.retune); with
+// RAN_RETUNE_APPLY=1 it is applied: the DU is told to move (F1
+// ChannelSwitch, src/cell/ChannelSwitch.h) RAN_CS_LEAD_SF superframes ahead,
+// announces it in its beacon, and it and its UEs retune together. One move
+// at a time, never across a handover (ran.cs_cmd / ran.cs_ack / ran.cs_done).
+//
+// Env (defaults in brackets):
+//   RAN_PORT [47254]          UDP port the DUs report to
+//   RAN_F1_KEY                the F1 key (HMAC-SHA1; = the DUs' CELL_F1_KEY)
+//   RAN_MASTER_KEY            per-cell keys (src/cell/Keys.h): the master. Each
+//                             handover command then carries the target cell's
+//                             key wrapped for the UE's home key (ran.ho_cmd
+//                             ctx 1); unset = one shared cell key (ctx 0).
+//   RAN_DUS                   expected DU (cell) ids, comma-separated
+//   RAN_PLAN [1]              1 = coordinate, 0 = identity (baseline)
+//   RAN_EDGE_DBM [-90]        RSSI from which another DU "hears" a UE
+//   RAN_LEAD_SF [12]          schedule lead (> the DUs' CELL_F1_MIN_LEAD_SF)
+//   RAN_PLAN_MS [1000]        plan / keepalive period
+//   RAN_SPARE_CHANNELS        channels the planner may propose (advisory)
+//   RAN_RETUNE_APPLY [0]      1: apply a proposal — move that running DU and
+//                             its UEs (F1 ChannelSwitch, ChannelSwitch.h)
+//   RAN_HO_TA [1]             carry the UE's TA at its source in the handover
+//                             command (the target's TA loop starts there)
+//   RAN_CHO [0]               1 = conditional handover (HoCommand.h): the A3
+//                             (or RAN_HO_FORCE) PREPARES the move, the UE
+//                             makes it — when its serving beacons have been
+//                             absent RAN_CHO_LOST_SF [4] superframes, or its
+//                             own measurement of the target has led the
+//                             serving cell's by RAN_CHO_MARGIN_DB [3] for
+//                             RAN_CHO_TTT_MS [640]. The preparation lapses
+//                             RAN_CHO_WINDOW_SF [300] superframes after the
+//                             command; the target grants the UE from the
+//                             command on. Set the A3 offset below the margin
+//                             to prepare before the move is due.
+//   RAN_CS_LEAD_SF [20]       a move's instant, this many superframes ahead
+//   RAN_CS_BACKOFF_S [30]     a DU whose move was refused or timed out is not
+//                             asked again before this
+//   RAN_REPHASE [0]           1 = re-phase live cells (ChannelSwitch.h v2): a
+//                             running DU whose phase plan (PhasePlan.h, the
+//                             others where they are) would score at least
+//                             RAN_REPHASE_MIN_GAIN [1.0] more than its phase
+//                             now is moved there with its UEs, at
+//                             RAN_CS_LEAD_SF; one DU at a time, none during a
+//                             handover; ran.rephase, then ran.cs_done. Not
+//                             before RAN_REPHASE_AT_S [0] s after the start
+// ran.meas: per DU, own [ue, rssi, snr, evm] and heard [cell, ue, rssi, snr,
+// evm] (filtered; evm null when the frames carried none). EVM is reported,
+// not used by the A3.
+// Handover evaluation (M6, #260) — OBSERVE ONLY: for every UE the CU runs the
+// A3 (CHO) condition (src/cell/Handover.h) on the DUs' filtered reports —
+// the serving DU's own measurement against every other DU's heard one — and
+// logs when a handover would trigger (ran.ho_candidate) and when the
+// condition clears (ran.ho_clear). Nothing is pushed to the DUs.
+//   RAN_HO [1]                0 = off
+//   RAN_A3_METRIC [rssi]      rssi | snr
+//   RAN_A3_OFFSET_DB [3] RAN_A3_HYST_DB [1] RAN_A3_TTT_MS [640]
+//   RAN_HO_EXECUTE [0]        1 = act on a candidate (M6): a handover command
+//                             (src/cell/HoCommand.h) to both DUs over F1: the
+//                             UE's lowest free id and first free position at
+//                             the target, the switch RAN_HO_LEAD_SF [24]
+//                             superframes ahead, the TSF delta from the two
+//                             DUs' (phase, net_off). Two-phase: sent to the
+//                             target until it stages the UE, only then to the
+//                             source (which airs it to the UE); ran.ho_done
+//                             when the target reports the UE. One handover in
+//                             flight per DU pair end.
+//   RAN_A3_DWELL_MS [2000]    after a handover, the moved UE's A3 dwell
+//   RAN_HO_FORCE              SRC:UE:TGT@SECONDS: that UE is handed over at
+//                             that time whatever the A3 says (an inter-
+//                             frequency test: no DU hears a UE across
+//                             channels until UE measurement gaps exist)
+// DAPS (M6): the DUs forward the UE uplinks they hear (F1 Uplink); the CU
+// delivers each once per UE stream (src/cell/Handover.h UlStreams; a
+// handover aliases the target identity onto the source's stream) and logs
+// every gap in a stream's delivered sequence (ran.ul_gap: the interruption
+// a crossing or a lost path costs) and a summary every 10 s (ran.ul).
+// DL streams (M6): the CU originates each UE's downlink (F1 Downlink, one
+// PDU numbered in the UE's stream), sent to its serving DU, which airs it in
+// the UE's DL frames (examples/cell: up to 8 per frame, HARQ re-airs them);
+// the UE delivers each sn once and logs gaps (cell.ue.dl_gap). The stream
+// moves to the target identity at ran.ho_done (ran.dl_moved).
+//   RAN_DL_MS [0]             a PDU per stream every this many ms (0 = off)
+//   RAN_DL_DAPS [1]           duplicate each PDU to the handover target too,
+//                             from the command until ran.ho_done: the target
+//                             buffers them and airs them after the switch
+//   RAN_DL_DAPS_BACKLOG [16]  ... and at the command the stream's last this
+//                             many PDUs (a link fading before the command may
+//                             have lost them at the source; the UE drops the
+//                             ones it had as duplicates)
+//   RAN_MEAS_STALE_MS [2000]  a reported value counts until its sample age
+//                             (carried in F1) plus the report's age passes
+//                             this (= the DUs' CELL_MEAS_STALE_MS)
+// The A3 runs once per RAN_PLAN_MS on the latest reports (the DUs report
+// every CELL_F1_REPORT_MS), so the effective time-to-trigger rounds up to
+// that period: 640 ms fires on the round after it, about 1 s at the
+// defaults.
+// Phase planning (M6): a DU started with CELL_PHASE_AUTO=1 reports phase -1
+// before it acquires; the CU answers with F1 Phase — the phase
+// src/cell/PhasePlan.h finds best against the running cells (another channel:
+// mutual measurability in gaps; the same channel: disjoint active spans).
+// Running cells keep theirs; an assignment is sticky (a restarted DU gets the
+// same). Joining DUs are planned one at a time, in id order; each waits for
+// the expected DUs not yet heard, up to RAN_PHASE_WAIT_S. A joining DU is in
+// no neighbour list until it reports its phase.
+// Phase requests are refused without RAN_F1_KEY (an assignment is lasting
+// state), unless RAN_F1_INSECURE=1. A sticky assignment holds only for the
+// period, channel and grid it was planned for. Running cells on another
+// period are not planned against (logged as other_period).
+//   RAN_PHASE_WAIT_S [20]     (below the DUs' CELL_PHASE_WAIT_S)
+//   RAN_GAP_RETUNE_US [26000] RAN_GAP_GUARD_US [2000]  the UEs' gap bound
+//                             (= CELL_UE_GAP_RETUNE_US / _GUARD_US)
+//   RAN_GAP_SUSPEND [0]       1 = the cells run suspend gaps
+//                             (CELL_GAP_SUSPEND_SF): a direction only a
+//                             suspend gap reaches counts 0.25 per position
+//                             instead of 0, so the plan still prefers idle
+//                             windows and covers every pair
+//                             A UE's report of a neighbour only a suspend gap
+//                             reaches (from the reports: phases, channels, its
+//                             slots, its DU's gap_suspend_sf) counts for k of
+//                             the DU's suspend periods + 1.5 s (k such
+//                             neighbours, measured in turn), if longer than
+//                             RAN_MEAS_STALE_MS; every other one keeps that
+//   RAN_SECS [120]            run time
+// Output: JSONL on stdout ("ev":"ran.*").
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <poll.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <random>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <deque>
+#include <map>
+#include <optional>
+#include <set>
+#include <string>
+#include <vector>
+
+#if defined(DEVOURER_CELL_OPENSSL)
+#include <openssl/evp.h>
+#include <openssl/hmac.h>
+#endif
+
+#include "cell/ChannelSwitch.h"
+#include "cell/Coord.h"
+#include "cell/F1.h"
+#include "cell/Handover.h"
+#include "cell/Keys.h"
+#include "cell/PhasePlan.h"
+
+namespace f1 = devourer::cell::f1;
+using devourer::cell::CoordAssign;
+using devourer::cell::CoordDu;
+using devourer::cell::CoordUe;
+
+namespace {
+
+long envl(const char *k, long d, long lo, long hi) {
+  const char *v = std::getenv(k);
+  if (!v || !*v)
+    return d;
+  char *end = nullptr;
+  const long x = std::strtol(v, &end, 0);
+  if (*end || x < lo || x > hi) {
+    fprintf(stderr, "invalid %s=\"%s\" (want an integer in %ld..%ld)\n", k, v, lo, hi);
+    std::exit(2);
+  }
+  return x;
+}
+std::vector<long> env_list(const char *k, long lo, long hi) {
+  std::vector<long> v;
+  const char *s = std::getenv(k);
+  if (!s || !*s)
+    return v;
+  std::string t = s;
+  for (size_t p = 0; p <= t.size();) {
+    const size_t q = t.find(',', p);
+    char *end = nullptr;
+    const std::string item = t.substr(p, q == std::string::npos ? std::string::npos : q - p);
+    const long x = std::strtol(item.c_str(), &end, 10);
+    if (item.empty() || *end || x < lo || x > hi) {
+      fprintf(stderr, "invalid %s=\"%s\"\n", k, s);
+      std::exit(2);
+    }
+    v.push_back(x);
+    if (q == std::string::npos)
+      break;
+    p = q + 1;
+  }
+  return v;
+}
+devourer::cell::Mac hmac_sha1(const std::string &key) {
+  if (key.empty())
+    return {};
+#if defined(DEVOURER_CELL_OPENSSL)
+  return [key](const uint8_t *d, size_t n, uint8_t out[20]) {
+    unsigned int len = 0;
+    return HMAC(EVP_sha1(), key.data(), static_cast<int>(key.size()), d, n, out, &len) != nullptr &&
+           len == 20;
+  };
+#else
+  fprintf(stderr, "an HMAC key (RAN_F1_KEY, RAN_MASTER_KEY) needs a build with OpenSSL\n");
+  std::exit(2);
+#endif
+}
+void emit(const std::string &s) {
+  fputs(s.c_str(), stdout);
+  fputc('\n', stdout);
+  fflush(stdout);
+}
+std::string assign_json(const std::vector<CoordAssign> &v) {
+  std::string s = "{";
+  for (size_t i = 0; i < v.size(); ++i)
+    s += (i ? ",\"" : "\"") + std::to_string(v[i].ue) + "\":" + std::to_string(v[i].pos);
+  return s + "}";
+}
+
+struct DuState {
+  f1::Report rep;
+  sockaddr_in addr{};
+  std::chrono::steady_clock::time_point at;
+  std::optional<f1::Schedule> sched; /* the schedule this DU should be running */
+  /* The DU refused it (Stale/Late/Invalid): a fresh version is due, but it
+   * still goes out as the keepalive meanwhile (any fresh-sequence schedule
+   * is CU contact), e.g. while a handover holds re-plans back. */
+  bool sched_refused = false;
+};
+
+}  // namespace
+
+int main() {
+  const int port = static_cast<int>(envl("RAN_PORT", 47254, 1, 65535));
+  const std::string key = std::getenv("RAN_F1_KEY") ? std::getenv("RAN_F1_KEY") : "";
+  const auto mac = hmac_sha1(key);
+  const auto expected = env_list("RAN_DUS", 1, 65535);
+  const bool plan_on = envl("RAN_PLAN", 1, 0, 1) != 0;
+  const int edge_dbm = static_cast<int>(envl("RAN_EDGE_DBM", -90, -127, 0));
+  const uint64_t lead_sf = static_cast<uint64_t>(envl("RAN_LEAD_SF", 12, 2, 100000));
+  const bool retune_apply = envl("RAN_RETUNE_APPLY", 0, 0, 1) != 0;
+  const bool ho_ta = envl("RAN_HO_TA", 1, 0, 1) != 0; /* carry the source's TA in a handover */
+  const bool cho = envl("RAN_CHO", 0, 0, 1) != 0;
+  const uint8_t cho_lost_sf = static_cast<uint8_t>(envl("RAN_CHO_LOST_SF", 4, 1, 255));
+  const int8_t cho_margin_db = static_cast<int8_t>(envl("RAN_CHO_MARGIN_DB", 3, -30, 30));
+  const uint16_t cho_ttt_ms = static_cast<uint16_t>(envl("RAN_CHO_TTT_MS", 640, 0, 60000));
+  const uint64_t cho_window_sf = static_cast<uint64_t>(envl("RAN_CHO_WINDOW_SF", 300, 24, 100000));
+  const uint64_t cs_lead_sf = static_cast<uint64_t>(envl("RAN_CS_LEAD_SF", 20, 4, 100000));
+  const int cs_backoff_s = static_cast<int>(envl("RAN_CS_BACKOFF_S", 30, 1, 3600));
+  const int plan_ms = static_cast<int>(envl("RAN_PLAN_MS", 1000, 50, 60000));
+  const int secs = static_cast<int>(envl("RAN_SECS", 120, 1, 86400));
+  const bool ho_on = envl("RAN_HO", 1, 0, 1) != 0;
+  const char *metric_env = std::getenv("RAN_A3_METRIC");
+  const std::string metric = metric_env && *metric_env ? metric_env : "rssi";
+  if (metric != "rssi" && metric != "snr") {
+    fprintf(stderr, "RAN_A3_METRIC must be rssi or snr\n");
+    return 2;
+  }
+  auto envd = [](const char *k, double d, double lo, double hi) {
+    const char *v = std::getenv(k);
+    if (!v || !*v)
+      return d;
+    char *end = nullptr;
+    const double x = std::strtod(v, &end);
+    if (*end || !(x >= lo && x <= hi)) {
+      fprintf(stderr, "invalid %s=\"%s\" (want %g..%g)\n", k, v, lo, hi);
+      std::exit(2);
+    }
+    return x;
+  };
+  devourer::cell::A3Config a3c;
+  a3c.offset_db = envd("RAN_A3_OFFSET_DB", 3.0, -30.0, 30.0);
+  const bool rephase_on = envl("RAN_REPHASE", 0, 0, 1) != 0;
+  const double rephase_min_gain = envd("RAN_REPHASE_MIN_GAIN", 1.0, 0.01, 100.0);
+  const int rephase_at_s = static_cast<int>(envl("RAN_REPHASE_AT_S", 0, 0, 86400));
+  a3c.hysteresis_db = envd("RAN_A3_HYST_DB", 1.0, 0.0, 20.0);
+  a3c.ttt_ms = static_cast<int64_t>(envl("RAN_A3_TTT_MS", 640, 0, 60000));
+  const bool ho_exec = envl("RAN_HO_EXECUTE", 0, 0, 1) != 0;
+  const uint64_t ho_lead_sf = static_cast<uint64_t>(envl("RAN_HO_LEAD_SF", 24, 4, 10000));
+  const int64_t ho_dwell_ms = envl("RAN_A3_DWELL_MS", 2000, 0, 600000);
+  /* RAN_HO_FORCE=SRC:UE:TGT@SECONDS — one handover issued at that time
+   * regardless of the A3 (with RAN_HO_EXECUTE=1). */
+  struct Force {
+    uint16_t src = 0, ue = 0, tgt = 0;
+    int64_t at_ms = 0;
+  };
+  std::optional<Force> force;
+  bool force_done = false;
+  if (const char *fv = std::getenv("RAN_HO_FORCE"); fv && *fv) {
+    unsigned long a = 0, b = 0, t = 0;
+    double sec = 0;
+    auto id_ok = [](unsigned long v) { return v >= 1 && v <= 65535; };
+    if (std::sscanf(fv, "%lu:%lu:%lu@%lf", &a, &b, &t, &sec) != 4 || !id_ok(a) || !id_ok(b) ||
+        !id_ok(t) || !std::isfinite(sec) || sec < 0 || sec > 86400) {
+      fprintf(stderr, "RAN_HO_FORCE=\"%s\": want SRC:UE:TGT@SECONDS\n", fv);
+      return 2;
+    }
+    force = Force{static_cast<uint16_t>(a), static_cast<uint16_t>(b), static_cast<uint16_t>(t),
+                  static_cast<int64_t>(sec * 1000)};
+  }
+  a3c.min_dwell_ms = ho_dwell_ms; /* counted from a moved UE's switch */
+  const int64_t meas_stale_ms = envl("RAN_MEAS_STALE_MS", 2000, 100, 60000);
+  const int dl_ms = static_cast<int>(envl("RAN_DL_MS", 0, 0, 10000));
+  const bool dl_daps = envl("RAN_DL_DAPS", 1, 0, 1) != 0;
+  const size_t dl_backlog = static_cast<size_t>(envl("RAN_DL_DAPS_BACKLOG", 16, 0, 64));
+  std::vector<uint8_t> spare;
+  for (long ch : env_list("RAN_SPARE_CHANNELS", 1, 196))
+    spare.push_back(static_cast<uint8_t>(ch));
+  if (expected.empty()) {
+    fprintf(stderr, "set RAN_DUS (the DU cell ids to coordinate)\n");
+    return 2;
+  }
+
+  const int fd = socket(AF_INET, SOCK_DGRAM, 0);
+  sockaddr_in me{};
+  me.sin_family = AF_INET;
+  me.sin_addr.s_addr = htonl(INADDR_ANY);
+  me.sin_port = htons(static_cast<uint16_t>(port));
+  if (fd < 0 || bind(fd, reinterpret_cast<sockaddr *>(&me), sizeof me) != 0) {
+    fprintf(stderr, "bind UDP %d failed\n", port);
+    return 1;
+  }
+  emit("{\"ev\":\"ran.start\",\"port\":" + std::to_string(port) + ",\"plan\":" +
+       std::to_string(plan_on ? 1 : 0) + ",\"edge_dbm\":" + std::to_string(edge_dbm) +
+       ",\"lead_sf\":" + std::to_string(lead_sf) + ",\"auth\":" + (mac ? "1" : "0") + "}");
+
+  std::map<uint16_t, DuState> dus;
+  /* Per DU, the last version issued. Versions start from this CU's start
+   * time (s), so a restarted CU's versions still move forward: a DU never
+   * mistakes a new CU's schedule for the one it already runs. */
+  const uint32_t version_base = static_cast<uint32_t>(
+      std::chrono::duration_cast<std::chrono::seconds>(
+          std::chrono::system_clock::now().time_since_epoch())
+          .count());
+  std::map<uint16_t, uint32_t> version;
+  const auto t0 = std::chrono::steady_clock::now();
+  const auto deadline = t0 + std::chrono::seconds(secs);
+  auto next_plan = t0 + std::chrono::milliseconds(plan_ms);
+  auto next_meas = t0 + std::chrono::seconds(10);
+  auto next_dl = t0;
+  /* Per UE (its serving cell, its id): the A3 state, and whether a
+   * candidate is currently logged as firing. */
+  struct HoState {
+    devourer::cell::A3Trigger a3;
+    std::optional<uint16_t> firing;
+  };
+  std::map<std::pair<uint16_t, uint16_t>, HoState> ho;
+  /* Handovers in flight, by the UE's (source cell, id). */
+  struct HoFlight {
+    devourer::cell::HoCommand cmd;
+    bool src_ok = false, tgt_ok = false, switched = false;
+    /* When the command was issued: only a target measurement sampled after
+     * it is the UE (an id's previous holder may still have a live one). */
+    std::chrono::steady_clock::time_point at = std::chrono::steady_clock::now();
+  };
+  std::map<std::pair<uint16_t, uint16_t>, HoFlight> flights;
+  /* The per-cell security context (src/cell/Keys.h): with RAN_MASTER_KEY the
+   * CU wraps the target cell's key in every handover command for the UE's
+   * HOME identity's key, as the SOURCE DU's current report names it
+   * (Report.homes: recorded by the DU at the admission — a static UE, a RACH
+   * joiner's MAC, or the home a handover command carried). Nothing of it is
+   * kept here: a restarted CU, or an id reused for another UE, cannot pick a
+   * stale home. No home reported: no context (the UE refuses the command). */
+  const char *master_env = std::getenv("RAN_MASTER_KEY");
+  const auto master = master_env && *master_env ? hmac_sha1(master_env) : devourer::cell::Mac{};
+  std::mt19937_64 area_rng{std::random_device{}()}; /* AreaKeys wrap nonces */
+  auto home_name = [](const devourer::cell::HomeId &h) {
+    char b[24];
+    if (h.joiner)
+      snprintf(b, sizeof b, "J:%02x%02x%02x%02x%02x%02x", h.mac[0], h.mac[1], h.mac[2], h.mac[3],
+               h.mac[4], h.mac[5]);
+    else
+      snprintf(b, sizeof b, "%u:%u", h.cell, h.ue);
+    return std::string(b);
+  };
+  std::map<std::pair<uint16_t, uint16_t>, int64_t> moved_at; /* new key -> switch time (ms) */
+  /* Old keys of UEs that handed over: the source keeps reporting their last
+   * measurement until it goes stale, which must not trigger again. */
+  std::map<std::pair<uint16_t, uint16_t>, int64_t> retired; /* key -> retired at (ms) */
+  /* Cancels for a target that may hold a pre-admitted UE, retried until the
+   * target acknowledges (a DU cancels only the id it staged or published,
+   * so a cancel is safe to send on any failure). */
+  struct Cancel {
+    devourer::cell::HoCommand cmd;
+    int tries = 0;
+  };
+  std::map<uint32_t, Cancel> cancels;
+  uint32_t ho_last_id = 0;
+  /* A channel move in flight (RAN_RETUNE_APPLY): resent until staged, done
+   * when the DU reports the new channel at/after the instant. */
+  struct CsFlight {
+    f1::ChannelSwitchCmd cmd;
+    uint8_t from = 0;
+    bool staged = false;
+  };
+  std::optional<CsFlight> cs_flight;
+  uint32_t cs_last_id = 0;
+  /* A DU whose move was refused or timed out: not asked again before this. */
+  std::map<uint16_t, std::chrono::steady_clock::time_point> cs_hold;
+  devourer::cell::UlStreams ul;
+  /* Per stream: the newest seq delivered, its latest identity (labels only),
+   * when it was last fed, and the seqs missing so far with the DU whose
+   * delivery revealed each gap. A gap is reported (ran.ul_gap) only once
+   * kUlReorder newer seqs have passed it: a late copy within the dedup
+   * window recovers it silently. */
+  constexpr uint32_t kUlReorder = 32;
+  std::map<uint32_t, uint32_t> ul_last;
+  std::map<uint32_t, std::pair<uint16_t, uint16_t>> ul_name;
+  std::map<uint32_t, std::chrono::steady_clock::time_point> ul_seen;
+  std::map<uint32_t, std::map<uint32_t, uint16_t>> ul_missing;
+  auto ul_drop_stream = [&](uint32_t s) {
+    ul_last.erase(s);
+    ul_name.erase(s);
+    ul_seen.erase(s);
+    ul_missing.erase(s);
+  };
+  /* The CU's DL streams (F1 Downlink): one per UE, keyed by its CURRENT
+   * identity (cell, ue), numbered from 1 and running on across handovers.
+   * A PDU every RAN_DL_MS to the serving DU; with RAN_DL_DAPS, from the
+   * handover command until ran.ho_done also to the target, for the target
+   * identity (`dup`). At ho_done the stream moves to the target identity. */
+  struct DlStream {
+    uint64_t epoch = 0; /* the CU's realtime (us) at creation: a re-created stream is newer */
+    uint32_t next_sn = 1;
+    std::optional<std::pair<uint16_t, uint16_t>> dup;
+    std::chrono::steady_clock::time_point reported;
+    std::deque<uint32_t> recent; /* the last RAN_DL_DAPS_BACKLOG sns sent */
+  };
+  std::map<std::pair<uint16_t, uint16_t>, DlStream> dls;
+  /* Per UE identity (cell, ue): where its uplink slot sits (its cell's phase
+   * and period, the slot's start on the grid), from the latest report that
+   * listed it — what a forwarded copy is mapped to (Handover.h
+   * ul_seq_for_copy); kept 30 s past the last report naming it. */
+  struct UlSlot {
+    int64_t phase_us = 0, period_us = 0, ul_start_us = 0, at_ms = 0;
+  };
+  std::map<std::pair<uint16_t, uint16_t>, UlSlot> ul_slot;
+  auto dl_undup = [&](const devourer::cell::HoCommand &cmd) {
+    if (auto d = dls.find({cmd.source, cmd.ue}); d != dls.end())
+      d->second.dup.reset();
+  };
+  auto ms_now = [&] {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0)
+        .count();
+  };
+  /* Schedule freshness (F1.h): the realtime clock in us, strictly
+   * increasing, so a restarted CU's sequence still moves forward. */
+  uint64_t last_seq = 0;
+  auto next_seq = [&] {
+    const uint64_t rt = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::system_clock::now().time_since_epoch())
+            .count());
+    last_seq = std::max(last_seq + 1, rt);
+    return last_seq;
+  };
+  auto send = [&](const DuState &d, const std::vector<uint8_t> &m) {
+    if (!m.empty())
+      sendto(fd, m.data(), m.size(), 0, reinterpret_cast<const sockaddr *>(&d.addr), sizeof d.addr);
+  };
+  /* Phase planning: the DUs asking (their latest request, kept apart from
+   * `dus` — a joining DU runs nothing yet) and the sticky assignments. */
+  const int phase_wait_s = static_cast<int>(envl("RAN_PHASE_WAIT_S", 20, 0, 600));
+  devourer::cell::PhaseParams phase_pp;
+  phase_pp.retune_us = envl("RAN_GAP_RETUNE_US", 26000, 1000, 500000);
+  phase_pp.guard_us = envl("RAN_GAP_GUARD_US", 2000, 0, 50000);
+  /* The cells run suspend gaps (CELL_GAP_SUSPEND_SF): a direction only a
+   * suspend gap reaches still counts, at this weight (PhasePlan.h). */
+  const bool gap_suspend = envl("RAN_GAP_SUSPEND", 0, 0, 1) != 0;
+  if (gap_suspend)
+    phase_pp.suspend_weight = 0.25;
+
+  struct Joining {
+    DuState st;
+    std::chrono::steady_clock::time_point first;
+  };
+  std::map<uint16_t, Joining> joining;
+  /* A sticky assignment holds for the layout it was planned for: a DU that
+   * comes back with another period, channel or grid is planned afresh. */
+  struct Assigned {
+    int64_t phase_us = 0;
+    int64_t period_us = 0;
+    uint8_t channel = 0;
+    std::vector<devourer::cell::CoordInterval> fixed;
+    std::vector<devourer::cell::CoordPosition> positions;
+    bool fits(const f1::Report &r) const {
+      return period_us == r.period_us && channel == r.channel && fixed == r.fixed &&
+             positions == r.positions && phase_us < r.period_us;
+    }
+  };
+  std::map<uint16_t, Assigned> phase_of;
+  /* A phase request is state the CU keeps (a sticky assignment): never from
+   * an unauthenticated sender unless explicitly allowed. */
+  const bool phase_insecure = envl("RAN_F1_INSECURE", 0, 0, 1) != 0;
+  if (!mac && !phase_insecure)
+    fprintf(stderr, "ran-controller: no RAN_F1_KEY: phase requests are ignored (RAN_F1_INSECURE=1 "
+                    "to allow)\n");
+  auto answer_phase = [&](const DuState &d) {
+    send(d, f1::encode_phase(f1::PhaseAssign{d.rep.du, phase_of.at(d.rep.du).phase_us, d.rep.seq},
+                             mac));
+  };
+  auto fresh = [](std::chrono::steady_clock::time_point at, std::chrono::steady_clock::time_point now) {
+    return at.time_since_epoch().count() != 0 && now - at < std::chrono::seconds(3);
+  };
+  auto plan_joining = [&](std::chrono::steady_clock::time_point now) {
+    for (auto &kv : joining) {
+      if (phase_of.count(kv.first))
+        continue;
+      const f1::Report &rq = kv.second.st.rep;
+      /* Wait for the expected DUs not heard lately — the same freshness as
+       * the cells planned against (a joining one never blocks: the lower ids
+       * are planned first, the higher ones around this). */
+      bool all = true;
+      for (long id : expected) {
+        const auto u = static_cast<uint16_t>(id);
+        const auto d = dus.find(u);
+        const auto j = joining.find(u);
+        all = all && (u == kv.first || (d != dus.end() && fresh(d->second.at, now)) ||
+                      (j != joining.end() && fresh(j->second.st.at, now)));
+      }
+      if (!all && now - kv.second.first < std::chrono::seconds(phase_wait_s))
+        continue;
+      std::vector<devourer::cell::PhaseCell> ex;
+      for (const auto &d : dus)
+        if (d.first != kv.first && d.second.rep.phase_us >= 0 && fresh(d.second.at, now))
+          ex.push_back(devourer::cell::phase_cell(d.first, d.second.rep.channel,
+                                                  d.second.rep.phase_us, d.second.rep.period_us,
+                                                  d.second.rep.fixed, d.second.rep.positions));
+      for (const auto &j : joining) /* assigned, not yet running */
+        if (j.first != kv.first && phase_of.count(j.first) && !dus.count(j.first) &&
+            fresh(j.second.st.at, now))
+          ex.push_back(devourer::cell::phase_cell(j.first, j.second.st.rep.channel,
+                                                  phase_of[j.first].phase_us,
+                                                  j.second.st.rep.period_us, j.second.st.rep.fixed,
+                                                  j.second.st.rep.positions));
+      devourer::cell::PhaseParams pp = phase_pp;
+      pp.period_us = rq.period_us;
+      const auto me = devourer::cell::phase_cell(kv.first, rq.channel, 0, rq.period_us, rq.fixed,
+                                                 rq.positions);
+      const auto plan = devourer::cell::plan_phase(me, ex, pp);
+      phase_of[kv.first] = Assigned{plan.phase_us, rq.period_us, rq.channel, rq.fixed, rq.positions};
+      std::string pairs = "{";
+      for (size_t i = 0; i < plan.pairs.size(); ++i) {
+        char b[48];
+        snprintf(b, sizeof b, "%s\"%u\":%.2f", i ? "," : "", plan.pairs[i].first, plan.pairs[i].second);
+        pairs += b;
+      }
+      char l[256];
+      snprintf(l, sizeof l,
+               "{\"ev\":\"ran.phase\",\"du\":%u,\"channel\":%u,\"phase_us\":%lld,"
+               "\"score\":%.2f,\"max_score\":%.2f,\"against\":%zu,\"other_period\":%zu,"
+               "\"pairs\":",
+               kv.first, rq.channel, (long long)plan.phase_us, plan.score, plan.max_score,
+               plan.pairs.size(), plan.other_period.size());
+      emit(std::string(l) + pairs + "}}");
+      answer_phase(kv.second.st);
+    }
+  };
+  while (std::chrono::steady_clock::now() < deadline) {
+    pollfd pf{fd, POLLIN, 0};
+    /* Woken for the DL stream's next PDU too: with a fixed 50 ms the PDUs
+     * left up to 50 ms late (whenever a datagram or the timeout woke the
+     * loop), so a DU saw them unevenly — a PDU missing a DL frame's pick by
+     * a few ms waited a superframe. */
+    int wait_ms = 50;
+    if (dl_ms > 0) {
+      const auto to_dl = std::chrono::ceil<std::chrono::milliseconds>(
+                             next_dl - std::chrono::steady_clock::now())
+                             .count();
+      wait_ms = static_cast<int>(std::clamp<int64_t>(to_dl, 0, 50));
+    }
+    if (poll(&pf, 1, wait_ms) > 0 && (pf.revents & POLLIN)) {
+      uint8_t buf[f1::kMaxDatagram];
+      sockaddr_in from{};
+      socklen_t fl = sizeof from;
+      const ssize_t n = recvfrom(fd, buf, sizeof buf, 0, reinterpret_cast<sockaddr *>(&from), &fl);
+      if (n > 0) {
+        const auto ty = f1::peek_type(buf, static_cast<size_t>(n));
+        if (ty == f1::Type::Uplink) {
+          auto u = f1::decode_uplink(buf, static_cast<size_t>(n), mac);
+          /* Only identities a configured DU reports as its UE, or that an
+           * active handover aliased: no state for anything else. */
+          bool known = false;
+          if (u && std::find(expected.begin(), expected.end(), static_cast<long>(u->du)) !=
+                       expected.end()) {
+            if (auto d = dus.find(u->cell); d != dus.end())
+              for (const auto &a : d->second.rep.ues)
+                known = known || a.ue == u->ue;
+            for (const auto &fl : flights)
+              known = known || (fl.second.cmd.source == u->cell && fl.second.cmd.ue == u->ue) ||
+                      (fl.second.cmd.target == u->cell && fl.second.cmd.target_ue == u->ue);
+            known = known || ul.stream_id({u->cell, u->ue}).has_value();
+          }
+          if (known) {
+            /* A copy heard by ANOTHER cell's DU (DAPS: the target hearing the
+             * source identity) may be a sequential-DAPS visit, sent after the
+             * UE's own uplink slot on the target's channel: its seq is that of
+             * the slot (Handover.h ul_seq_for_copy), from the serving cell's
+             * phase and the UE's uplink position in its last report. */
+            /* Every copy, the serving DU's own too: the two copies of one
+             * uplink must get the same seq even with the slot next to a
+             * network-superframe boundary (a timing advance puts the
+             * serving copy before it). From the identity's last-known slot,
+             * so a copy that arrives after the source released the UE still
+             * maps. */
+            if (auto m = ul_slot.find({u->cell, u->ue}); m != ul_slot.end() && ms_now() - m->second.at_ms < 30000)
+              u->seq = devourer::cell::ul_seq_for_copy(u->net_us, m->second.phase_us, m->second.ul_start_us,
+                                                       m->second.period_us);
+            const uint32_t raw_seq = static_cast<uint32_t>(u->net_us / std::max<int64_t>(1, dus.count(u->du) ? dus.at(u->du).rep.period_us : 102400));
+            const auto r = ul.deliver({u->cell, u->ue}, u->seq, u->du);
+            if (u->du != u->cell)
+              emit("{\"ev\":\"ran.ul_copy\",\"du\":" + std::to_string(u->du) + ",\"cell\":" +
+                   std::to_string(u->cell) + ",\"ue\":" + std::to_string(u->ue) + ",\"raw\":" +
+                   std::to_string(raw_seq) + ",\"seq\":" + std::to_string(u->seq) + ",\"fresh\":" +
+                   (r.fresh ? "1" : "0") + "}");
+            ul_seen[r.stream] = std::chrono::steady_clock::now();
+            ul_name[r.stream] = {u->cell, u->ue};
+            if (r.fresh) {
+              auto &miss = ul_missing[r.stream];
+              auto lit = ul_last.find(r.stream);
+              if (miss.erase(u->seq)) {
+                /* a late copy: recovered, never reported */
+              } else if (lit == ul_last.end()) {
+                ul_last[r.stream] = u->seq;
+              } else {
+                const int32_t d = static_cast<int32_t>(u->seq - lit->second);
+                for (int32_t k = 1; k < d && k <= 512; ++k)
+                  miss[lit->second + static_cast<uint32_t>(k)] = u->du;
+                if (d > 0)
+                  lit->second = u->seq;
+              }
+              /* Confirm what fell kUlReorder behind the newest: runs of
+               * consecutive missing seqs, one event each. */
+              const uint32_t top = ul_last[r.stream];
+              while (!miss.empty()) {
+                /* The oldest run of consecutive missing seqs, reported whole
+                 * once its LAST seq has fallen kUlReorder behind. */
+                const uint32_t first = miss.begin()->first;
+                const uint16_t via = miss.begin()->second;
+                uint32_t n_run = 0;
+                for (auto m = miss.begin(); m != miss.end() && m->first == first + n_run; ++m)
+                  ++n_run;
+                if (static_cast<int32_t>(top - (first + n_run - 1)) <= static_cast<int32_t>(kUlReorder))
+                  break;
+                for (uint32_t k = 0; k < n_run; ++k)
+                  miss.erase(first + k);
+                emit("{\"ev\":\"ran.ul_gap\",\"cell\":" + std::to_string(u->cell) +
+                     ",\"ue\":" + std::to_string(u->ue) + ",\"after_seq\":" +
+                     std::to_string(first - 1) + ",\"missing\":" + std::to_string(n_run) +
+                     ",\"resumed_via\":" + std::to_string(via) + "}");
+              }
+            }
+          }
+        } else if (ty == f1::Type::Report) {
+          auto r = f1::decode_report(buf, static_cast<size_t>(n), mac);
+          /* Only the configured DUs: no state for any other id, however
+           * many a sender makes up. */
+          if (r && std::find(expected.begin(), expected.end(), static_cast<long>(r->du)) ==
+                       expected.end())
+            r.reset();
+          if (r && r->phase_us < 0) {
+            /* A phase request (M6): authenticated, above this DU's last
+             * request and last report (else a replay), and on a period a DU
+             * grid can have (CELL_TU 10..1000 TU). */
+            if (!mac && !phase_insecure)
+              continue;
+            auto j = joining.find(r->du);
+            const auto d = dus.find(r->du);
+            if ((j != joining.end() && r->seq <= j->second.st.rep.seq) ||
+                (d != dus.end() && r->seq <= d->second.rep.seq) || r->period_us < 10 * 1024 ||
+                r->period_us > 1000 * 1024 || r->period_us % 1024 != 0)
+              continue;
+            if (auto a = phase_of.find(r->du); a != phase_of.end() && !a->second.fits(*r))
+              phase_of.erase(a); /* another layout: planned afresh */
+            if (j == joining.end())
+              j = joining.emplace(r->du, Joining{{}, std::chrono::steady_clock::now()}).first;
+            j->second.st.rep = *r;
+            j->second.st.addr = from;
+            j->second.st.at = std::chrono::steady_clock::now();
+            if (phase_of.count(r->du))
+              answer_phase(j->second.st);
+            else
+              plan_joining(std::chrono::steady_clock::now());
+            continue;
+          }
+          if (r && r->per_cell_keys && !master) {
+            /* A per-cell DU needs AreaKeys (its heard UEs, DAPS) and handover
+             * contexts: both come from the master key. */
+            fprintf(stderr, "DU %u runs per-cell keys (CELL_AREA_KEY) but RAN_MASTER_KEY is unset\n",
+                    r->du);
+            emit("{\"ev\":\"ran.config_error\",\"du\":" + std::to_string(r->du) +
+                 ",\"why\":\"per-cell DU, no RAN_MASTER_KEY\"}");
+            return 2;
+          }
+          if (r) {
+            /* Running: no longer joining (its assignment stays). */
+            joining.erase(r->du);
+            DuState &d = dus[r->du];
+            const bool first = d.at.time_since_epoch().count() == 0;
+            /* Freshness: a report at or below the last one taken from this DU
+             * is a replay (or reordering) and changes nothing, not even the
+             * address this DU's schedules go to. */
+            if (!first && r->seq <= d.rep.seq)
+              continue;
+            d.rep = *r;
+            d.addr = from;
+            d.at = std::chrono::steady_clock::now();
+            if (r->period_us > 0)
+              for (const auto &a : r->ues)
+                if (a.pos >= 1 && a.pos <= r->positions.size())
+                  ul_slot[{r->du, a.ue}] = {r->phase_us, r->period_us, r->positions[a.pos - 1].ul.start_us,
+                                            ms_now()};
+            if (first) {
+              char a[INET_ADDRSTRLEN] = {};
+              inet_ntop(AF_INET, &from.sin_addr, a, sizeof a);
+              emit("{\"ev\":\"ran.du\",\"du\":" + std::to_string(r->du) + ",\"addr\":\"" + a +
+                   ":" + std::to_string(ntohs(from.sin_port)) + "\",\"tier\":" +
+                   std::to_string(r->tier) + ",\"phase_us\":" + std::to_string(r->phase_us) +
+                   ",\"positions\":" + std::to_string(r->positions.size()) + "}");
+            }
+          }
+        } else if (ty == f1::Type::Ack) {
+          if (auto ca = f1::decode_ack(buf, static_cast<size_t>(n), mac);
+              ca && ca->kind == f1::AckKind::ChannelSwitch && cs_flight && ca->version == cs_flight->cmd.id &&
+              ca->du == cs_flight->cmd.du && ca->status != f1::AckStatus::Stale) {
+            const bool ok = ca->status == f1::AckStatus::Staged || ca->status == f1::AckStatus::Applied;
+            emit("{\"ev\":\"ran.cs_ack\",\"id\":" + std::to_string(ca->version) + ",\"du\":" +
+                 std::to_string(ca->du) + ",\"status\":\"" + f1::ack_status_name(ca->status) + "\"}");
+            if (ok) {
+              cs_flight->staged = true; /* Applied: done once its report shows the channel */
+            } else { /* refused, or not made: not asked again for RAN_CS_BACKOFF_S */
+              cs_hold[cs_flight->cmd.du] = std::chrono::steady_clock::now() + std::chrono::seconds(cs_backoff_s);
+              cs_flight.reset();
+            }
+          }
+          if (auto a = f1::decode_ack(buf, static_cast<size_t>(n), mac);
+              a && a->kind == f1::AckKind::Handover) {
+            if (auto c = cancels.find(a->version);
+                c != cancels.end() && a->du == c->second.cmd.target &&
+                a->status == f1::AckStatus::Staged) {
+              emit("{\"ev\":\"ran.ho_cancelled\",\"id\":" + std::to_string(a->version) + "}");
+              cancels.erase(c);
+            }
+            for (auto it = flights.begin(); it != flights.end(); ++it) {
+              HoFlight &fl = it->second;
+              if (fl.cmd.id != a->version)
+                continue;
+              /* A Stale reply answers a reordered (older) copy of a command
+               * resent since: no verdict on the handover. */
+              if (a->status == f1::AckStatus::Stale)
+                break;
+              const bool ok = a->status == f1::AckStatus::Staged;
+              const bool was = a->du == fl.cmd.source ? fl.src_ok : fl.tgt_ok;
+              (a->du == fl.cmd.source ? fl.src_ok : fl.tgt_ok) = ok;
+              if (!ok) {
+                emit("{\"ev\":\"ran.ho_failed\",\"id\":" + std::to_string(fl.cmd.id) +
+                     ",\"du\":" + std::to_string(a->du) + ",\"status\":\"" +
+                     f1::ack_status_name(a->status) + "\"}");
+                /* The target may hold the UE (even a refusing target: its
+                 * earlier Staged ack may have been lost): cancel, retried. */
+                cancels[fl.cmd.id] = Cancel{fl.cmd};
+                ul.forget({fl.cmd.target, fl.cmd.target_ue}); /* the provisional alias */
+                dl_undup(fl.cmd);
+                flights.erase(it); /* the A3 fires again later: a fresh command */
+              } else if (!was) {
+                emit("{\"ev\":\"ran.ho_ack\",\"id\":" + std::to_string(fl.cmd.id) +
+                     ",\"du\":" + std::to_string(a->du) + ",\"role\":\"" +
+                     (a->du == fl.cmd.source ? "source" : "target") + "\"}");
+                /* The target has it: the source (and so the UE) now, not on the
+                 * next round — the lead is spent waiting otherwise. */
+                if (a->du == fl.cmd.target && !fl.src_ok)
+                  if (auto s2 = dus.find(fl.cmd.source); s2 != dus.end()) {
+                    fl.cmd.seq = next_seq();
+                    send(s2->second, f1::encode_handover(fl.cmd.source, fl.cmd, mac));
+                  }
+              }
+              break;
+            }
+          } else if (a) {
+            auto it = dus.find(a->du);
+            const bool bad = a->status == f1::AckStatus::Stale || a->status == f1::AckStatus::Late ||
+                             a->status == f1::AckStatus::Invalid;
+            if (a->kind == f1::AckKind::Schedule && it != dus.end() && it->second.sched &&
+                it->second.sched->version == a->version && bad)
+              it->second.sched_refused = true; /* re-issue a fresh version (kept as the keepalive) */
+            static std::map<uint16_t, std::pair<uint32_t, int>> last; /* log changes only */
+            auto &l = last[a->du];
+            if (l.first != a->version || l.second != static_cast<int>(a->status)) {
+              l = {a->version, static_cast<int>(a->status)};
+              emit("{\"ev\":\"ran.ack\",\"du\":" + std::to_string(a->du) + ",\"version\":" +
+                   std::to_string(a->version) + ",\"status\":\"" + f1::ack_status_name(a->status) +
+                   "\",\"net_sf\":" + std::to_string(a->net_sf) + "}");
+            }
+          }
+        }
+      }
+    }
+    const auto now = std::chrono::steady_clock::now();
+    /* The DL streams: a PDU per stream every RAN_DL_MS. */
+    if (dl_ms > 0 && now >= next_dl) {
+      next_dl = std::max(next_dl + std::chrono::milliseconds(dl_ms), now - std::chrono::milliseconds(dl_ms));
+      /* A stream per UE a configured DU reports (not a handed-over source
+       * identity, nor a handover target identity in flight: those are the
+       * stream that moves). */
+      for (const auto &kv : dus) {
+        if (std::find(expected.begin(), expected.end(), static_cast<long>(kv.first)) == expected.end())
+          continue;
+        if (now - kv.second.at > std::chrono::seconds(3))
+          continue; /* a DU gone quiet (dead, or F1 lost): its last report is no evidence */
+        for (const auto &a : kv.second.rep.ues) {
+          const std::pair<uint16_t, uint16_t> id{kv.first, a.ue};
+          if (auto d = dls.find(id); d != dls.end()) {
+            d->second.reported = now;
+            continue;
+          }
+          if (retired.count(id))
+            continue;
+          bool target = false;
+          for (const auto &fl : flights)
+            target = target || (fl.second.cmd.target == id.first && fl.second.cmd.target_ue == id.second);
+          if (!target) {
+            dls[id].reported = now;
+            dls[id].epoch = next_seq();
+            emit("{\"ev\":\"ran.dl_stream\",\"cell\":" + std::to_string(id.first) + ",\"ue\":" +
+                 std::to_string(id.second) + "}");
+          }
+        }
+      }
+      for (auto d = dls.begin(); d != dls.end();) {
+        bool flying = false;
+        for (const auto &fl : flights)
+          flying = flying || (fl.second.cmd.source == d->first.first && fl.second.cmd.ue == d->first.second);
+        if (!flying && now - d->second.reported > std::chrono::seconds(10)) {
+          d = dls.erase(d); /* no DU serves it any more */
+          continue;
+        }
+        const uint32_t sn = d->second.next_sn++;
+        d->second.recent.push_back(sn);
+        while (d->second.recent.size() > dl_backlog)
+          d->second.recent.pop_front();
+        if (auto du = dus.find(d->first.first); du != dus.end())
+          send(du->second, f1::encode_downlink({d->first.first, d->first.second, d->second.epoch, sn}, mac));
+        if (d->second.dup)
+          if (auto du = dus.find(d->second.dup->first); du != dus.end())
+            send(du->second,
+                 f1::encode_downlink({d->second.dup->first, d->second.dup->second, d->second.epoch, sn}, mac));
+        ++d;
+      }
+    }
+    /* The DUs' filtered uplink measurements (M6), every 10 s, and the DAPS
+     * uplink streams. */
+    if (now >= next_meas) {
+      next_meas = now + std::chrono::seconds(10);
+      /* Streams idle 60 s are retired with their identities and records. */
+      for (auto it = ul_seen.begin(); it != ul_seen.end();) {
+        if (now - it->second > std::chrono::seconds(60)) {
+          const uint32_t s = it->first;
+          ++it;
+          ul.forget_stream(s);
+          ul_drop_stream(s);
+          continue;
+        }
+        ++it;
+      }
+      /* Retired source identities (a completed handover) leave the streams. */
+      for (auto r = retired.begin(); r != retired.end();) {
+        if (ms_now() - r->second >= 6000) {
+          const auto s = ul.stream_id(r->first);
+          ul.forget(r->first);
+          if (s && !ul.stats_of_stream(*s))
+            ul_drop_stream(*s);
+          r = retired.erase(r);
+        } else {
+          ++r;
+        }
+      }
+      for (const auto &nm : ul_name)
+        if (const auto *st = ul.stats_of_stream(nm.first)) {
+          std::string m = "{\"ev\":\"ran.ul\",\"cell\":" + std::to_string(nm.second.first) +
+                          ",\"ue\":" + std::to_string(nm.second.second) + ",\"delivered\":" +
+                          std::to_string(st->delivered) + ",\"duplicates\":" +
+                          std::to_string(st->duplicates) + ",\"first_by_du\":{";
+          bool f = true;
+          for (const auto &kv : st->first_by_du) {
+            m += std::string(f ? "" : ",") + "\"" + std::to_string(kv.first) + "\":" +
+                 std::to_string(kv.second);
+            f = false;
+          }
+          emit(m + "}}");
+        }
+      for (const auto &kv : dus) {
+        std::string m = "{\"ev\":\"ran.meas\",\"du\":" + std::to_string(kv.first) + ",\"own\":[";
+        for (size_t i = 0; i < kv.second.rep.meas.size(); ++i) {
+          const auto &q = kv.second.rep.meas[i];
+          char b[96];
+          char ev[16] = "null"; /* EVM last (F1 v16): earlier fields keep their places */
+          if (q.evm_qdb != f1::kNoEvmQ)
+            snprintf(ev, sizeof ev, "%.2f", q.evm_qdb / 4.0);
+          snprintf(b, sizeof b, "%s[%u,%.2f,%.2f,%s]", i ? "," : "", q.ue, q.rssi_qdbm / 4.0,
+                   q.snr_qdb / 4.0, ev);
+          m += b;
+        }
+        m += "],\"heard\":[";
+        for (size_t i = 0; i < kv.second.rep.heard.size(); ++i) {
+          const auto &h = kv.second.rep.heard[i];
+          char b[96];
+          char ev[16] = "null";
+          if (h.evm_db != f1::kNoEvm8)
+            snprintf(ev, sizeof ev, "%d", h.evm_db);
+          snprintf(b, sizeof b, "%s[%u,%u,%d,%d,%s]", i ? "," : "", h.cell, h.ue, h.rssi_dbm, h.snr_db, ev);
+          m += b;
+        }
+        emit(m + "]}");
+      }
+    }
+    /* A3, every plan round, on the configured DUs' latest reports. A value
+     * counts only while its sample is younger than meas_stale_ms (its age
+     * at report time plus the report's age since). */
+    if (ho_on && now >= next_plan) {
+      const int64_t tms = ms_now();
+      auto live = [&](const DuState &d, uint16_t age_ms) {
+        const int64_t rep_age =
+            std::chrono::duration_cast<std::chrono::milliseconds>(now - d.at).count();
+        return d.at.time_since_epoch().count() != 0 && age_ms + rep_age <= meas_stale_ms;
+      };
+      auto live_within = [&](const DuState &d, uint16_t age_ms, int64_t bound_ms) {
+        const int64_t rep_age =
+            std::chrono::duration_cast<std::chrono::milliseconds>(now - d.at).count();
+        return d.at.time_since_epoch().count() != 0 && age_ms + rep_age <= bound_ms;
+      };
+      /* The neighbours a UE of DU `d` (at position `pos`) reaches only in
+       * suspend gaps (MeasGap.h suspend_only, from the reports: phases,
+       * channels, its slots), when its DU runs them (Report.gap_suspend_sf). A
+       * UE measures each of them once per k suspend periods (k of them, round
+       * robin), so its report of one counts that long (+1.5 s for the MR and
+       * F1 report path); every other report keeps RAN_MEAS_STALE_MS. Else such
+       * a neighbour flickers stale and the A3's time-to-trigger restarts (the
+       * three-cell crossing: the 2 -> 3 handover fired 12 s late). */
+      auto suspend_only_of = [&](const DuState &d, uint8_t pos) {
+        std::set<uint16_t> out;
+        if (d.rep.gap_suspend_sf == 0 || d.rep.period_us <= 0 || pos == 0)
+          return out;
+        const auto pc = devourer::cell::phase_cell(d.rep.du, d.rep.channel, d.rep.phase_us, d.rep.period_us,
+                                                   d.rep.fixed, d.rep.positions);
+        if (pos > pc.positions.size())
+          return out;
+        const std::vector<devourer::cell::GridSpan> busy = {
+            {0, pc.beacon_us}, pc.positions[pos - 1].first, pc.positions[pos - 1].second};
+        for (const auto &o : dus) {
+          if (o.first == d.rep.du || now - o.second.at >= std::chrono::seconds(3) ||
+              o.second.rep.period_us != d.rep.period_us)
+            continue;
+          const devourer::cell::Neighbour n{
+              o.first, o.second.rep.channel,
+              devourer::cell::neighbour_offset_us(o.second.rep.phase_us, d.rep.phase_us, d.rep.period_us)};
+          if (devourer::cell::suspend_only(n, d.rep.channel, phase_pp.retune_us, phase_pp.guard_us,
+                                           d.rep.period_us, busy))
+            out.insert(o.first);
+        }
+        return out;
+      };
+      auto log_candidate = [&](uint16_t ue, uint16_t from, uint16_t to, double sv, double tv,
+                               int64_t held, bool ue_reported) {
+        char b[256];
+        snprintf(b, sizeof b,
+                 "{\"ev\":\"ran.ho_candidate\",\"t_ms\":%lld,\"ue\":%u,\"from\":%u,"
+                 "\"to\":%u,\"metric\":\"%s%s\",\"serving\":%.2f,\"target\":%.2f,"
+                 "\"held_ms\":%lld}",
+                 (long long)tms, ue, from, to, ue_reported ? "ue_" : "", metric.c_str(), sv, tv,
+                 (long long)held);
+        emit(b);
+      };
+      auto log_clear = [&](uint16_t ue, uint16_t from, uint16_t to, const char *why) {
+        char b[200];
+        snprintf(b, sizeof b,
+                 "{\"ev\":\"ran.ho_clear\",\"t_ms\":%lld,\"ue\":%u,\"from\":%u,"
+                 "\"to\":%u,\"why\":\"%s\"}",
+                 (long long)tms, ue, from, to, why);
+        emit(b);
+      };
+      std::set<std::pair<uint16_t, uint16_t>> seen;
+      for (long id : expected) {
+        auto dit = dus.find(static_cast<uint16_t>(id));
+        if (dit == dus.end())
+          continue;
+        const uint16_t cell = dit->first;
+        for (const f1::UeMeas &q : dit->second.rep.meas) {
+          if (!live(dit->second, q.age_ms))
+            continue; /* no valid serving measurement: handled below */
+          /* Per neighbour, ONE comparable pair: the UE's own (serving beacon,
+           * neighbour beacon) when its MR has both, else the DUs' (serving
+           * uplink, neighbour-heard uplink). The A3 sees margins (neighbour -
+           * serving; the A3 condition depends on the difference only), so a
+           * neighbour the UE did not report keeps its DU-heard evidence. */
+          auto val = [&](int16_t qdb_rssi, int16_t qdb_snr) {
+            return metric == "rssi" ? qdb_rssi / 4.0 : qdb_snr / 4.0;
+          };
+          const double serving_du = val(q.rssi_qdbm, q.snr_qdb);
+          uint8_t qpos = 0;
+          for (const auto &a : dit->second.rep.ues)
+            if (a.ue == q.ue)
+              qpos = a.pos;
+          const auto susp_only = suspend_only_of(dit->second, qpos);
+          const int64_t susp_bound_ms =
+              std::max<int64_t>(meas_stale_ms, static_cast<int64_t>(susp_only.size()) *
+                                                       dit->second.rep.gap_suspend_sf *
+                                                       dit->second.rep.period_us / 1000 +
+                                                   1500);
+          std::optional<double> serving_ue;
+          for (const f1::UeCellMeas &m : dit->second.rep.ue_meas)
+            if (m.ue == q.ue && m.cell == cell && live(dit->second, m.age_ms))
+              serving_ue = val(m.rssi_qdbm, m.snr_qdb);
+          struct Pair {
+            double s, t;
+            bool ue;
+          };
+          std::map<uint16_t, Pair> pairs;
+          std::map<uint16_t, std::optional<double>> neigh;
+          for (long oid : expected) {
+            if (oid == cell)
+              continue;
+            const auto o = static_cast<uint16_t>(oid);
+            std::optional<double> ue_v, du_v;
+            if (serving_ue)
+              for (const f1::UeCellMeas &m : dit->second.rep.ue_meas)
+                if (m.ue == q.ue && m.cell == o &&
+                    live_within(dit->second, m.age_ms, susp_only.count(o) ? susp_bound_ms : meas_stale_ms))
+                  ue_v = val(m.rssi_qdbm, m.snr_qdb);
+            if (auto oit = dus.find(o); oit != dus.end())
+              for (const f1::HeardUe &h : oit->second.rep.heard)
+                if (h.cell == cell && h.ue == q.ue && live(oit->second, h.age_ms))
+                  du_v = metric == "rssi" ? h.rssi_dbm : h.snr_db;
+            if (ue_v)
+              pairs[o] = {*serving_ue, *ue_v, true};
+            else if (du_v)
+              pairs[o] = {serving_du, *du_v, false};
+            if (pairs.count(o))
+              neigh[o] = pairs[o].t - pairs[o].s;
+            else
+              neigh[o] = std::nullopt; /* absent or expired: no evidence */
+          }
+          const double serving = 0.0; /* margins */
+          const auto key = std::make_pair(cell, q.ue);
+          /* A just-moved UE's old key: the source's last (stale) reports must
+           * not trigger again. Time-bound (stale window + release + a report),
+           * so the id is usable again by a later UE there. */
+          if (auto r = retired.find(key); r != retired.end()) {
+            if (tms - r->second < 6000)
+              continue;
+            retired.erase(r);
+          }
+          seen.insert(key);
+          /* A UE whose handover is in flight: its A3 is frozen until the flight
+           * ends. The UE leaves at the instant, and the source's reports then
+           * lose its own measurements; the DUs' stale ones must not clear the
+           * candidate and raise another for the same move. */
+          if (flights.count(key))
+            continue;
+          auto it = ho.find(key);
+          if (it == ho.end())
+            it = ho.emplace(key, HoState{devourer::cell::A3Trigger(cell, a3c), std::nullopt}).first;
+          HoState &st = it->second;
+          if (auto mv = moved_at.find(key); mv != moved_at.end()) { /* a moved UE: dwell */
+            st.a3.handed_over(cell, mv->second);
+            moved_at.erase(mv);
+          }
+          const auto tgt = st.a3.evaluate(serving, neigh, tms);
+          if (tgt != st.firing) {
+            if (st.firing) /* also when switching straight to another target */
+              log_clear(q.ue, cell, *st.firing, tgt ? "retarget" : "condition");
+            if (tgt) {
+              const auto since = st.a3.holding_since(*tgt);
+              const Pair &pp = pairs.at(*tgt);
+              log_candidate(q.ue, cell, *tgt, pp.s, pp.t, since ? tms - *since : 0, pp.ue);
+            }
+          }
+          st.firing = tgt;
+          /* Execute: one command per candidate, one handover in flight per
+           * DU (source or target). */
+          /* RAN_HO_FORCE: the configured UE is handed over at its time,
+           * whatever the A3 says (inter-frequency: no DU hears the UE across
+           * channels until measurement gaps exist). */
+          std::optional<uint16_t> act = tgt;
+          bool forcing = false;
+          if (force && !force_done && key == std::make_pair(force->src, force->ue) &&
+              tms >= force->at_ms) {
+            act = force->tgt;
+            forcing = true; /* done only once a command is in flight */
+          }
+          if (ho_exec && act) {
+            bool busy = flights.count(key) > 0 ||
+                        (cs_flight && (cs_flight->cmd.du == *act || cs_flight->cmd.du == cell));
+            for (const auto &fl : flights)
+              busy = busy || fl.second.cmd.target == *act || fl.second.cmd.source == *act ||
+                     fl.second.cmd.target == cell || fl.second.cmd.source == cell;
+            /* Nor while either DU has a schedule pushed and not yet applied:
+             * the positions in its report are about to change (the reverse
+             * of the schedule's own in-flight guard). */
+            for (const uint16_t x : {cell, *act})
+              if (auto xd = dus.find(x); xd != dus.end() && xd->second.sched && !xd->second.sched_refused &&
+                                         xd->second.rep.applied_version < xd->second.sched->version)
+                busy = true;
+            auto tit = dus.find(*act);
+            /* The target's report must be current: its capacity, channel and
+             * clock are what the command is built from. */
+            const bool tgt_fresh = tit != dus.end() && now - tit->second.at < std::chrono::seconds(3);
+            if (!busy && tgt_fresh && tit->second.rep.net_sf > 0 && dit->second.rep.net_sf > 0) {
+              const f1::Report &sr = dit->second.rep, &tr = tit->second.rep;
+              /* Taken at the target: what it reports, and what this CU last
+               * scheduled it (its report may predate that schedule). */
+              std::vector<CoordAssign> taken = tr.ues;
+              if (tit->second.sched)
+                taken.insert(taken.end(), tit->second.sched->ues.begin(), tit->second.sched->ues.end());
+              uint16_t tue = 0;
+              for (uint16_t u = 1; u <= tr.positions.size() && !tue; ++u) {
+                bool used = false;
+                for (const auto &a : taken)
+                  used = used || a.ue == u;
+                if (!used)
+                  tue = u;
+              }
+              uint8_t tpos = 0;
+              for (uint8_t p = 1; p <= tr.positions.size() && !tpos; ++p) {
+                bool used = false;
+                for (const auto &a : taken)
+                  used = used || a.pos == p;
+                if (!used)
+                  tpos = p;
+              }
+              if (tue && tpos) {
+                devourer::cell::HoCommand cmd;
+                ho_last_id = std::max(ho_last_id + 1, version_base);
+                cmd.id = ho_last_id;
+                cmd.ue = q.ue;
+                cmd.source = cell;
+                cmd.target = *act;
+                cmd.target_ue = tue;
+                cmd.target_pos = tpos;
+                /* The UE's TA at the source (its report): the target starts there. */
+                if (ho_ta)
+                  for (const f1::UeMeas &m : sr.meas)
+                    if (m.ue == q.ue)
+                      cmd.ta_us = m.ta_us;
+                cmd.target_channel = tr.channel; /* != the source's: inter-frequency */
+                const double age_us =
+                    std::chrono::duration<double, std::micro>(now - dit->second.at).count();
+                /* Conditional: the instant is the expiry; the UE moves on its
+                 * own condition before it. */
+                cmd.effective_net_sf =
+                    sr.net_sf + static_cast<uint64_t>(age_us / sr.period_us) + (cho ? cho_window_sf : ho_lead_sf);
+                if (cho) {
+                  cmd.cond_lost_sf = cho_lost_sf;
+                  cmd.cond_margin_db = cho_margin_db;
+                  cmd.cond_ttt_ms = cho_ttt_ms;
+                }
+                cmd.tsf_delta_us = devourer::cell::ho_tsf_delta_us(sr.phase_us, sr.net_off, tr.phase_us,
+                                                                   tr.net_off, sr.period_us);
+                std::optional<devourer::cell::HomeId> home;
+                for (const f1::UeHome &h : sr.homes)
+                  if (h.ue == cmd.ue)
+                    home = h.home;
+                if (home)
+                  cmd.home = *home; /* the target records it for target_ue */
+                bool ctx_ok = false;
+                if (master && home) {
+                  const auto tk = devourer::cell::cell_key(master, cmd.target);
+                  const auto uk = devourer::cell::home_key(master, *home);
+                  const auto raw = tk ? devourer::cell::key_from_hex(*tk) : std::nullopt;
+                  if (raw && uk)
+                    if (auto cx = devourer::cell::wrap_context(hmac_sha1(*uk), cmd.id, cmd.target, *raw)) {
+                      cmd.ctx = *cx;
+                      ctx_ok = true;
+                    }
+                }
+                flights[key] = HoFlight{cmd};
+                if (forcing) {
+                  force_done = true;
+                  emit("{\"ev\":\"ran.ho_forced\",\"ue\":" + std::to_string(q.ue) + ",\"from\":" +
+                       std::to_string(cell) + ",\"to\":" + std::to_string(force->tgt) + "}");
+                }
+                ul.alias({cmd.target, cmd.target_ue}, {cmd.source, cmd.ue}); /* DAPS: one stream */
+                /* The target identity's uplink slot from the command itself:
+                 * its first uplinks come before the target's report names it,
+                 * and must map to the slot they belong to. */
+                if (cmd.target_pos >= 1 && cmd.target_pos <= tr.positions.size())
+                  ul_slot[{cmd.target, cmd.target_ue}] = {tr.phase_us, tr.period_us,
+                                                          tr.positions[cmd.target_pos - 1].ul.start_us, ms_now()};
+                if (auto d = dls.find({cmd.source, cmd.ue}); d != dls.end()) {
+                  char db[200];
+                  snprintf(db, sizeof db,
+                           "{\"ev\":\"ran.dl_cmd\",\"id\":%u,\"stream\":\"%u:%u\",\"next_sn\":%u,"
+                           "\"dup\":%d,\"backlog\":%zu}",
+                           cmd.id, cmd.source, cmd.ue, d->second.next_sn, dl_daps ? 1 : 0,
+                           dl_daps ? d->second.recent.size() : 0);
+                  emit(db);
+                }
+                if (dl_daps)
+                  if (auto d = dls.find({cmd.source, cmd.ue}); d != dls.end()) {
+                    d->second.dup = std::make_pair(cmd.target, cmd.target_ue); /* DL duplicated */
+                    /* The recent PDUs too, oldest first: a link fading before
+                     * the command may have lost them at the source. */
+                    if (auto tdu = dus.find(cmd.target); tdu != dus.end())
+                      for (uint32_t sn : d->second.recent)
+                        send(tdu->second,
+                             f1::encode_downlink({cmd.target, cmd.target_ue, d->second.epoch, sn}, mac));
+                  }
+                char b[300];
+                snprintf(b, sizeof b,
+                         "{\"ev\":\"ran.ho_cmd\",\"id\":%u,\"ue\":%u,\"from\":%u,\"to\":%u,"
+                         "\"target_ue\":%u,\"pos\":%u,\"effective_net_sf\":%llu,\"delta_us\":%lld,"
+                         "\"ctx\":%d,\"home\":\"%s\",\"ta_us\":%d,\"cond\":%d}",
+                         cmd.id, cmd.ue, cmd.source, cmd.target, cmd.target_ue, cmd.target_pos,
+                         (unsigned long long)cmd.effective_net_sf, (long long)cmd.tsf_delta_us,
+                         ctx_ok ? 1 : 0, home ? home_name(*home).c_str() : "none", cmd.ta_us,
+                         cmd.conditional() ? 1 : 0);
+                emit(b);
+              }
+            }
+          }
+        }
+      }
+      /* In flight: (re)send to both DUs until staged; conclude when the
+       * target reports the UE; give up long after the instant. */
+      /* A flight that ends without the move: the source key's A3 (frozen in
+       * flight) starts over, a new candidate needs its own time-to-trigger. */
+      auto a3_restart = [&](const devourer::cell::HoCommand &c, const char *why) {
+        if (auto h = ho.find({c.source, c.ue}); h != ho.end()) {
+          if (h->second.firing)
+            log_clear(c.ue, c.source, *h->second.firing, why);
+          ho.erase(h);
+        }
+      };
+      for (auto it = flights.begin(); it != flights.end();) {
+        HoFlight &fl = it->second;
+        auto sit = dus.find(fl.cmd.source), tit = dus.find(fl.cmd.target);
+        if (sit == dus.end() || tit == dus.end()) {
+          ul.forget({fl.cmd.target, fl.cmd.target_ue}); /* the provisional alias */
+          dl_undup(fl.cmd);
+          a3_restart(fl.cmd, "flight_lost");
+          it = flights.erase(it);
+          continue;
+        }
+        const double age_us = std::chrono::duration<double, std::micro>(now - tit->second.at).count();
+        const uint64_t tnet =
+            tit->second.rep.net_sf + static_cast<uint64_t>(age_us / tit->second.rep.period_us);
+        bool there = false;
+        for (const f1::UeMeas &q : tit->second.rep.meas)
+          there = there || (q.ue == fl.cmd.target_ue && live(tit->second, q.age_ms) &&
+                            tit->second.at - std::chrono::milliseconds(q.age_ms) > fl.at);
+        /* A conditional move happens whenever the UE decides (before the
+         * expiry): the target hearing it is the move. */
+        if (there && (fl.cmd.conditional() || tnet >= fl.cmd.effective_net_sf)) {
+          char b[220];
+          snprintf(b, sizeof b,
+                   "{\"ev\":\"ran.ho_done\",\"id\":%u,\"ue\":%u,\"from\":%u,\"to\":%u,"
+                   "\"target_ue\":%u,\"net_sf\":%llu,\"after_sf\":%lld}",
+                   fl.cmd.id, fl.cmd.ue, fl.cmd.source, fl.cmd.target, fl.cmd.target_ue,
+                   (unsigned long long)tnet, (long long)(tnet - fl.cmd.effective_net_sf));
+          emit(b);
+          moved_at[{fl.cmd.target, fl.cmd.target_ue}] = tms;
+          retired[{fl.cmd.source, fl.cmd.ue}] = tms;
+          /* The DL stream follows the UE: its sns run on at the target. */
+          if (auto node = dls.extract({fl.cmd.source, fl.cmd.ue})) {
+            node.key() = {fl.cmd.target, fl.cmd.target_ue};
+            node.mapped().dup.reset();
+            node.mapped().reported = std::chrono::steady_clock::now();
+            dls.erase(node.key());
+            const uint32_t sn = node.mapped().next_sn;
+            dls.insert(std::move(node));
+            char db[160];
+            snprintf(db, sizeof db, "{\"ev\":\"ran.dl_moved\",\"from\":\"%u:%u\",\"to\":\"%u:%u\",\"next_sn\":%u}",
+                     fl.cmd.source, fl.cmd.ue, fl.cmd.target, fl.cmd.target_ue, sn);
+            emit(db);
+          }
+          if (auto h = ho.find({fl.cmd.source, fl.cmd.ue}); h != ho.end()) {
+            if (h->second.firing)
+              log_clear(fl.cmd.ue, fl.cmd.source, *h->second.firing, "handed_over");
+            ho.erase(h);
+          }
+          it = flights.erase(it);
+          continue;
+        }
+        if (tnet > fl.cmd.effective_net_sf + 100) { /* ~10 s past: did not happen */
+          emit("{\"ev\":\"ran.ho_timeout\",\"id\":" + std::to_string(fl.cmd.id) + "}");
+          cancels[fl.cmd.id] = Cancel{fl.cmd}; /* never committed: free the target */
+          ul.forget({fl.cmd.target, fl.cmd.target_ue}); /* and its provisional alias */
+          dl_undup(fl.cmd);
+          a3_restart(fl.cmd, "timeout");
+          it = flights.erase(it);
+          continue;
+        }
+        /* Two-phase: the target first; the source (which tells the UE) only
+         * once the target has staged it, so a target that refuses never
+         * leaves a command on the air. */
+        /* Never on an unknown clock: a DU without a network superframe (not
+         * locked) gets nothing until it has one again. */
+        const uint16_t du = fl.tgt_ok ? fl.cmd.source : fl.cmd.target;
+        if (tnet < fl.cmd.effective_net_sf && !(fl.src_ok && fl.tgt_ok) &&
+            dus.at(du).rep.net_sf > 0 && tit->second.rep.net_sf > 0) {
+          fl.cmd.seq = next_seq();
+          send(dus.at(du), f1::encode_handover(du, fl.cmd, mac));
+        }
+        ++it;
+      }
+      /* Cancels: resent each round until acknowledged (5 tries). */
+      for (auto c = cancels.begin(); c != cancels.end();) {
+        auto t = dus.find(c->second.cmd.target);
+        if (t == dus.end() || ++c->second.tries > 5) {
+          emit("{\"ev\":\"ran.ho_cancel_unacked\",\"id\":" + std::to_string(c->first) + "}");
+          c = cancels.erase(c);
+          continue;
+        }
+        devourer::cell::HoCommand x = c->second.cmd;
+        x.target_pos = 0;
+        x.seq = next_seq();
+        send(t->second, f1::encode_handover(x.target, x, mac));
+        ++c;
+      }
+      /* A UE without a valid serving measurement this round: its evidence
+       * is gone, so its timers go, and a logged candidate clears. */
+      for (auto it = ho.begin(); it != ho.end();) {
+        if (seen.count(it->first)) {
+          ++it;
+          continue;
+        }
+        if (it->second.firing)
+          log_clear(it->first.second, it->first.first, *it->second.firing, "no_serving");
+        it = ho.erase(it);
+      }
+    }
+    if (now < next_plan)
+      continue;
+    next_plan = now + std::chrono::milliseconds(plan_ms);
+    /* The neighbour lists (M6 measurement gaps): each fresh DU gets every
+     * other fresh DU's channel and TBTT phase, every round. */
+    for (auto &kv : dus) {
+      if (now - kv.second.at >= std::chrono::seconds(3))
+        continue;
+      f1::Neighbours nb;
+      nb.du = kv.first;
+      nb.seq = next_seq();
+      for (const auto &ov : dus)
+        if (ov.first != kv.first && now - ov.second.at < std::chrono::seconds(3) &&
+            nb.cells.size() < devourer::cell::kMaxNeighbours)
+          nb.cells.push_back({ov.first, ov.second.rep.channel, ov.second.rep.phase_us});
+      send(kv.second, f1::encode_neighbours(nb, mac));
+      /* Per-cell keys: the other cells' UEs' own area keys (Keys.h A_u, from
+       * the homes their DUs report), each wrapped for this DU under its cell
+       * key with a fresh nonce — what it checks a heard UE beacon with. */
+      if (master) {
+        const auto dk = devourer::cell::cell_key(master, kv.first);
+        const auto du_mac = dk ? hmac_sha1(*dk) : devourer::cell::Mac{};
+        f1::AreaKeys ak;
+        ak.du = kv.first;
+        ak.seq = next_seq();
+        auto add_area_key = [&](f1::AreaKeys &a, const devourer::cell::Mac &dm, uint16_t cell,
+                                uint16_t ue, const devourer::cell::HomeId &home) {
+          if (a.keys.size() >= f1::kMaxAreaKeys || !dm)
+            return;
+          for (const auto &e : a.keys)
+            if (e.cell == cell && e.ue == ue)
+              return; /* once per identity */
+          const auto uk = devourer::cell::home_key(master, home);
+          const auto au = uk ? devourer::cell::ue_area_key(hmac_sha1(*uk)) : std::nullopt;
+          const auto raw = au ? devourer::cell::key_from_hex(*au) : std::nullopt;
+          const uint64_t nonce = area_rng();
+          if (auto w = raw ? devourer::cell::wrap_area_key(dm, cell, ue, nonce, *raw) : std::nullopt)
+            a.keys.push_back({cell, ue, nonce, *w});
+        };
+        for (const auto &ov : dus) {
+          if (ov.first == kv.first || now - ov.second.at >= std::chrono::seconds(3))
+            continue;
+          for (const f1::UeHome &h : ov.second.rep.homes)
+            add_area_key(ak, du_mac, ov.first, h.ue, h.home);
+        }
+        /* A handover's TARGET identity as soon as its command exists: the
+         * source hears the UE under it right after the switch (its DAPS
+         * window), before the target's report names it. */
+        for (const auto &f : flights) {
+          const auto &cmd = f.second.cmd;
+          if (cmd.target != kv.first && cmd.target_pos != 0 &&
+              (cmd.home.joiner || cmd.home.cell != 0))
+            add_area_key(ak, du_mac, cmd.target, cmd.target_ue, cmd.home);
+        }
+        send(kv.second, f1::encode_area_keys(ak, mac));
+      }
+    }
+    /* The keepalive, every round and whatever the planning state: every DU
+     * keeps its current schedule (a fresh sequence each send) while one
+     * DU cannot be planned (e.g. it is re-locking). Only the plan waits. */
+    for (auto &kv : dus)
+      if (kv.second.sched && now - kv.second.at < std::chrono::seconds(10)) {
+        kv.second.sched->seq = next_seq();
+        send(kv.second, f1::encode_schedule(*kv.second.sched, mac));
+      }
+
+    /* Every expected DU fresh, locked and on the network count. */
+    bool ready = true;
+    for (long id : expected) {
+      auto it = dus.find(static_cast<uint16_t>(id));
+      ready = ready && it != dus.end() && now - it->second.at < std::chrono::seconds(3) &&
+              it->second.rep.net_sf > 0 && it->second.rep.sync_state == 2;
+    }
+    if (!ready)
+      continue;
+    std::vector<CoordDu> view;
+    uint64_t net_now = 0;
+    for (long id : expected) {
+      const DuState &d = dus.at(static_cast<uint16_t>(id));
+      CoordDu c;
+      c.du = d.rep.du;
+      c.channel = d.rep.channel;
+      c.tier = static_cast<devourer::SyncTier>(d.rep.tier);
+      c.phase_us = d.rep.phase_us;
+      c.period_us = d.rep.period_us;
+      c.fixed = d.rep.fixed;
+      c.positions = d.rep.positions;
+      for (const CoordAssign &a : d.rep.ues) {
+        /* Where the UE IS going: the CU's own issued schedule, not the
+         * report — a schedule takes effect RAN_LEAD_SF ahead, more than a
+         * plan round, so the report still shows the positions before it.
+         * Planned from those, two equally good layouts were re-issued in
+         * turn every round (each move an uplink in the old slot). A UE the
+         * schedule does not name yet (a handover arrival) is where the DU
+         * reports it. */
+        uint8_t pos = a.pos;
+        if (d.sched)
+          for (const CoordAssign &s : d.sched->ues)
+            if (s.ue == a.ue)
+              pos = s.pos;
+        CoordUe u{a.ue, pos, {}};
+        for (long oid : expected) {
+          const DuState &o = dus.at(static_cast<uint16_t>(oid));
+          if (o.rep.du == c.du)
+            continue;
+          for (const f1::HeardUe &h : o.rep.heard)
+            if (h.cell == c.du && h.ue == a.ue && h.rssi_dbm >= edge_dbm)
+              u.heard_by.push_back(o.rep.du);
+        }
+        c.ues.push_back(u);
+      }
+      view.push_back(c);
+      /* The network superframe now, from the report's age. */
+      const double age_us =
+          std::chrono::duration<double, std::micro>(now - d.at).count();
+      const uint64_t est = d.rep.net_sf + static_cast<uint64_t>(age_us / d.rep.period_us);
+      net_now = std::max(net_now, est);
+    }
+    /* A channel move in flight: resent until staged; done once the DU
+     * reports the new channel at or after the instant. */
+    if (cs_flight) {
+      const DuState &d = dus.at(cs_flight->cmd.du);
+      /* A phase move is done once the report shows the phase (the channel
+       * never changed). */
+      const bool there = cs_flight->cmd.phase_us >= 0 ? d.rep.phase_us == cs_flight->cmd.phase_us
+                                                      : d.rep.channel == cs_flight->cmd.channel;
+      if (there && d.rep.net_sf >= cs_flight->cmd.effective_net_sf) {
+        emit("{\"ev\":\"ran.cs_done\",\"id\":" + std::to_string(cs_flight->cmd.id) + ",\"du\":" +
+             std::to_string(cs_flight->cmd.du) + ",\"from\":" + std::to_string(cs_flight->from) + ",\"to\":" +
+             std::to_string(cs_flight->cmd.channel) + ",\"phase_us\":" + std::to_string(cs_flight->cmd.phase_us) +
+             ",\"net_sf\":" + std::to_string(d.rep.net_sf) + "}");
+        if (cs_flight->cmd.phase_us >= 0) /* not moved again at once on a plan that drifts */
+          cs_hold[cs_flight->cmd.du] = now + std::chrono::seconds(cs_backoff_s);
+        cs_flight.reset();
+      } else if (net_now > cs_flight->cmd.effective_net_sf + 50) {
+        emit("{\"ev\":\"ran.cs_timeout\",\"id\":" + std::to_string(cs_flight->cmd.id) + "}");
+        cs_hold[cs_flight->cmd.du] = now + std::chrono::seconds(cs_backoff_s);
+        cs_flight.reset();
+      } else if (net_now + 2 < cs_flight->cmd.effective_net_sf) {
+        /* Resent until the instant, staged or not: a DU that restarted after
+         * staging lost the move, and re-stages it from this. */
+        cs_flight->cmd.seq = next_seq();
+        send(d, f1::encode_channel_switch(cs_flight->cmd, mac));
+      }
+    }
+    /* Re-phasing live cells (RAN_REPHASE): the DU whose own phase plan, the
+     * others where they are, gains the most over where it is — moved there
+     * with its UEs, if the move has an instant idle in both grids. */
+    if (rephase_on && !cs_flight && flights.empty() && now >= t0 + std::chrono::seconds(rephase_at_s)) {
+      struct Cand {
+        uint16_t du = 0;
+        int64_t to = 0;
+        double now_score = 0, new_score = 0;
+      };
+      std::optional<Cand> pick;
+      for (const auto &kv : dus) {
+        const f1::Report &r = kv.second.rep;
+        if (!fresh(kv.second.at, now) || r.phase_us < 0 || r.net_sf == 0 ||
+            (cs_hold.count(kv.first) && now < cs_hold.at(kv.first)))
+          continue;
+        std::vector<devourer::cell::PhaseCell> ex;
+        for (const auto &o : dus)
+          if (o.first != kv.first && o.second.rep.phase_us >= 0 && fresh(o.second.at, now))
+            ex.push_back(devourer::cell::phase_cell(o.first, o.second.rep.channel, o.second.rep.phase_us,
+                                                    o.second.rep.period_us, o.second.rep.fixed,
+                                                    o.second.rep.positions));
+        if (ex.empty())
+          continue;
+        devourer::cell::PhaseParams pp = phase_pp;
+        pp.period_us = r.period_us;
+        const auto me = devourer::cell::phase_cell(kv.first, r.channel, r.phase_us, r.period_us, r.fixed, r.positions);
+        double cur = 0;
+        for (const auto &e : ex)
+          if (e.period_us == 0 || e.period_us == r.period_us)
+            cur += devourer::cell::mg_detail::pair_score(me, r.phase_us, e, pp);
+        /* The best phase it can be MOVED to (an instant idle in both grids),
+         * not the best phase overall: an unreachable optimum must not hide a
+         * reachable gain. */
+        const auto plan = devourer::cell::plan_phase(me, ex, pp, [&](int64_t ph) {
+          return devourer::cell::rephase_plan(r.phase_us, ph, me.span_us, 1000, r.period_us).has_value();
+        });
+        if (plan.score - cur < rephase_min_gain || plan.phase_us == r.phase_us)
+          continue;
+        /* Ties: the highest id (the latest to join) moves; the oldest cell
+         * stays the reference. */
+        if (!pick || plan.score - cur >= pick->new_score - pick->now_score)
+          pick = Cand{kv.first, plan.phase_us, cur, plan.score};
+      }
+      if (pick) {
+        const DuState &d = dus.at(pick->du);
+        CsFlight f;
+        cs_last_id = std::max(cs_last_id + 1, version_base);
+        f.cmd = {pick->du, cs_last_id, d.rep.channel, net_now + cs_lead_sf, next_seq(),
+                 static_cast<int32_t>(pick->to)};
+        f.from = d.rep.channel;
+        cs_flight = f;
+        send(d, f1::encode_channel_switch(f.cmd, mac));
+        char b[260];
+        snprintf(b, sizeof b,
+                 "{\"ev\":\"ran.rephase\",\"id\":%u,\"du\":%u,\"from_us\":%lld,\"to_us\":%lld,"
+                 "\"score_now\":%.2f,\"score_new\":%.2f,\"effective_net_sf\":%llu}",
+                 f.cmd.id, pick->du, (long long)d.rep.phase_us, (long long)pick->to, pick->now_score,
+                 pick->new_score, (unsigned long long)f.cmd.effective_net_sf);
+        emit(b);
+      }
+    }
+    const size_t before = devourer::cell::coord_conflicts(view);
+    std::map<uint16_t, std::vector<CoordAssign>> target;
+    devourer::cell::CoordPlan p;
+    if (plan_on) {
+      /* The positions pushed are planned on the channels the DUs are on: a
+       * retune the CU only proposes (below) must not make a co-channel
+       * conflict look resolved. */
+      p = devourer::cell::coord_plan(view, {});
+      target = p.assign;
+      if (!spare.empty() && (p.unresolved || p.fixed_conflicts || !p.unseparated.empty())) {
+        const auto adv = devourer::cell::coord_plan(view, spare);
+        static std::string last_adv; /* log a proposal once, not every round */
+        std::string txt;
+        for (uint16_t du : adv.retuned)
+          txt += "{\"ev\":\"ran.retune\",\"du\":" + std::to_string(du) + ",\"channel\":" +
+                 std::to_string(adv.channel.at(du)) + ",\"applied\":0}\n";
+        if (!txt.empty() && txt != last_adv) {
+          last_adv = txt;
+          fputs(txt.c_str(), stdout);
+          fflush(stdout);
+        }
+        /* Applied (RAN_RETUNE_APPLY): one DU at a time, none in a handover. */
+        const bool held = !adv.retuned.empty() && cs_hold.count(adv.retuned.front()) &&
+                          now < cs_hold.at(adv.retuned.front());
+        if (retune_apply && !cs_flight && flights.empty() && !adv.retuned.empty() && !held) {
+          const uint16_t du = adv.retuned.front();
+          const DuState &d = dus.at(du);
+          CsFlight f;
+          cs_last_id = std::max(cs_last_id + 1, version_base);
+          f.cmd = {du, cs_last_id, adv.channel.at(du), net_now + cs_lead_sf, next_seq()};
+          f.from = d.rep.channel;
+          cs_flight = f;
+          send(d, f1::encode_channel_switch(f.cmd, mac));
+          emit("{\"ev\":\"ran.cs_cmd\",\"id\":" + std::to_string(f.cmd.id) + ",\"du\":" + std::to_string(du) +
+               ",\"from\":" + std::to_string(f.from) + ",\"to\":" + std::to_string(f.cmd.channel) +
+               ",\"effective_net_sf\":" + std::to_string(f.cmd.effective_net_sf) + "}");
+        }
+      }
+    } else {
+      for (const CoordDu &c : view)
+        for (const CoordUe &u : c.ues)
+          target[c.du].push_back({u.ue, u.pos});
+    }
+    std::vector<CoordDu> after_view = view;
+    for (CoordDu &c : after_view)
+      for (size_t k = 0; k < c.ues.size(); ++k)
+        c.ues[k].pos = target[c.du][k].pos;
+    const size_t after = devourer::cell::coord_conflicts(after_view);
+    static std::string last_plan;
+    std::string pl = "{\"ev\":\"ran.plan\",\"net_sf\":" + std::to_string(net_now) +
+                     ",\"conflicts_now\":" + std::to_string(before) + ",\"conflicts_planned\":" +
+                     std::to_string(after) + ",\"moved\":" + std::to_string(p.moved) +
+                     ",\"unresolved\":" + std::to_string(p.unresolved) + ",\"fixed_conflicts\":" +
+                     std::to_string(p.fixed_conflicts) + ",\"unseparated\":" +
+                     std::to_string(p.unseparated.size()) + ",\"edges\":{";
+    bool firstk = true;
+    for (const CoordDu &c : view)
+      for (const CoordUe &u : c.ues)
+        for (uint16_t o : u.heard_by) {
+          pl += std::string(firstk ? "" : ",") + "\"" + std::to_string(c.du) + "/" +
+                std::to_string(u.ue) + "\":" + std::to_string(o);
+          firstk = false;
+        }
+    pl += "}}";
+    if (pl.substr(pl.find("\"conflicts_now\"")) != last_plan) { /* log on change */
+      last_plan = pl.substr(pl.find("\"conflicts_now\""));
+      emit(pl);
+    }
+
+    /* Changed DUs: new versions, one network-wide instant. */
+    const uint64_t eff = net_now + lead_sf;
+    for (const CoordDu &c : view) {
+      DuState &d = dus.at(c.du);
+      const auto &want = target[c.du];
+      /* Not while it is a handover's source or target: a schedule instant
+       * in the arrival's publish window would cost it the arrival (a DU
+       * publishes one instant at a time). Re-planned once it concludes. */
+      bool in_flight = false;
+      for (const auto &fl : flights)
+        in_flight = in_flight || fl.second.cmd.source == c.du || fl.second.cmd.target == c.du;
+      if (in_flight)
+        continue;
+      if (!d.sched || d.sched_refused || d.sched->ues != want) {
+        /* Above anything this CU issued AND anything the DU reports applied
+         * or staged (a restarted CU, or a DU that outlived several CUs). */
+        uint32_t &v = version[c.du];
+        v = std::max({v ? v + 1 : version_base, d.rep.applied_version + 1,
+                      d.rep.staged_version + 1});
+        d.sched = f1::Schedule{c.du, v, eff, next_seq(), want};
+        d.sched_refused = false;
+        emit("{\"ev\":\"ran.schedule\",\"du\":" + std::to_string(c.du) + ",\"version\":" +
+             std::to_string(d.sched->version) + ",\"effective_net_sf\":" + std::to_string(eff) +
+             ",\"net_sf\":" + std::to_string(net_now) + ",\"ues\":" + assign_json(want) + "}");
+        send(d, f1::encode_schedule(*d.sched, mac));
+      }
+    }
+  }
+  emit("{\"ev\":\"ran.done\"}");
+  close(fd);
+  return 0;
+}
