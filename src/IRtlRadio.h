@@ -230,6 +230,14 @@ public:
   virtual uint32_t GetTxDmaStatus() { return 0; }
   /* True where GetTxDmaStatus reads the real latch (Jaguar2, Jaguar3). */
   virtual bool HasTxDmaStatus() const { return false; }
+  /* Set the wide-TX IGI floor (raw IGI, 0 = off) at run time. It applies under
+   * the same rule as DeviceConfig::Tuning::wide_tx_igi_floor: after the
+   * session's first 40 MHz or wider frame, while tuned that wide; every retune
+   * re-applies it. Takes effect at once both ways (raised or lowered, IGI is
+   * clamped immediately). Callable from any thread, including while another
+   * thread is blocked in a bulk-OUT send. Returns false where unsupported or
+   * for a value the chip cannot take (Jaguar3: above 0x7f). */
+  virtual bool SetWideTxIgiFloor(uint8_t floor) { (void)floor; return false; }
   /* The MAC registers in the rtl88x2cu vendor driver's /proc/.../
    * mac_reg_dump layout: the same two ranges it dumps on the 88xx parts,
    * 0x0000..0x07FF and 0x1000..0x17FF, a "======= MAC REG =======" banner,
