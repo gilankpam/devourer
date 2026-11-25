@@ -5,6 +5,7 @@
  * built by hand from the register map, and every bit OUTSIDE the fields is
  * checked to round-trip from the current register value. */
 #include "jaguar3/NhmBusyMath.h"
+#include "NoiseFloorMath.h"
 
 #include <cstdio>
 
@@ -42,11 +43,29 @@ int main() {
   CHECK((q.w1e60 & 0xf00u) == 0x100u);
   CHECK((q.w1e60 & 0x2u) == 0);
   CHECK((q.w1e60 & 0xffff0000u) == ((11u << 24) | (10u << 16)));
+  // Period per BB tick: 4/8/16 us at 20/10/5 MHz, clamped to [1, 65535].
+  CHECK(nhm_period_for_us(240000, 0) == 60000);
+  CHECK(nhm_period_for_us(240000, 1) == 30000);   // 10 MHz: 8 us tick
+  CHECK(nhm_period_for_us(240000, 2) == 15000);   // 5 MHz: 16 us tick
+  CHECK(nhm_period_for_us(1, 0) == 1);
+  CHECK(nhm_period_for_us(300000, 0) == 0xffff);
+  CHECK(nhm_period_for_us(300000, 1) == 37500);   // fits at 8 us
   // Result parse.
   const NhmResult r = parse_nhm_result(0x0001002a, 0x04030201, 0x08070605, 0x0c0b0a09);
   CHECK(r.ready && r.duration == 0x2a);
   for (int i = 0; i < 12; ++i) CHECK(r.buckets[i] == i + 1);
   CHECK(!parse_nhm_result(0x0000002a, 0, 0, 0).ready);
+  // Absolute table: PWdB U(8,1) = 2*(dBm+110), strictly rising, and the
+  // bucket lookup the busy share is read from.
+  using namespace devourer::nf;
+  uint8_t ath[11];
+  nhm_abs_thresholds(ath);
+  CHECK(ath[0] == 12 && ath[7] == 54 && ath[10] == 80);  // -104, -83, -70 dBm
+  for (int i = 1; i < 11; ++i) CHECK(ath[i] > ath[i - 1]);
+  CHECK(nhm_abs_bucket_from(-104) == 1);
+  CHECK(nhm_abs_bucket_from(-83) == 8);
+  CHECK(nhm_abs_bucket_from(-70) == 11);
+  CHECK(nhm_abs_bucket_from(-84) == -1);  // not an edge
   if (fails) return 1;
   std::printf("nhm_busy_selftest OK\n");
   return 0;

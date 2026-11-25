@@ -1,10 +1,10 @@
 /* Pure register arithmetic for RtlJaguar3Device::ArmNhmBusy/ReadNhmBusy:
  * the busy-airtime NHM recipe (inc_cca on, inc_tx off, absolute dBm
  * thresholds) composed as FULL dwords from the registers' current values,
- * so the arm path is a batched write group with no masked read-modify-
- * write (JGR3 double-shift gotcha, jaguar3/CLAUDE.md). NhmReader.h's
- * polling readers (masked writes + a sleeping poll) are deliberately not
- * built on this. */
+ * so the arm path is plain 32-bit writes: no per-field read-modify-write and
+ * no value to pass relative to its mask (the trap NhmReader.h's th[8..10]
+ * comment describes). NhmReader.h's polling readers (masked writes + a
+ * sleeping poll) are deliberately not built on this. */
 #ifndef DEVOURER_JAGUAR3_NHM_BUSY_MATH_H
 #define DEVOURER_JAGUAR3_NHM_BUSY_MATH_H
 
@@ -45,6 +45,16 @@ inline NhmProgram compose_nhm_program(uint32_t cur_1e40, uint32_t cur_1e5c,
   return p;
 }
 
+/* The engine tick follows the baseband clock: 4 us at 20 MHz and wider,
+ * 8 us at 10 MHz, 16 us at 5 MHz (tick_shift 0/1/2; the vendor's
+ * phydm_nhm_set shifts its period the same way). Period for a window of
+ * window_us, clamped to the 16-bit field's [1, 65535]; the armed window is
+ * period * (4 << tick_shift) us. */
+inline uint16_t nhm_period_for_us(uint32_t window_us, unsigned tick_shift) {
+  const uint32_t t = window_us / (4u << tick_shift);
+  return static_cast<uint16_t>(t < 1 ? 1 : t > 0xffffu ? 0xffffu : t);
+}
+
 /* 0x1e40 with only the period field [31:16] replaced (re-arm path). */
 inline uint32_t nhm_with_period(uint32_t w1e40, uint16_t period) {
   return (w1e40 & 0x0000ffffu) | (static_cast<uint32_t>(period) << 16);
@@ -62,7 +72,7 @@ struct NhmResult {
 };
 
 /* Decode a finished window: 0x2d4c[16] = ready, 0x2d4c[15:0] = duration
- * (4 us units), 0x2d40/44/48 = buckets 0..11, LSB-first. */
+ * (engine ticks, see nhm_period_for_us), 0x2d40/44/48 = buckets 0..11, LSB-first. */
 inline NhmResult parse_nhm_result(uint32_t r2d4c, uint32_t r2d40,
                                   uint32_t r2d44, uint32_t r2d48) {
   NhmResult r;

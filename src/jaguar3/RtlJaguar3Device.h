@@ -227,6 +227,8 @@ public:
    * floor from a second, absolute-threshold NHM window (the vendor ACS
    * recipe; NoiseFloorMath.h) — this generation has no idle-noise report. */
   RxEnergy GetRxEnergy(bool with_nhm) override;
+  uint32_t ArmNhmBusy(uint32_t window_us) override;
+  NhmBusy ReadNhmBusy() override;
 
   /* Frame-free scout read (see IRtlRadio::GetRxEnergyScout) — 8 reads then
    * a 4-write composed reset, 12 EP0 transfers in TWO batched groups (the
@@ -240,11 +242,7 @@ public:
    * comment. */
   RxEnergy GetRxEnergyScout() override;
 
-  /* Busy-airtime NHM window and RF18 channel readback — contracts on
-   * IRtlRadio, caveats (counter-reset collisions, frozen estimate, recipe
-   * cache invalidation) in jaguar3/CLAUDE.md "Busy-airtime NHM". */
-  bool ArmNhmBusy(uint16_t period_4us) override;
-  NhmBusy ReadNhmBusy() override;
+  /* RF18 channel readback — contract on IRtlRadio. */
   int ReadTunedCentral() override;
 
   /* Bench/debug-only raw BB register peek (tests/scout_read_bench.cpp's
@@ -304,6 +302,28 @@ public:
   bool should_stop = false;
 
 private:
+  /* This generation's CCX map and register access, under its locks — see
+   * IRtlRadio::with_ccx. Private: the base class calls it, nobody else. */
+  bool with_ccx(const CcxFn &fn) override {
+    /* Nothing to lend before bring-up: the BB is not programmed, and a
+     * window armed against it would be forgotten by Init/InitWrite's reset. */
+    if (!_brought_up)
+      return false;
+    std::lock_guard<std::mutex> reg(_reg_mu);
+    std::lock_guard<std::mutex> ccx(busy_window_mutex());
+    /* A CLM arm rewrites CCX dwords the busy-NHM recipe cache holds
+     * (period low half, ctrl bit0): recompose it on the next ArmNhmBusy. */
+    nhm_busy_forget();
+    const Read32 rd = [this](uint16_t a) {
+      return _device.rtw_read<uint32_t>(a);
+    };
+    const SetBb wr = [this](uint16_t a, uint32_t m, uint32_t v) {
+      _device.phy_set_bb_reg(a, m, v);
+    };
+    fn(devourer::nhm_regs_jgr3(), rd, wr);
+    return true;
+  }
+
   /* Maps ChannelWidth_t to the devourer RX bw code (0/1/2 = 20/40/80 MHz),
    * for _rx_bw_code below. Explicit switch rather than a cast: the enum's
    * numeric values happen to line up today (CHANNEL_WIDTH_20/40/80 = 0/1/2)
@@ -318,28 +338,6 @@ private:
     default:
       return 0;
     }
-  }
-
-  /* This generation's CCX map and register access, under its locks — see
-   * IRtlRadio::with_ccx. Private: the base class calls it, nobody else. */
-  bool with_ccx(const CcxFn &fn) override {
-    /* Nothing to lend before bring-up: the BB is not programmed, and a
-     * window armed against it would be forgotten by Init/InitWrite's reset. */
-    if (!_brought_up)
-      return false;
-    std::lock_guard<std::mutex> reg(_reg_mu);
-    std::lock_guard<std::mutex> ccx(busy_window_mutex());
-    /* A CLM arm rewrites the CCX dwords the busy-NHM recipe cache holds
-     * (period low half, ctrl bit0): recompose it on the next ArmNhmBusy. */
-    _nhm_busy_ready = false;
-    const Read32 rd = [this](uint16_t a) {
-      return _device.rtw_read<uint32_t>(a);
-    };
-    const SetBb wr = [this](uint16_t a, uint32_t m, uint32_t v) {
-      _device.phy_set_bb_reg(a, m, v);
-    };
-    fn(devourer::nhm_regs_jgr3(), rd, wr);
-    return true;
   }
 
   /* Parse one send_packet-contract buffer (radiotap + 802.11) and build its
@@ -472,9 +470,19 @@ private:
   bool _brought_up = false;
   /* Busy-NHM recipe cache (ArmNhmBusy): the composed 0x1e40/0x1e60 dwords
    * once the recipe is programmed. Cleared by anything else that programs
-   * NHM (GetRxEnergy with_nhm) and by a full channel set / InitWrite. */
+   * the CCX engine (GetRxEnergy with_nhm, a CLM arm via with_ccx), by a full
+   * channel set, FastSetBandwidth, Stop and Init/InitWrite.
+   * The four fields below are guarded by busy_window_mutex(). */
   bool _nhm_busy_ready = false;
   uint32_t _nhm_busy_1e40 = 0, _nhm_busy_1e60 = 0;
+  /* A window armed by ArmNhmBusy whose result still describes the current
+   * channel: ReadNhmBusy answers only while it is set. A hop clears it but
+   * keeps the recipe (the hop does not touch 0x1e40/0x1e60). */
+  bool _nhm_busy_armed = false;
+  void nhm_busy_forget() {
+    _nhm_busy_ready = false;
+    _nhm_busy_armed = false;
+  }
   /* Rolling per-frame RX link-quality aggregate (GetRxQuality). */
   devourer::RxQualityAccumulator _rxq;
   devourer::RxPathActivityAccumulator _rxpaths;
