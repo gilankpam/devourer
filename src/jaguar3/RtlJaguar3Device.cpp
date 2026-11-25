@@ -3118,13 +3118,14 @@ size_t RtlJaguar3Device::build_tx_block(const uint8_t *packet, size_t length,
    * (_wide_tx_seen) and apply the IGI floor (DeviceConfig::Tuning::
    * wide_tx_igi_floor / SetWideTxIgiFloor; with a floor of 0 the apply writes
    * nothing, so a session that never sets one is unchanged) for the CURRENT
-   * tune before the frame is queued — on a quiet channel the MAC would otherwise hold it
-   * forever. Whether the floor is on follows the tuned width, which is read
-   * under _reg_mu here and by every retune (apply_igi_floor_locked), so a
-   * retune racing this frame either runs first and is seen here, or runs
-   * after and sees the flag. The flag is published only after the floor is
-   * applied, so a concurrent sender cannot skip ahead of it. One _reg_mu take
-   * per session, whatever the tuned width — the hot path stays lock-free. */
+   * tune before the frame is queued — on a quiet channel the MAC would
+   * otherwise hold it forever. Whether the floor is on follows the tuned
+   * width, which is read under _reg_mu here and by every retune
+   * (apply_igi_floor_locked), so a retune racing this frame either runs first
+   * and is seen here, or runs after and sees the flag. The flag is published
+   * only after the floor is applied, so a concurrent sender cannot skip ahead
+   * of it. One _reg_mu take per session, whatever the tuned width — the hot
+   * path stays lock-free. */
   const bool wide_frame =
       bwidth == CHANNEL_WIDTH_40 || bwidth == CHANNEL_WIDTH_80;
   const bool c_die = _variant == jaguar3::ChipVariant::C8822C;

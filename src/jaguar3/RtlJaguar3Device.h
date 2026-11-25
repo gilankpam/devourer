@@ -407,7 +407,8 @@ private:
   }
   std::atomic<bool> _wide_tx_seen{false};
   /* The live floor: starts at _cfg.tuning.wide_tx_igi_floor, moved by
-   * SetWideTxIgiFloor. Read lock-free by build_tx_block's arm path. */
+   * SetWideTxIgiFloor under _reg_mu. Read only by apply_igi_floor_locked,
+   * under _reg_mu (or in pre-coex bring-up). */
   std::atomic<uint8_t> _wide_tx_igi_floor{_cfg.tuning.wide_tx_igi_floor};
   SelectedChannel _channel{};
   /* Mirrors _channel.ChannelWidth as a devourer bw code (0/1/2 = 20/40/80 MHz)
