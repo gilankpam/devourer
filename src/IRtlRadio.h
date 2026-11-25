@@ -236,7 +236,11 @@ public:
    * re-applies it. Takes effect at once both ways (raised or lowered, IGI is
    * clamped immediately). Callable from any thread, including while another
    * thread is blocked in a bulk-OUT send. Returns false where unsupported or
-   * for a value the chip cannot take (Jaguar3: above 0x7f). */
+   * for a value the chip cannot take (Jaguar3: above 0x7f).
+   *
+   * THROWS on a failed USB transfer (the IGI read-modify-write is a register
+   * access) - catch it. The new floor is recorded before any register access,
+   * so a throw leaves it set and the periodic DIG tick enforces it. */
   virtual bool SetWideTxIgiFloor(uint8_t floor) { (void)floor; return false; }
   /* The MAC registers in the rtl88x2cu vendor driver's /proc/.../
    * mac_reg_dump layout: the same two ranges it dumps on the 88xx parts,
