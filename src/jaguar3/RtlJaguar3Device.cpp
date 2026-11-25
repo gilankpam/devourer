@@ -2524,6 +2524,17 @@ bool RtlJaguar3Device::SetWideTxIgiFloor(uint8_t floor) {
   return true;
 }
 
+bool RtlJaguar3Device::GetTxQueuePages(uint16_t& free_pages,
+                                       uint16_t& total_pages) {
+  /* REG_FIFOPAGE_INFO_5 (PUB): free pages in bits 27:16, configured in 11:0
+   * (see DumpChipState). */
+  std::lock_guard<std::mutex> lk(_reg_mu);
+  const uint32_t v = _device.rtw_read<uint32_t>(0x0240);
+  total_pages = v & 0x0fff;
+  free_pages = (v >> 16) & 0x0fff;
+  return true;
+}
+
 uint32_t RtlJaguar3Device::GetTxDmaStatus() {
   /* Serialized on _reg_mu against the coex runtime tick and every other
    * register-touching control call. A failed transfer still throws. */

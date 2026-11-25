@@ -87,6 +87,7 @@ public:
   uint32_t GetTxDmaStatus() override;
   bool HasTxDmaStatus() const override { return true; }
   bool SetWideTxIgiFloor(uint8_t floor) override;
+  bool GetTxQueuePages(uint16_t& free_pages, uint16_t& total_pages) override;
   /* Serialized on _reg_mu against the coex runtime tick for the whole dump
    * (~1024 register reads, so it holds the tick off that long - a diagnostic
    * cost). */
