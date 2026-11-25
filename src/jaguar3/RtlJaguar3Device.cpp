@@ -1497,7 +1497,9 @@ RxEnergy RtlJaguar3Device::GetRxEnergy(bool with_nhm) {
     ccx.lock();
     busy_window_note_nhm_read();
     nhm_busy_forget(); /* read_nhm reprograms the busy-NHM recipe */
-    devourer::read_nhm(devourer::nhm_regs_jgr3(), e.igi, rd, set_bb, e);
+    devourer::read_nhm(devourer::nhm_regs_jgr3(), e.igi, rd, set_bb, e,
+                       devourer::nhm_sample_period(ccx_tick_shift_now()),
+                       ccx_tick_shift_now());
   }
 
   /* DEVOURER_RX_NOISE_FLOOR — active/frame-free absolute floor. Jaguar3 has no
@@ -1825,9 +1827,7 @@ uint32_t RtlJaguar3Device::ArmNhmBusy(uint32_t window_us) {
   if (!_brought_up || window_us == 0)
     return 0;
   /* The CCX tick follows the BB clock: 8 us at 10 MHz, 16 us at 5 MHz. */
-  const unsigned tick_shift = _channel.ChannelWidth == CHANNEL_WIDTH_10  ? 1
-                              : _channel.ChannelWidth == CHANNEL_WIDTH_5 ? 2
-                                                                         : 0;
+  const unsigned tick_shift = ccx_tick_shift_now();
   const uint16_t period = devourer::jgr3::nhm_period_for_us(window_us, tick_shift);
   /* The NHM trigger re-arms the shared CCX engine, which destroys an armed
    * CLM busy window on this map: note it under the CCX lock, as GetRxEnergy
