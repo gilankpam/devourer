@@ -147,7 +147,11 @@ int main(int argc, char **argv) {
   if (!dev)
     return 1;
   const ChannelWidth_t bwe = bw == 40 ? CHANNEL_WIDTH_40 : CHANNEL_WIDTH_20;
+  /* 40 MHz on 5 GHz: the standard pairing (36/40, 44/48, ..., 157/161), so
+   * the upper channel of a pair is HT40- (offset 2) and the lower HT40+. */
+  const bool ht40_minus = bw == 40 && channel >= 36 && ((channel - 36) / 4) % 2;
   dev->InitWrite(SelectedChannel{.Channel = static_cast<uint8_t>(channel),
+                                 .ChannelOffset = static_cast<uint8_t>(ht40_minus ? 2 : 0),
                                  .ChannelWidth = bwe});
   if (!dev->CrossPathSupported()) {
     std::fprintf(stderr, "cross-path capture unsupported on this adapter\n");
