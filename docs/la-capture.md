@@ -148,6 +148,9 @@ The caller's obligations:
   keeps its full-layout address, which sits inside the capture window during
   the half layout.
 - The chip stays on one channel and width for the whole session.
+- No CW tone runs during a session: it makes the flat index override
+  refuse, so captures and the end-of-session restore would not apply.
+  `CrossPathSupported()` is false while one is active.
 
 ## Risks
 

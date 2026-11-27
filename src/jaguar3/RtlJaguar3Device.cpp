@@ -551,6 +551,9 @@ RtlJaguar3Device::~RtlJaguar3Device() {
     CrossPathEnd();
   } catch (...) {
   }
+  /* Destroy the session now, while _reg_mu (declared after it) is alive: an
+   * end() that threw leaves it open, and its destructor retries end(). */
+  _xp.reset();
 #endif
   /* Inert on this generation (its send path is synchronous), but the invariant
    * belongs to every device: nothing gets released while a transfer the
@@ -2370,8 +2373,10 @@ devourer::LaResult RtlJaguar3Device::la_capture(const devourer::LaParams &p) {
 #if defined(DEVOURER_HAVE_JAGUAR3_8822E)
 bool RtlJaguar3Device::CrossPathSupported() {
   const uint8_t rfe = _hal.rfe_type();
+  /* A CW tone makes SetTxPowerIndexOverride refuse: captures would run at an
+   * index never applied. */
   return _variant == jaguar3::ChipVariant::C8822E && rfe >= 21 && rfe <= 24 &&
-         _brought_up;
+         _brought_up && !_cw_active;
 }
 
 bool RtlJaguar3Device::CrossPathBegin(ChannelWidth_t bw) {

@@ -152,6 +152,8 @@ int main() {
     fake->write_delay_us = 300;
     std::vector<std::string> log;
     std::atomic<size_t> send_count{0}, sends_seen_while_listener_inactive{0};
+    int cur_index = 77, get_index_count = 0;
+    uint32_t gain_at_capture = 0;
     bool relayout_fails = false, capture_times_out = false;
     LaParams last;
     jaguar3::CrossPathListener8822e listener(RtlAdapter(fake, std::make_shared<Logger>()));
@@ -163,11 +165,18 @@ int main() {
                       " listener=" + (l->active() ? "1" : "0"));
         return !relayout_fails;
       };
-      io.get_index = [] { return 77; };
-      io.set_index = [&](int i) { log.push_back("set_index " + std::to_string(i)); };
+      io.get_index = [&] {
+        ++get_index_count;
+        return cur_index;
+      };
+      io.set_index = [&](int i) {
+        cur_index = i;
+        log.push_back("set_index " + std::to_string(i));
+      };
       io.capture = [&](const LaParams &p) {
         log.push_back("capture");
         last = p;
+        gain_at_capture = fake->regs[0x4c00];
         LaResult r;
         if (capture_times_out) {
           r.poll_timeout = true;
@@ -192,6 +201,7 @@ int main() {
     CHECK(!s.park(true) && !s.capture(60, 0, out) && log.empty()); // no session open
     CHECK(!s.begin(CHANNEL_WIDTH_80) && !s.begin(CHANNEL_WIDTH_10) && log.empty());
     CHECK(s.begin(CHANNEL_WIDTH_20) && s.active());
+    CHECK(get_index_count == 1);
     CHECK(log[0] == "relayout half listener=0");
     while (send_count < 3) sleep_ms(1);
     CHECK(sends_seen_while_listener_inactive == 0);
@@ -208,7 +218,10 @@ int main() {
     CHECK(log.empty());
 
     CHECK(s.begin(CHANNEL_WIDTH_20));
+    CHECK(get_index_count == 2);
+    log.clear();
     CHECK(!s.begin(CHANNEL_WIDTH_40));
+    CHECK(log.empty() && get_index_count == 2); // the refused begin wrote nothing
     CHECK(s.width() == CHANNEL_WIDTH_20 && s.active() && listener.active());
 
     relayout_fails = true;
@@ -225,6 +238,7 @@ int main() {
     CHECK(out.size() == 8192 && !out[0].bad);
     CHECK((log == std::vector<std::string>{"set_index 60", "capture"}));
     CHECK(fake->to(0x4108).back() == kCrossPathGainWord[1]);
+    CHECK(gain_at_capture == (kCrossPathGainWord[1] & 0xfffff)); // gain written before the capture
     log.clear();
     CHECK(s.capture(60, 2, out));
     CHECK((log == std::vector<std::string>{"capture"})); // same index: no re-set
