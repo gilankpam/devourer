@@ -19,6 +19,9 @@
 #include "RadioManagementJaguar3.h"
 #include "PhydmRuntimeJaguar3.h"
 #include "TxPktPwrBanks.h"
+#if defined(DEVOURER_HAVE_JAGUAR3_8822E)
+#include "CrossPath8822e.h"
+#endif
 
 /* RtlJaguar3Device is the orchestrator for the Realtek "Jaguar3" 802.11ac family
  * — RTL8822CU, RTL8812EU, RTL8822EU. It is the Jaguar3 sibling of
@@ -299,6 +302,18 @@ public:
   devourer::LaResult la_capture(const devourer::LaParams &p);
   bool la_capture_wedged() const { return _la && _la->is_wedged(); }
 
+#if defined(DEVOURER_HAVE_JAGUAR3_8822E)
+  /* Cross-path capture (IRtlRadio): 8822E, rfe_type 21..24, after bring-up.
+   * Register work serializes on _reg_mu per step, never across the session;
+   * the probe train sends through send_packet. */
+  bool CrossPathSupported() override;
+  bool CrossPathBegin(ChannelWidth_t bw) override;
+  bool CrossPathPark(bool parked) override;
+  bool CrossPathCapture(int tx_index, int gain,
+                        std::vector<devourer::IqSample> &out) override;
+  bool CrossPathEnd() override;
+#endif
+
   bool should_stop = false;
 
 private:
@@ -389,6 +404,13 @@ private:
   jaguar3::HalJaguar3 _hal;
   /* Lazy LA-mode capture helper (la_capture). */
   std::unique_ptr<devourer::LaCapture> _la;
+#if defined(DEVOURER_HAVE_JAGUAR3_8822E)
+  /* Built by the first CrossPathBegin; the session refers to the listener. */
+  std::unique_ptr<jaguar3::CrossPathListener8822e> _xp_listener;
+  std::unique_ptr<jaguar3::CrossPathSession> _xp;
+  /* _wide_tx_seen as CrossPathBegin found it. */
+  bool _xp_wide_tx_seen = false;
+#endif
   jaguar3::RadioManagementJaguar3 _radioManagement;
   /* phydm dynamic mechanisms (FA/DIG/CCK-PD/EDCCA), ticked from the coex
    * thread every ~2 s like the vendor watchdog. */
@@ -396,7 +418,8 @@ private:
   /* Wide-TX IGI floor policy (DeviceConfig::Tuning::wide_tx_igi_floor, both
    * dies). _wide_tx_seen records that this session has transmitted a
    * >= 40 MHz frame (build_tx_block, set once); it is cleared by Init,
-   * InitWrite and Stop, and nothing else. While it is set the floor follows
+   * InitWrite and Stop, and by CrossPathEnd when the session's own probe set
+   * it, and nothing else. While it is set the floor follows
    * the TUNED width: on at 40/80 MHz, off (IGI clamped back into the normal
    * window) at any narrower width. A session that only receives at 40 MHz,
    * or only transmits 20 MHz frames into a 40 MHz channel as a ground

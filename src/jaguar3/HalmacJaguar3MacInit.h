@@ -62,7 +62,15 @@ public:
    * downloaded and BCN_HEAD points. Valid after init_mac_cfg. */
   uint16_t rsvd_boundary() const { return _rsvd_boundary; }
 
+  /* Re-lay the TX packet buffer at run time: the full 256 KB, or with `half`
+   * only the lower half (the upper half is then free for the LA capture
+   * window). The caller guarantees a drained TX queue. REG_CR bit 2 is
+   * pulsed off/on first, then the queue page configuration runs; the MAC
+   * TRX init is not re-run. Updates rsvd_boundary(). */
+  bool relayout_tx_buffer(bool half);
+
 private:
+  bool _tx_half = false;
   bool init_trx_cfg();
   bool priority_queue_cfg();
   void init_h2c();

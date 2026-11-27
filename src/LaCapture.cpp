@@ -1,6 +1,8 @@
 #include "LaCapture.h"
 
+#include <algorithm>
 #include <chrono>
+#include <cstring>
 #include <thread>
 
 namespace devourer {
@@ -243,6 +245,38 @@ void LaCapture::readback(const LaParams &p, LaResult &r) {
 
   r.samples.reserve(count);
   uint32_t page = 0xFFFFFFFFu;
+  if (p.block_len > 0) {
+    uint8_t buf[256];
+    const uint32_t blk = std::min<uint32_t>(p.block_len, sizeof buf) & ~7u;
+    uint32_t left = count;
+    while (blk && left) {
+      if (addr >= buf_end)
+        addr = buf_start; /* ring */
+      const uint32_t pg = addr >> 12;
+      if (pg != page) {
+        page = pg;
+        _device.rtw_write16(kRegTxffPage, static_cast<uint16_t>(0x780 + pg));
+      }
+      const uint32_t n =
+          std::min({blk, 0x1000u - (addr & 0xfff), left * 8});
+      const int rc = _device.read_block(
+          static_cast<uint16_t>(kTxffWindow + (addr & 0xfff)), buf,
+          static_cast<int>(n));
+      if (rc != static_cast<int>(n)) {
+        _logger->error("LaCapture: block read rc={} want {}", rc, n);
+        r.samples.clear();
+        return;
+      }
+      for (uint32_t i = 0; i < n; i += 8) { /* little-endian 8-byte words */
+        uint64_t w;
+        std::memcpy(&w, buf + i, 8);
+        r.samples.push_back(w);
+      }
+      addr += n;
+      left -= n / 8;
+    }
+    return;
+  }
   for (uint32_t i = 0; i < count; i++) {
     if (addr >= buf_end)
       addr = buf_start; /* ring */
@@ -260,12 +294,32 @@ void LaCapture::readback(const LaParams &p, LaResult &r) {
 }
 
 LaResult LaCapture::run(const LaParams &p) {
-  LaResult r;
   if (_wedged) {
+    LaResult r;
     r.wedged = true;
     return r;
   }
+  try {
+    return run_once(p);
+  } catch (...) {
+    /* A failed control transfer throws. Put back whatever the snapshot holds
+     * so the next run does not snapshot a half-armed LA block; snapshot()
+     * empties it first, so nothing is written when the throw came before
+     * any register was read. */
+    _logger->error("LaCapture: register I/O failed mid-capture; restoring");
+    if (!_saved.empty()) {
+      try {
+        restore();
+      } catch (...) {
+        _logger->error("LaCapture: restore after a failed capture failed too");
+      }
+    }
+    return LaResult{};
+  }
+}
 
+LaResult LaCapture::run_once(const LaParams &p) {
+  LaResult r;
   snapshot();
   if (p.buff_all && _regs.full_buff_capable)
     set_reg(kRegLaConf, 1u << 30, 1);

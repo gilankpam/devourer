@@ -9,6 +9,7 @@
 
 #include <cstdio>
 #include <memory>
+#include <vector>
 
 namespace {
 
@@ -130,6 +131,16 @@ int main() {
    * this is the false positive the dynamic_cast used to produce. */
   check(!rtl->GetChannelBusy().valid,
         "a Realtek radio with no GetRxEnergy reports no channel-busy reading");
+
+  {
+    std::vector<devourer::IqSample> v(3);
+    check(!rtl->CrossPathSupported() && !rtl->CrossPathBegin(CHANNEL_WIDTH_20) &&
+              !rtl->CrossPathPark(true),
+          "CrossPath defaults refuse");
+    check(!rtl->CrossPathCapture(60, 0, v) && v.empty(),
+          "CrossPathCapture default refuses and clears out");
+    check(rtl->CrossPathEnd(), "CrossPathEnd default (no session) returns true");
+  }
 
   check(!rtl->SetCcaGates(true, true), "SetCcaGates default refuses");
   bool primary = true, edcca = true; /* poison: a refusal must not write */

@@ -263,6 +263,8 @@ add_library(devourer
     # all three generations (LaRegs carries the per-chip parameters).
     src/LaCapture.cpp
     src/LaCapture.h
+    src/CrossPathCapture.cpp
+    src/CrossPathCapture.h
     # phydm check_positive table walker — shared by Jaguar1 and Jaguar2
     # (both use the older addr/value + check_positive table format).
     src/PhyTableLoader.cpp
@@ -467,7 +469,9 @@ if(DEVOURER_JAGUAR3_8822E)
         hal/hal8822e_fw.c hal/hal8822e_fw.h
         hal/phydm/rtl8822e/Hal8822e_PhyTables.c hal/phydm/rtl8822e/Hal8822e_PhyTables.h
         src/jaguar3/Phy8822eTables.cpp
-        src/jaguar3/Halrf8822e.cpp src/jaguar3/Halrf8822e.h)
+        src/jaguar3/Halrf8822e.cpp src/jaguar3/Halrf8822e.h
+        src/jaguar3/Afe8822e.h
+        src/jaguar3/CrossPath8822e.cpp src/jaguar3/CrossPath8822e.h)
     target_compile_definitions(devourer PUBLIC DEVOURER_HAVE_JAGUAR3_8822E=1)
 endif()
 
@@ -864,6 +868,15 @@ add_executable(txpower
 )
 target_link_libraries(txpower PUBLIC devourer PRIVATE PkgConfig::libusb)
 target_include_directories(txpower PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/examples/common)
+
+# crosspath — bench tool for the 8822E cross-path capture session
+# (IRtlRadio::CrossPath*): capture sweep, park rise, TX-page and send checks.
+add_executable(crosspath
+    examples/crosspath/main.cpp
+    examples/common/env_config.cpp
+)
+target_link_libraries(crosspath PUBLIC devourer PRIVATE PkgConfig::libusb)
+target_include_directories(crosspath PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/examples/common)
 
 # sense — Wi-Fi motion/presence sensor from beamforming reports. Drives
 # two adapters (a sounder + a beamformee) on one host, self-captures the reports,
@@ -1601,6 +1614,19 @@ target_include_directories(CtrlBatchSelftest PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src)
 add_test(NAME ctrl_batch_semantics COMMAND CtrlBatchSelftest)
 
+# Headless guard for LaCapture's block readback: sample order across 4 KB
+# pages and the ring wrap, and failure on a short read.
+add_executable(LaBlockReadbackSelftest tests/la_block_readback_selftest.cpp)
+target_link_libraries(LaBlockReadbackSelftest PRIVATE devourer)
+add_test(NAME la_block_readback COMMAND LaBlockReadbackSelftest)
+
+# Headless guard for the cross-path types and the 8822E chain-B listener.
+if(DEVOURER_JAGUAR3_8822E)
+    add_executable(CrossPathSelftest tests/cross_path_selftest.cpp)
+    target_link_libraries(CrossPathSelftest PRIVATE devourer)
+    add_test(NAME cross_path COMMAND CrossPathSelftest)
+endif()
+
 # Headless guard for the ONE silent-corruption path on the batched scout read:
 # GetRxEnergyScout must not compose its 0x1d2c/0x1eb4 BB reset out of a FAILED
 # read. Unlike ctrl_batch_semantics this drives the real RtlJaguar3Device over
@@ -1610,6 +1636,14 @@ if(DEVOURER_JAGUAR3)
     add_executable(ScoutBatchFailSelftest tests/scout_batch_fail_selftest.cpp)
     target_link_libraries(ScoutBatchFailSelftest PRIVATE devourer)
     add_test(NAME scout_batch_fail COMMAND ScoutBatchFailSelftest)
+
+    # Live TX-buffer re-layout: the REG_CR pulse comes first and is never
+    # held, the half layout moves the reserved boundary down, no MAC TRX re-init.
+    add_executable(Jaguar3RelayoutSelftest tests/jaguar3_relayout_selftest.cpp)
+    target_link_libraries(Jaguar3RelayoutSelftest PRIVATE devourer)
+    target_include_directories(Jaguar3RelayoutSelftest PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME jaguar3_relayout COMMAND Jaguar3RelayoutSelftest)
 endif()
 
 # Headless guard for the adapter-health classifier + EFUSE-stability probe

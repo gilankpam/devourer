@@ -607,9 +607,20 @@ bool HalmacJaguar3MacInit::init_trx_cfg() {
   return true;
 }
 
+bool HalmacJaguar3MacInit::relayout_tx_buffer(bool half) {
+  _tx_half = half;
+  /* Pulse the TXDMA enable (REG_CR bit 2) so the queue page registers
+   * take the new layout; it is never held off across the configuration. */
+  const uint8_t cr = _device.rtw_read8(REG_CR);
+  _device.rtw_write8(REG_CR, static_cast<uint8_t>(cr & ~(1u << 2)));
+  _device.rtw_write8(REG_CR, cr);
+  return priority_queue_cfg();
+}
+
 /* priority_queue_cfg_8822c + set_trx_fifo_info_8822c + pg_num_parser */
 bool HalmacJaguar3MacInit::priority_queue_cfg() {
-  const uint16_t tx_fifo_pg_num = TX_FIFO_SIZE_8822C >> TX_PAGE_SHIFT; /* 2048 */
+  const uint16_t tx_fifo_pg_num =
+      (TX_FIFO_SIZE_8822C >> TX_PAGE_SHIFT) / (_tx_half ? 2 : 1); /* 2048 */
   const uint16_t rsvd_pg_num =
       RSVD_PG_DRV_NUM + RSVD_PG_H2C_EXTRAINFO_NUM + RSVD_PG_H2C_STATICINFO_NUM +
       RSVD_PG_H2CQ_NUM + RSVD_PG_CPU_INSTRUCTION_NUM + RSVD_PG_FW_TXBUF_NUM +

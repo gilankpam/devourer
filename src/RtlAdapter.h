@@ -85,6 +85,7 @@ public:
              Logger_t logger, const devourer::DeviceConfig &cfg = {});
 
   bool is_usb() const { return _transport->is_usb(); }
+  const Logger_t &logger() const { return _logger; }
   /* Pre-power-on HCI programming (rtw88 rtw_hci_setup slot): PCIe TRX ring
    * registers; no-op on USB. Call per bring-up attempt, before power-on. */
   void hci_setup() { _transport->hci_setup(); }
@@ -96,6 +97,10 @@ public:
   bool write_batch_end() { return _transport->write_batch_end(); }
   void flush_writes() { _transport->flush_writes(); }
   uint64_t ctrl_xfers() const { return _transport->ctrl_xfers(); }
+  /* One multi-byte vendor read (ITransport::read_block). */
+  int read_block(uint16_t reg, uint8_t *buf, int len) {
+    return _transport->read_block(reg, buf, len);
+  }
   /* Batched EP0 register transfers — see ITransport::ctrl_batch for the
    * ordering / in-place-read / failure contract and the USB event-pump
    * hazard. The caller owns serialization (its device register lock). */

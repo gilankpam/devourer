@@ -49,6 +49,12 @@ public:
     return false;
   }
 
+  /* True when the last path-B AFEDIG (0x4130) table a calibration step wrote
+   * was the TXGAPK restore (kAfeTxgapkRestoreSeq), false for the IQK restore
+   * or none. 0x4130 is write-only, so this record is the only way to put the
+   * table back. 8822E only. */
+  virtual bool afe_b_txgapk_last() const { return false; }
+
   /* Coex antenna control (combo chips). */
   virtual void force_wl_antenna() = 0;
   virtual void coex_wlan_only_init() = 0;
