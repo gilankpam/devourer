@@ -190,6 +190,15 @@ public:
    * rtw_fw_send_h2c_command): 8-byte command, round-robin across 4 boxes. */
   void send_h2c_raw(uint32_t msg, uint32_t msg_ext);
 
+  /* Live TX-buffer re-layout (half / full); see
+   * HalmacJaguar3MacInit::relayout_tx_buffer. The firmware download's rsvd
+   * boundary follows. */
+  bool relayout_tx_buffer(bool half) {
+    const bool ok = _macinit.relayout_tx_buffer(half);
+    _fw.set_rsvd_boundary(_macinit.rsvd_boundary());
+    return ok;
+  }
+
   /* Load a beacon into the page-0 beacon rsvd-page for TBTT auto-TX
    * (experimental — see RtlJaguar3Device::StartBeacon). */
   bool download_beacon_page(const uint8_t *buf, uint32_t size) {

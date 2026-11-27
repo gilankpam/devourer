@@ -1616,6 +1616,14 @@ if(DEVOURER_JAGUAR3)
     add_executable(ScoutBatchFailSelftest tests/scout_batch_fail_selftest.cpp)
     target_link_libraries(ScoutBatchFailSelftest PRIVATE devourer)
     add_test(NAME scout_batch_fail COMMAND ScoutBatchFailSelftest)
+
+    # Live TX-buffer re-layout: the REG_CR pulse comes first and is never
+    # held, the half layout moves the reserved boundary down, no MAC TRX re-init.
+    add_executable(Jaguar3RelayoutSelftest tests/jaguar3_relayout_selftest.cpp)
+    target_link_libraries(Jaguar3RelayoutSelftest PRIVATE devourer)
+    target_include_directories(Jaguar3RelayoutSelftest PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME jaguar3_relayout COMMAND Jaguar3RelayoutSelftest)
 endif()
 
 # Headless guard for the adapter-health classifier + EFUSE-stability probe
