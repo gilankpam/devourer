@@ -115,30 +115,46 @@ receiver, which is what the TX power ladder's self-calibration needs.
 Implementation: `src/jaguar3/CrossPath8822e.{h,cpp}` (listener and
 `CrossPathSession`), shared types in `src/CrossPathCapture.h`.
 
-The five `IRtlRadio` calls:
+The five `IRtlRadio` calls. None of them throws: a failed register transfer
+is a false return.
 
 - `CrossPathSupported()`: true on an 8822E with `rfe_type` 21–24 after
-  bring-up. Every other chip and RFE type returns false, and the other four
-  calls then refuse without writing anything.
-- `CrossPathBegin(bw)`: `bw` is 20 or 40 MHz, the width the chip is tuned
-  to. Re-lays the TX buffer to its lower half (the upper half is the capture
-  window), sets up the chain-B listener, then starts the probe train: HT MCS1
-  frames (150-byte body at 20 MHz, 320 at 40) sent back to back through
-  `send_packet` until `CrossPathEnd`. Refused while a session is open, and
-  when the TX queue does not drain within 500 ms (nothing written). A failed
-  step undoes the steps before it.
+  bring-up, with no CW tone running. Every other chip and RFE type returns
+  false, and the other four calls then refuse without writing anything.
+  Validated at 5 GHz only; the call does not check the band, and a 2.4 GHz
+  session is untested.
+- `CrossPathBegin(bw)`: `bw` is 20 or 40 MHz, and refused when wider than
+  the tuned width. Re-lays the TX buffer to its lower half (the upper half is
+  the capture window), sets up the chain-B listener, then starts the probe
+  train: HT MCS1 frames (150-byte body at 20 MHz, 320 at 40) sent back to
+  back through `send_packet` until `CrossPathEnd`. Refused while a session
+  is open, and when the TX queue does not drain within 500 ms (nothing
+  written). A failed step undoes the steps before it.
 - `CrossPathPark(parked)`: parks or unparks the listener's front end
   (`0x4c[22]`, `0x3c[26]`); false if the bits do not take.
 - `CrossPathCapture(tx_index, gain, out)`: sets the flat index override
   (and waits 15 ms) when it changed, writes the listener gain word (3 ms),
   runs one capture (8192 samples at 20 MHz, 16384 at 40) and decodes it into
   `out`. A timed-out or wedged capture returns false with `out` empty, and
-  the session can still be closed.
+  the session can still be closed. A capture holds the device register lock
+  throughout; on a trigger that never fires that is the full poll,
+  2000 × 2 ms, about 4.5 s with the readback.
 - `CrossPathEnd()`: stops the train, waits (up to 500 ms) until the chip's
-  queue reports every page free, undoes the listener, re-lays the TX buffer to full and restores the
-  flat index override saved at `CrossPathBegin`. Channel, width and the
-  rate-diff table are not touched. A no-op with no session open; `Stop()`
-  calls it first.
+  queue reports every page free, undoes the listener, re-lays the TX buffer
+  to full and restores the flat index override saved at `CrossPathBegin`.
+  The listener undo puts `0x4130` back on the AFE table bring-up last wrote
+  there (the TXGAPK restore, or the IQK restore when TXGAPK did not run) and
+  reads back the other bits it restored. A 40 MHz probe arms the wide-TX IGI
+  floor; End clears it again when the session found it clear. The session
+  writes neither channel nor width, and the rate-diff table is not written
+  either: the flat override goes back to the value it had, and the rate-diff
+  walk that runs under it is the one that was there. Returns true when every
+  step succeeded and the queue drained before the re-layout. A drain timeout
+  is logged at error level and returns false; the undo and the full
+  re-layout still run, since leaving TX confined to the half layout is
+  worse, but TX may be wedged afterwards. A step that threw keeps the
+  session open, so a later End retries. True with no session open. `Stop()`
+  calls it first, and so do `Init` and `InitWrite`.
 
 The caller's obligations:
 
@@ -148,13 +164,26 @@ The caller's obligations:
   bulk-OUT times out. The session waits for a drained queue at both ends;
   the train alone keeps the half layout nearly full, and it takes about
   100 ms to empty after the train stops.
-- H2C packet traffic stays quiet while a session is open: the H2C queue
-  keeps its full-layout address, which sits inside the capture window during
-  the half layout.
 - The chip stays on one channel and width for the whole session.
+- At 40 MHz the result belongs to the tuned primary channel and offset.
+  `ChannelOffset = 0` is HT40+ in this driver, so the upper channel of a
+  standard 5 GHz pair (40, 48, ... 144, 161) needs offset 2. Tune the pair
+  the link flies: at the wrong pair the bench read EVM 2–5 dB off.
+- The probe goes out with the session's TX state: the flat index plus any
+  `SetTxPowerOffsetQdb` offset, A-MPDU when `SetAmpduMode` is on, and the
+  per-packet TX-power default bank (`SetTxPacketPowerOffsetQdb`). Turn
+  A-MPDU off and zero the offset and the per-packet default before
+  `CrossPathBegin`.
+- One control thread. `Stop()` calls `CrossPathEnd()`, so `Stop` and the
+  session calls run on one thread, or the caller serializes them.
 - No CW tone runs during a session: it makes the flat index override
   refuse, so captures and the end-of-session restore would not apply.
   `CrossPathSupported()` is false while one is active.
+
+A note on H2C: during the half layout the H2C queue keeps its full-layout
+address, which sits inside the capture window. This backend sends its
+runtime H2C commands through the HMEBOX registers, not the H2C queue, so
+nothing lands there during a session; an H2C packet sent then would.
 
 ## Risks
 
