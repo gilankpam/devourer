@@ -76,8 +76,20 @@ namespace {
 void sleep_ms(int ms) { std::this_thread::sleep_for(std::chrono::milliseconds(ms)); }
 }
 
+bool CrossPathSession::wait_drained() {
+  if (!_io.drained)
+    return true;
+  for (int t = 0; t < kDrainMs; t += 2) {
+    if (_io.drained())
+      return true;
+    sleep_ms(2);
+  }
+  return _io.drained();
+}
+
 bool CrossPathSession::begin(ChannelWidth_t bw) {
-  if (_active || (bw != CHANNEL_WIDTH_20 && bw != CHANNEL_WIDTH_40))
+  if (_active || (bw != CHANNEL_WIDTH_20 && bw != CHANNEL_WIDTH_40) ||
+      !wait_drained())
     return false;
   _saved_index = _last_index = _io.get_index();
   bool ok = false;
@@ -163,7 +175,10 @@ void CrossPathSession::end() {
   _train_stop = true;
   if (_train.joinable())
     _train.join();
-  sleep_ms(30); // the chip's queue empties before the buffer moves
+  // Re-laying a buffer that still holds frames corrupts the page accounting
+  // and wedges TX. Past the bound the layout goes back to full regardless:
+  // leaving TX confined to half is not an option either.
+  wait_drained();
   {
     auto lk = regs();
     _l.undo();

@@ -156,6 +156,7 @@ int main() {
     int cur_index = 77, get_index_count = 0;
     uint32_t gain_at_capture = 0;
     bool relayout_fails = false, capture_times_out = false;
+    std::atomic<int> undrained_polls{0}; // drained() reads false this many more times
     LaParams last;
     jaguar3::CrossPathListener8822e listener(RtlAdapter(fake, std::make_shared<Logger>()));
     jaguar3::CrossPathListener8822e listener2(RtlAdapter(fake, std::make_shared<Logger>()));
@@ -192,6 +193,14 @@ int main() {
         ++send_count;
         return true;
       };
+      io.drained = [&] {
+        if (undrained_polls > 0) {
+          --undrained_polls;
+          log.push_back("undrained");
+          return false;
+        }
+        return true;
+      };
       return io;
     };
     auto sleep_ms = [](int ms) { std::this_thread::sleep_for(std::chrono::milliseconds(ms)); };
@@ -201,14 +210,28 @@ int main() {
 
     CHECK(!s.park(true) && !s.capture(60, 0, out) && log.empty()); // no session open
     CHECK(!s.begin(CHANNEL_WIDTH_80) && !s.begin(CHANNEL_WIDTH_10) && log.empty());
+    // a queue that never drains: begin refuses and writes nothing
+    undrained_polls = 1 << 30;
+    fake->writes.clear();
+    CHECK(!s.begin(CHANNEL_WIDTH_20) && !s.active());
+    CHECK(fake->writes.empty() && get_index_count == 0 && send_count == 0);
+    CHECK(std::all_of(log.begin(), log.end(), [](const std::string &e) { return e == "undrained"; }));
+    undrained_polls = 0;
+    log.clear();
     CHECK(s.begin(CHANNEL_WIDTH_20) && s.active());
     CHECK(get_index_count == 1);
     CHECK(log[0] == "relayout half listener=0");
     while (send_count < 3) sleep_ms(1);
     CHECK(sends_seen_while_listener_inactive == 0);
     CHECK(s.park(true) && s.park(false));
+    undrained_polls = 3; // frames still queued when the train stops
     s.end();
     CHECK(log[log.size() - 2] == "relayout full listener=0");
+    CHECK(undrained_polls == 0);
+    {
+      const auto full = std::find(log.begin(), log.end(), "relayout full listener=0");
+      CHECK(std::count(log.begin(), full, "undrained") == 3); // all before the re-layout
+    }
     CHECK(log.back() == "set_index 77");
     CHECK(!s.active() && !listener.active());
     const size_t sends = send_count;

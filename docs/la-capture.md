@@ -124,8 +124,9 @@ The five `IRtlRadio` calls:
   to. Re-lays the TX buffer to its lower half (the upper half is the capture
   window), sets up the chain-B listener, then starts the probe train: HT MCS1
   frames (150-byte body at 20 MHz, 320 at 40) sent back to back through
-  `send_packet` until `CrossPathEnd`. Refused while a session is open. A
-  failed step undoes the steps before it.
+  `send_packet` until `CrossPathEnd`. Refused while a session is open, and
+  when the TX queue does not drain within 500 ms (nothing written). A failed
+  step undoes the steps before it.
 - `CrossPathPark(parked)`: parks or unparks the listener's front end
   (`0x4c[22]`, `0x3c[26]`); false if the bits do not take.
 - `CrossPathCapture(tx_index, gain, out)`: sets the flat index override
@@ -133,17 +134,20 @@ The five `IRtlRadio` calls:
   runs one capture (8192 samples at 20 MHz, 16384 at 40) and decodes it into
   `out`. A timed-out or wedged capture returns false with `out` empty, and
   the session can still be closed.
-- `CrossPathEnd()`: stops the train, waits 30 ms for the chip's queue to
-  empty, undoes the listener, re-lays the TX buffer to full and restores the
+- `CrossPathEnd()`: stops the train, waits (up to 500 ms) until the chip's
+  queue reports every page free, undoes the listener, re-lays the TX buffer to full and restores the
   flat index override saved at `CrossPathBegin`. Channel, width and the
   rate-diff table are not touched. A no-op with no session open; `Stop()`
   calls it first.
 
 The caller's obligations:
 
-- The TX queue is drained before `CrossPathBegin`, and nothing else sends
-  until `CrossPathEnd`. The re-layout moves the queue boundaries under any
-  frame still in the buffer.
+- Nothing else sends from `CrossPathBegin` until `CrossPathEnd`. The
+  re-layout moves the queue boundaries under any frame still in the buffer:
+  done on a full queue it leaves more free pages than exist and every later
+  bulk-OUT times out. The session waits for a drained queue at both ends;
+  the train alone keeps the half layout nearly full, and it takes about
+  100 ms to empty after the train stops.
 - H2C packet traffic stays quiet while a session is open: the H2C queue
   keeps its full-layout address, which sits inside the capture window during
   the half layout.

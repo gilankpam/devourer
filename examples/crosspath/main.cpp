@@ -17,6 +17,7 @@
  * the parked set. Name the directory with "_40_" for a 40 MHz run. */
 #include <libusb.h>
 
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -24,6 +25,7 @@
 #include <cstring>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "CrossPathCapture.h"
@@ -218,6 +220,13 @@ int main(int argc, char **argv) {
       if (!dev->send_packet(frame.data(), frame.size()))
         ++failed;
     std::printf("send frames=%d failed=%d\n", kFrames, failed);
+    /* Let the burst leave the queue so the next cycle starts on a drained one. */
+    for (int t = 0; t < 500 && !g_devourer_should_stop; t += 2) {
+      uint16_t fr = 0, tot = 0;
+      if (dev->GetTxQueuePages(fr, tot) && fr == tot)
+        break;
+      std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
     if (failed)
       ok = false;
     std::printf("cycle %d %s\n", c, ok ? "OK" : "BAD");

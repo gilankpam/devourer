@@ -2395,6 +2395,10 @@ bool RtlJaguar3Device::CrossPathBegin(ChannelWidth_t bw) {
     // send_packet takes no _reg_mu for these frames (no radiotap CHANNEL);
     // a first 40 MHz frame takes it once for the IGI floor.
     io.send = [this](const uint8_t *f, size_t n) { return send_packet(f, n); };
+    io.drained = [this] {
+      uint16_t fr = 0, tot = 0;
+      return GetTxQueuePages(fr, tot) && fr == tot;
+    };
     io.reg_mu = &_reg_mu;
     _xp = std::make_unique<jaguar3::CrossPathSession>(std::move(io), *_xp_listener);
   }

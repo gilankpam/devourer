@@ -53,6 +53,9 @@ public:
     std::function<void(int)> set_index;
     std::function<devourer::LaResult(const devourer::LaParams &)> capture;
     std::function<bool(const uint8_t *, size_t)> send;
+    // True once the chip's TX queue is empty (free pages == configured
+    // pages). Unset counts as drained.
+    std::function<bool()> drained;
     // Held around the listener's register work when set; the other callables
     // serialize themselves.
     std::mutex *reg_mu = nullptr;
@@ -72,19 +75,23 @@ public:
   /* bw is 20 or 40 MHz: the probe's and the capture's width; the caller has
    * the chip tuned at it. False if a session is open, bw is another width or a
    * step fails (a throw included); a failure
-   * undoes the steps already done. */
+   * undoes the steps already done. Refuses, writing nothing, when the TX
+   * queue does not drain within kDrainMs: the buffer only moves when empty. */
   bool begin(ChannelWidth_t bw);
   bool park(bool parked);
   /* tx_index 0..127, gain 0..kCrossPathGains-1. `out` is cleared first and
    * filled only on a completed capture. */
   bool capture(int tx_index, int gain, std::vector<devourer::IqSample> &out);
-  /* Stop the train, let the queue empty, undo the listener, re-lay the buffer
-   * to full, restore the saved index override. No-op when not open. */
+  /* Stop the train, wait (up to kDrainMs) for the queue to empty, undo the
+   * listener, re-lay the buffer to full, restore the saved index override.
+   * No-op when not open. */
   void end();
   bool active() const { return _active; }
   ChannelWidth_t width() const { return _bw; }
+  static constexpr int kDrainMs = 500;
 
 private:
+  bool wait_drained();
   std::unique_lock<std::mutex> regs() {
     return _io.reg_mu ? std::unique_lock<std::mutex>(*_io.reg_mu)
                       : std::unique_lock<std::mutex>();
