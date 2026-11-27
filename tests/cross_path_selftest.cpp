@@ -105,8 +105,9 @@ int main() {
 
   l.setup();
   std::vector<uint32_t> want;
-  for (uint32_t n = 0; n < 16; ++n) want.push_back(0x70000000u | (n << 16) | 0xF0001u);
+  for (uint32_t n = 0; n < 16; ++n) want.push_back(0x700F0001u + 0x100000u * n);
   CHECK(fake->to(0x4130) == want);
+  CHECK(want[1] == 0x701F0001u && want[15] == 0x70FF0001u);
   CHECK((fake->to(0x1c38) == std::vector<uint32_t>{0, 0xffffffff}));
   CHECK((fake->regs[0x410c] & 3) == 0 && fake->regs[0x410c] >> 2 == 0xabcd0003u >> 2);
   CHECK((fake->regs[0x820] & 0xff) == 0x31 && (fake->regs[0x820] >> 8) == 0x123456);

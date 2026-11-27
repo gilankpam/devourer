@@ -22,7 +22,7 @@ void CrossPathListener8822e::setup() {
   _s3c = _a.rtw_read32(kRegDpdt3c);
   _sRfB0 = _a.rtw_read32(0x4c00) & 0xfffff; // path-B RF 0x00 via the direct window
   for (uint32_t n = 0; n < 16; ++n)
-    _a.rtw_write32(0x4130, 0x70000000u | (n << 16) | 0xF0001u);
+    _a.rtw_write32(0x4130, 0x70000000u | (n << 20) | 0xF0001u); // 0x70<n>F0001
   _a.rtw_write32(0x1c38, 0);
   _a.rtw_write32(0x1c38, 0xffffffff);
   _a.rtw_write32(0x410c, _s410c & ~3u);
