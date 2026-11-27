@@ -1,5 +1,6 @@
 /* Headless guard for the cross-path types and the 8822E chain-B listener over
  * a recording fake transport that keeps register state. */
+#include <algorithm>
 #include <cstdio>
 #include <map>
 #include <memory>
@@ -23,6 +24,7 @@ struct Fake : devourer::ITransport {
   uint16_t read16(uint16_t a) override { return read32(a) & 0xffff; }
   bool write32(uint16_t a, uint32_t v) override {
     writes.push_back({a, v});
+    if (a == 0x4108 && !(v >> 20)) regs[0x4c00] = v & 0xfffff; // RF 0x00, path B
     const uint32_t m = stuck[a];
     regs[a] = (regs[a] & m) | (v & ~m);
     return true;
@@ -69,6 +71,16 @@ int main() {
   CHECK(cross_path_probe_frame(CHANNEL_WIDTH_20) == cross_path_probe_frame(CHANNEL_WIDTH_20));
   CHECK(cross_path_probe_frame(CHANNEL_WIDTH_20).size() == build_stream_radiotap(m20).size() + 24 + 150);
   CHECK(cross_path_probe_frame(CHANNEL_WIDTH_40).size() == build_stream_radiotap(m40).size() + 24 + 320);
+  {
+    const auto f = cross_path_probe_frame(CHANNEL_WIDTH_20);
+    const size_t o = build_stream_radiotap(m20).size();
+    const uint8_t hdr[24] = {0x08, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff,
+                             0xff, 0xff, 0x57, 0x42, 0x75, 0x05, 0xd6, 0x00,
+                             0x57, 0x42, 0x75, 0x05, 0xd6, 0x00, 0x00, 0x00};
+    const uint8_t body[8] = {117, 205, 37, 75, 132, 226, 234, 242};
+    CHECK(std::equal(hdr, hdr + 24, f.begin() + o));
+    CHECK(std::equal(body, body + 8, f.begin() + o + 24));
+  }
   CHECK(cross_path_samples(CHANNEL_WIDTH_20) == 8192);
   CHECK(cross_path_samples(CHANNEL_WIDTH_40) == 16384);
 
@@ -77,6 +89,7 @@ int main() {
   fake->regs[0x410c] = 0xabcd0003;
   fake->regs[0x4c] = 0x00a00000;
   fake->regs[0x3c] = 0x04000011;
+  fake->regs[0x4c00] = 0x30123;
   const uint32_t s4c = 0x00a00000, s3c = 0x04000011;
   jaguar3::CrossPathListener8822e l(RtlAdapter(fake, std::make_shared<Logger>()));
 
@@ -105,6 +118,7 @@ int main() {
   CHECK(fake->regs[0x410c] >> 2 == 0xabcd0003u >> 2);
   CHECK(fake->regs[0x820] == 0x12345632);
   CHECK(fake->regs[0x4c] == s4c && fake->regs[0x3c] == s3c);
+  CHECK(fake->regs[0x4c00] == 0x30123); // path-B RF 0x00 back after set_gain(2)
   CHECK(!l.active());
   fake->writes.clear();
   l.undo();
@@ -117,6 +131,14 @@ int main() {
   CHECK(fake->regs[0x4c] == s4c && fake->regs[0x3c] == s3c);
   l.undo();
   CHECK(fake->regs[0x4c] == s4c);
+
+  // 0x4c[22] sticks low: park clears 0x3c[26] first, the restore must set it back
+  fake->stuck.clear();
+  fake->stuck[0x4c] = 1u << 22;
+  l.setup();
+  CHECK(!l.park(true));
+  CHECK(fake->regs[0x4c] == s4c && fake->regs[0x3c] == s3c);
+  l.undo();
 
   if (fails) return 1;
   std::puts("cross_path: ok");

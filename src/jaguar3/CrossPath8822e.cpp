@@ -18,6 +18,7 @@ void CrossPathListener8822e::setup() {
   _s410c = _a.rtw_read32(0x410c);
   _s4c = _a.rtw_read32(kRegDpdt4c);
   _s3c = _a.rtw_read32(kRegDpdt3c);
+  _sRfB0 = _a.rtw_read32(0x4c00) & 0xfffff; // path-B RF 0x00 via the direct window
   for (uint32_t n = 0; n < 16; ++n)
     _a.rtw_write32(0x4130, 0x70000000u | (n << 16) | 0xF0001u);
   _a.rtw_write32(0x1c38, 0);
@@ -64,6 +65,8 @@ void CrossPathListener8822e::undo() {
   _a.rtw_write32(0x1c38, 0xffa1005e);
   _a.rtw_write32(0x410c, (_a.rtw_read32(0x410c) & ~3u) | 3u);
   _a.rtw_write32(0x820, (_a.rtw_read32(0x820) & ~0xffu) | (_s820 & 0xffu));
+  // After 3-wire is back on, the way the driver writes RF 0x00 (via 0x4108).
+  _a.rtw_write32(0x4108, _sRfB0);
   _active = false;
 }
 

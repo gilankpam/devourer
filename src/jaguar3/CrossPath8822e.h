@@ -31,7 +31,7 @@ public:
 private:
   RtlAdapter _a;
   bool _active = false, _parked = false;
-  uint32_t _s820 = 0, _s410c = 0, _s4c = 0, _s3c = 0;
+  uint32_t _s820 = 0, _s410c = 0, _s4c = 0, _s3c = 0, _sRfB0 = 0;
 };
 
 } // namespace jaguar3
