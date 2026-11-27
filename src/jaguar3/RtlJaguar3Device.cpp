@@ -2400,7 +2400,13 @@ bool RtlJaguar3Device::CrossPathBegin(ChannelWidth_t bw) {
     io.capture = [this](const devourer::LaParams &p) { return la_capture(p); }; // takes _reg_mu
     // send_packet takes no _reg_mu for these frames (no radiotap CHANNEL);
     // a first 40 MHz frame takes it once for the IGI floor.
-    io.send = [this](const uint8_t *f, size_t n) { return send_packet(f, n); };
+    // Three copies per call: with USB TX aggregation on they share one bulk-OUT
+    // URB. One frame per URB fills the FIFO slower than the air drains it, so
+    // the train airs in bursts with gaps longer than a capture window.
+    io.send = [this](const uint8_t *f, size_t n) {
+      const TxPacketView v[3] = {{f, n}, {f, n}, {f, n}};
+      return send_packets(v, 3) == 3;
+    };
     io.drained = [this] {
       uint32_t info[4];
       std::lock_guard<std::mutex> lk(_reg_mu);

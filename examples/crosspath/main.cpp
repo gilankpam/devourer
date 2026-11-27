@@ -140,7 +140,12 @@ int main(int argc, char **argv) {
   session.adopt_handle(handle);
   session.adopt_lock(lock);
   WiFiDriver driver(logger);
-  auto owned = driver.CreateRadio(handle, ctx, lock, devourer_config_from_env());
+  devourer::DeviceConfig cfg = devourer_config_from_env();
+  /* The probe train sends three copies per call; they only share one URB (and
+   * so air back-to-back) with USB TX aggregation on, as maburd configures. */
+  if (cfg.tx.usb_agg_max < 3)
+    cfg.tx.usb_agg_max = 3;
+  auto owned = driver.CreateRadio(handle, ctx, lock, cfg);
   if (!owned)
     return 1;
   session.adopt_device(std::move(owned));

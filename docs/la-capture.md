@@ -127,7 +127,11 @@ is a false return.
   the tuned width. Re-lays the TX buffer to its lower half (the upper half is
   the capture window), sets up the chain-B listener, then starts the probe
   train: HT MCS1 frames (150-byte body at 20 MHz, 320 at 40) sent back to
-  back through `send_packet` until `CrossPathEnd`. Refused while a session
+  back through `send_packets` (three copies per call) until `CrossPathEnd`.
+  Caller contract: the train relies on USB TX aggregation
+  (`tx.usb_agg_max >= 3`) to put the three copies in one URB and air
+  back-to-back; with one frame per URB the train airs in bursts with gaps
+  longer than a capture window, and a capture often holds no frame. Refused while a session
   is open, and when the TX queues do not drain within 500 ms (nothing
   written). The probe rides LQ, whose 64 dedicated pages can hold frames
   while the public pool already reads all free, so both waits check every
