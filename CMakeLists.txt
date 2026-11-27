@@ -869,6 +869,15 @@ add_executable(txpower
 target_link_libraries(txpower PUBLIC devourer PRIVATE PkgConfig::libusb)
 target_include_directories(txpower PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/examples/common)
 
+# crosspath — bench tool for the 8822E cross-path capture session
+# (IRtlRadio::CrossPath*): capture sweep, park rise, TX-page and send checks.
+add_executable(crosspath
+    examples/crosspath/main.cpp
+    examples/common/env_config.cpp
+)
+target_link_libraries(crosspath PUBLIC devourer PRIVATE PkgConfig::libusb)
+target_include_directories(crosspath PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/examples/common)
+
 # sense — Wi-Fi motion/presence sensor from beamforming reports. Drives
 # two adapters (a sounder + a beamformee) on one host, self-captures the reports,
 # decodes the per-tone Givens angles (src/BfReportDecode.h), and shows a live
