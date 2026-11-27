@@ -104,6 +104,51 @@ trigger. CW line scores (peak/median): 8822CU 50.8 dB, 8821C 36.8 dB,
   train as long precomputed buffers — per-burst `send()` calls underrun
   from python and nothing airs.
 
+## Cross-path capture (8822E)
+
+On the 8822E one chain can hear the other: chain A transmits a probe train
+while chain B, re-pointed as a listener, feeds the path-B ADC tap
+(`dma1`/`0xa80`) into the LA capture. Each capture is the radiated probe as
+the second chain receives it at a chosen flat TXAGC index and listener gain.
+That gives a relative TX-power reading per index without an external
+receiver, which is what the TX power ladder's self-calibration needs.
+Implementation: `src/jaguar3/CrossPath8822e.{h,cpp}` (listener and
+`CrossPathSession`), shared types in `src/CrossPathCapture.h`.
+
+The five `IRtlRadio` calls:
+
+- `CrossPathSupported()`: true on an 8822E with `rfe_type` 21–24 after
+  bring-up. Every other chip and RFE type returns false, and the other four
+  calls then refuse without writing anything.
+- `CrossPathBegin(bw)`: `bw` is 20 or 40 MHz, the width the chip is tuned
+  to. Re-lays the TX buffer to its lower half (the upper half is the capture
+  window), sets up the chain-B listener, then starts the probe train: HT MCS1
+  frames (150-byte body at 20 MHz, 320 at 40) sent back to back through
+  `send_packet` until `CrossPathEnd`. Refused while a session is open. A
+  failed step undoes the steps before it.
+- `CrossPathPark(parked)`: parks or unparks the listener's front end
+  (`0x4c[22]`, `0x3c[26]`); false if the bits do not take.
+- `CrossPathCapture(tx_index, gain, out)`: sets the flat index override
+  (and waits 15 ms) when it changed, writes the listener gain word (3 ms),
+  runs one capture (8192 samples at 20 MHz, 16384 at 40) and decodes it into
+  `out`. A timed-out or wedged capture returns false with `out` empty, and
+  the session can still be closed.
+- `CrossPathEnd()`: stops the train, waits 30 ms for the chip's queue to
+  empty, undoes the listener, re-lays the TX buffer to full and restores the
+  flat index override saved at `CrossPathBegin`. Channel, width and the
+  rate-diff table are not touched. A no-op with no session open; `Stop()`
+  calls it first.
+
+The caller's obligations:
+
+- The TX queue is drained before `CrossPathBegin`, and nothing else sends
+  until `CrossPathEnd`. The re-layout moves the queue boundaries under any
+  frame still in the buffer.
+- H2C packet traffic stays quiet while a session is open: the H2C queue
+  keeps its full-layout address, which sits inside the capture window during
+  the half layout.
+- The chip stays on one channel and width for the whole session.
+
 ## Risks
 
 Same class as `BbDbgportReader` (0x8fc/0x95c/0x1c3c writes on a live

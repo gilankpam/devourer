@@ -1,7 +1,11 @@
 /* Headless guard for the cross-path types and the 8822E chain-B listener over
  * a recording fake transport that keeps register state. */
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstdio>
+#include <string>
+#include <thread>
 #include <map>
 #include <memory>
 #include <utility>
@@ -18,11 +22,13 @@ struct Fake : devourer::ITransport {
   std::vector<std::pair<uint16_t, uint32_t>> writes;
   std::map<uint16_t, uint32_t> regs;
   std::map<uint16_t, uint32_t> stuck; // bits that ignore writes
+  int write_delay_us = 0;              // a USB-like write cost, so thread order shows
 
   uint32_t read32(uint16_t a) override { return regs[a]; }
   uint8_t read8(uint16_t a) override { return read32(a) & 0xff; }
   uint16_t read16(uint16_t a) override { return read32(a) & 0xffff; }
   bool write32(uint16_t a, uint32_t v) override {
+    if (write_delay_us) std::this_thread::sleep_for(std::chrono::microseconds(write_delay_us));
     writes.push_back({a, v});
     if (a == 0x4108 && !(v >> 20)) regs[0x4c00] = v & 0xfffff; // RF 0x00, path B
     const uint32_t m = stuck[a];
@@ -139,6 +145,107 @@ int main() {
   CHECK(!l.park(true));
   CHECK(fake->regs[0x4c] == s4c && fake->regs[0x3c] == s3c);
   l.undo();
+
+  // the session: order of work, guards, capture parameters
+  {
+    fake->stuck.clear();
+    fake->write_delay_us = 300;
+    std::vector<std::string> log;
+    std::atomic<size_t> send_count{0}, sends_seen_while_listener_inactive{0};
+    bool relayout_fails = false, capture_times_out = false;
+    LaParams last;
+    jaguar3::CrossPathListener8822e listener(RtlAdapter(fake, std::make_shared<Logger>()));
+    jaguar3::CrossPathListener8822e listener2(RtlAdapter(fake, std::make_shared<Logger>()));
+    auto make_io = [&](jaguar3::CrossPathListener8822e &lis) {
+      jaguar3::CrossPathSession::Io io;
+      io.relayout = [&, l = &lis](bool half) {
+        log.push_back(std::string("relayout ") + (half ? "half" : "full") +
+                      " listener=" + (l->active() ? "1" : "0"));
+        return !relayout_fails;
+      };
+      io.get_index = [] { return 77; };
+      io.set_index = [&](int i) { log.push_back("set_index " + std::to_string(i)); };
+      io.capture = [&](const LaParams &p) {
+        log.push_back("capture");
+        last = p;
+        LaResult r;
+        if (capture_times_out) {
+          r.poll_timeout = true;
+          return r;
+        }
+        r.ok = true;
+        r.samples.assign(p.max_samples, uint64_t{1} << 61);
+        return r;
+      };
+      io.send = [&, l = &lis](const uint8_t *, size_t) {
+        if (!l->active()) ++sends_seen_while_listener_inactive;
+        ++send_count;
+        return true;
+      };
+      return io;
+    };
+    auto sleep_ms = [](int ms) { std::this_thread::sleep_for(std::chrono::milliseconds(ms)); };
+    jaguar3::CrossPathSession s(make_io(listener), listener);
+    jaguar3::CrossPathSession s2(make_io(listener2), listener2);
+    std::vector<IqSample> out;
+
+    CHECK(!s.park(true) && !s.capture(60, 0, out) && log.empty()); // no session open
+    CHECK(!s.begin(CHANNEL_WIDTH_80) && !s.begin(CHANNEL_WIDTH_10) && log.empty());
+    CHECK(s.begin(CHANNEL_WIDTH_20) && s.active());
+    CHECK(log[0] == "relayout half listener=0");
+    while (send_count < 3) sleep_ms(1);
+    CHECK(sends_seen_while_listener_inactive == 0);
+    CHECK(s.park(true) && s.park(false));
+    s.end();
+    CHECK(log[log.size() - 2] == "relayout full listener=0");
+    CHECK(log.back() == "set_index 77");
+    CHECK(!s.active() && !listener.active());
+    const size_t sends = send_count;
+    sleep_ms(20);
+    CHECK(send_count == sends);
+    log.clear();
+    s.end();
+    CHECK(log.empty());
+
+    CHECK(s.begin(CHANNEL_WIDTH_20));
+    CHECK(!s.begin(CHANNEL_WIDTH_40));
+    CHECK(s.width() == CHANNEL_WIDTH_20 && s.active() && listener.active());
+
+    relayout_fails = true;
+    CHECK(!s2.begin(CHANNEL_WIDTH_20));
+    CHECK(!s2.active() && !listener2.active());
+    relayout_fails = false;
+
+    log.clear();
+    CHECK(s.capture(60, 1, out));
+    CHECK(last.trig_mode == LaTrigMode::AdcMacTrig && last.mac_sig == LaMacSig::Manual);
+    CHECK(last.dma_type == 1 && last.dbg_port == 0xa80 && last.smp_rate == 2 && last.max_samples == 8192);
+    CHECK(last.block_len == 248 && last.trigger_time_us == 300);
+    CHECK(last.poll_ms == 2 && last.poll_tries == 2000);
+    CHECK(out.size() == 8192 && !out[0].bad);
+    CHECK((log == std::vector<std::string>{"set_index 60", "capture"}));
+    CHECK(fake->to(0x4108).back() == kCrossPathGainWord[1]);
+    log.clear();
+    CHECK(s.capture(60, 2, out));
+    CHECK((log == std::vector<std::string>{"capture"})); // same index: no re-set
+    CHECK(fake->to(0x4108).back() == kCrossPathGainWord[2]);
+
+    capture_times_out = true;
+    CHECK(!s.capture(64, 1, out) && out.empty());
+    s.end();
+    CHECK(log.back() == "set_index 77");
+    CHECK(!listener.active());
+
+    log.clear();
+    CHECK(!s.capture(128, 0, out) && !s.capture(60, 4, out));
+    CHECK(s.begin(CHANNEL_WIDTH_40));
+    log.clear();
+    capture_times_out = false;
+    CHECK(!s.capture(128, 0, out) && !s.capture(-1, 0, out) && !s.capture(60, 4, out) &&
+          !s.capture(60, -1, out) && log.empty());
+    CHECK(s.capture(60, 0, out) && last.smp_rate == 1 && last.max_samples == 16384);
+    s.end();
+  }
 
   if (fails) return 1;
   std::puts("cross_path: ok");

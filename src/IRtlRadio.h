@@ -5,8 +5,10 @@
 
 #include "AdapterHealth.h" /* EfuseStability */
 #include <mutex>
+#include <vector>
 
 #include "BusyWindow.h"
+#include "CrossPathCapture.h" /* IqSample */
 #include "RxSense.h"       /* RxEnergy */
 
 /* IRtlRadio is the Realtek-family extension of IRadio: the members whose
@@ -189,6 +191,38 @@ public:
     (void)reads;
     return {};
   }
+
+  /* Cross-path capture: one chain transmits a probe train while the other
+   * listens through the LA capture, for self-calibration of the TX power
+   * ladder (docs/la-capture.md "Cross-path capture (8822E)"). Ported on the
+   * 8822E with rfe_type 21..24 only, after bring-up; everywhere else every
+   * call refuses and writes nothing. Control-thread only. */
+  virtual bool CrossPathSupported() { return false; }
+  /* Opens the session at bw (20 or 40 MHz, the tuned width). Caller
+   * guarantees: the TX queue is drained and nothing else sends until
+   * CrossPathEnd. */
+  virtual bool CrossPathBegin(ChannelWidth_t bw) {
+    (void)bw;
+    return false;
+  }
+  /* Park (true) / unpark the listener's front end; false with no session. */
+  virtual bool CrossPathPark(bool parked) {
+    (void)parked;
+    return false;
+  }
+  /* One capture at a flat TXAGC index (0..127) and listener gain
+   * (0..kCrossPathGains-1). `out` is cleared, then filled only on success. */
+  virtual bool CrossPathCapture(int tx_index, int gain,
+                                std::vector<devourer::IqSample> &out) {
+    (void)tx_index;
+    (void)gain;
+    out.clear();
+    return false;
+  }
+  /* Closes the session and restores the TX buffer, the chain-B front end and
+   * the flat index override; never touches channel, width or the rate-diff
+   * table. No-op with no session. */
+  virtual void CrossPathEnd() {}
 
   /* Dump the chip's canary register set (BB / MAC / per-path RF) to the
    * diagnostic plane. Reads only — no writes, no calibration, no bring-up.

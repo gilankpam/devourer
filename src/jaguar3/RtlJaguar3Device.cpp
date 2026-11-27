@@ -545,6 +545,13 @@ void RtlJaguar3Device::start_rx_loop(Action_ParsedRadioPacket packetProcessor, b
  * (exception path / caller that drops the device) — a joinable std::thread in
  * the destructor would otherwise std::terminate. Idempotent with Stop(). */
 RtlJaguar3Device::~RtlJaguar3Device() {
+#if defined(DEVOURER_HAVE_JAGUAR3_8822E)
+  /* The probe train sends through this object: stop it first. */
+  try {
+    CrossPathEnd();
+  } catch (...) {
+  }
+#endif
   /* Inert on this generation (its send path is synchronous), but the invariant
    * belongs to every device: nothing gets released while a transfer the
    * transport still owns is outstanding. */
@@ -910,6 +917,15 @@ void RtlJaguar3Device::apply_replay_wseq() {
 /* Clean shutdown — see IRadio::Stop. Best-effort: a chip that already
  * dropped off the bus will make the de-init writes fail, which is fine. */
 void RtlJaguar3Device::Stop() {
+#if defined(DEVOURER_HAVE_JAGUAR3_8822E)
+  /* A cross-path session ends before the chip does (best effort, like the
+   * de-init below). */
+  try {
+    CrossPathEnd();
+  } catch (...) {
+    _logger->info("Jaguar3: Stop() cross-path end failed (chip already gone?)");
+  }
+#endif
   /* The armed window dies with the session. Nothing else forgets it:
    * with_ccx gates on _brought_up, which Stop() does not clear, so a window
    * armed before a Stop stays visible afterwards and the next retune's note
@@ -2350,6 +2366,54 @@ devourer::LaResult RtlJaguar3Device::la_capture(const devourer::LaParams &p) {
   std::lock_guard<std::mutex> lk(_reg_mu);
   return _la->run(p);
 }
+
+#if defined(DEVOURER_HAVE_JAGUAR3_8822E)
+bool RtlJaguar3Device::CrossPathSupported() {
+  const uint8_t rfe = _hal.rfe_type();
+  return _variant == jaguar3::ChipVariant::C8822E && rfe >= 21 && rfe <= 24 &&
+         _brought_up;
+}
+
+bool RtlJaguar3Device::CrossPathBegin(ChannelWidth_t bw) {
+  if (!CrossPathSupported() || (_xp && _xp->active()))
+    return false;
+  if (!_xp) {
+    _xp_listener = std::make_unique<jaguar3::CrossPathListener8822e>(_device);
+    jaguar3::CrossPathSession::Io io;
+    io.relayout = [this](bool half) {
+      std::lock_guard<std::mutex> lk(_reg_mu);
+      return _hal.relayout_tx_buffer(half);
+    };
+    io.get_index = [this] { return _tx_pwr_override.load(); };
+    io.set_index = [this](int i) { SetTxPowerIndexOverride(i); }; // takes _reg_mu
+    io.capture = [this](const devourer::LaParams &p) { return la_capture(p); }; // takes _reg_mu
+    // send_packet takes no _reg_mu for these frames (no radiotap CHANNEL);
+    // a first 40 MHz frame takes it once for the IGI floor.
+    io.send = [this](const uint8_t *f, size_t n) { return send_packet(f, n); };
+    io.reg_mu = &_reg_mu;
+    _xp = std::make_unique<jaguar3::CrossPathSession>(std::move(io), *_xp_listener);
+  }
+  return _xp->begin(bw);
+}
+
+bool RtlJaguar3Device::CrossPathPark(bool parked) {
+  return _xp && _xp->park(parked);
+}
+
+bool RtlJaguar3Device::CrossPathCapture(int tx_index, int gain,
+                                        std::vector<devourer::IqSample> &out) {
+  if (!_xp) {
+    out.clear();
+    return false;
+  }
+  return _xp->capture(tx_index, gain, out);
+}
+
+void RtlJaguar3Device::CrossPathEnd() {
+  if (_xp)
+    _xp->end();
+}
+#endif
 
 devourer::TxPowerState RtlJaguar3Device::GetTxPowerState() {
   devourer::TxPowerState s;
