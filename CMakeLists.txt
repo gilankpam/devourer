@@ -263,6 +263,8 @@ add_library(devourer
     # all three generations (LaRegs carries the per-chip parameters).
     src/LaCapture.cpp
     src/LaCapture.h
+    src/CrossPathCapture.cpp
+    src/CrossPathCapture.h
     # phydm check_positive table walker — shared by Jaguar1 and Jaguar2
     # (both use the older addr/value + check_positive table format).
     src/PhyTableLoader.cpp
@@ -467,7 +469,9 @@ if(DEVOURER_JAGUAR3_8822E)
         hal/hal8822e_fw.c hal/hal8822e_fw.h
         hal/phydm/rtl8822e/Hal8822e_PhyTables.c hal/phydm/rtl8822e/Hal8822e_PhyTables.h
         src/jaguar3/Phy8822eTables.cpp
-        src/jaguar3/Halrf8822e.cpp src/jaguar3/Halrf8822e.h)
+        src/jaguar3/Halrf8822e.cpp src/jaguar3/Halrf8822e.h
+        src/jaguar3/Afe8822e.h
+        src/jaguar3/CrossPath8822e.cpp src/jaguar3/CrossPath8822e.h)
     target_compile_definitions(devourer PUBLIC DEVOURER_HAVE_JAGUAR3_8822E=1)
 endif()
 
@@ -1606,6 +1610,13 @@ add_test(NAME ctrl_batch_semantics COMMAND CtrlBatchSelftest)
 add_executable(LaBlockReadbackSelftest tests/la_block_readback_selftest.cpp)
 target_link_libraries(LaBlockReadbackSelftest PRIVATE devourer)
 add_test(NAME la_block_readback COMMAND LaBlockReadbackSelftest)
+
+# Headless guard for the cross-path types and the 8822E chain-B listener.
+if(DEVOURER_JAGUAR3_8822E)
+    add_executable(CrossPathSelftest tests/cross_path_selftest.cpp)
+    target_link_libraries(CrossPathSelftest PRIVATE devourer)
+    add_test(NAME cross_path COMMAND CrossPathSelftest)
+endif()
 
 # Headless guard for the ONE silent-corruption path on the batched scout read:
 # GetRxEnergyScout must not compose its 0x1d2c/0x1eb4 BB reset out of a FAILED

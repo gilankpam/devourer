@@ -1,4 +1,5 @@
 #include "Halrf8822e.h"
+#include "Afe8822e.h"
 #include <cstdlib>
 
 #include <chrono>
@@ -556,11 +557,7 @@ void Halrf8822e::iqk_afe_restore() {
       0x70fb0001};
   for (uint32_t v : seq)
     bb_write(0x1830, v);
-  static const uint32_t seq_b[] = {
-      0x700f0001, 0x700f0001, 0x70144001, 0x70244001, 0x70344001, 0x70444001,
-      0x705b0001, 0x70644001, 0x707b0001, 0x708f0001, 0x709f0001, 0x70af0001,
-      0x70bf0001, 0x70cb0001, 0x70db0001, 0x70eb0001, 0x70fb0001, 0x70fb0001};
-  for (uint32_t v : seq_b)
+  for (uint32_t v : kAfeRestoreSeqB)
     bb_write(0x4130, v);
   bb_write(0x1c38, 0xffa1005e);
   iqk_ex_dac_fifo_rst();
