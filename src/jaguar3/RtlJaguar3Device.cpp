@@ -2402,8 +2402,12 @@ bool RtlJaguar3Device::CrossPathBegin(ChannelWidth_t bw) {
     // a first 40 MHz frame takes it once for the IGI floor.
     io.send = [this](const uint8_t *f, size_t n) { return send_packet(f, n); };
     io.drained = [this] {
-      uint16_t fr = 0, tot = 0;
-      return GetTxQueuePages(fr, tot) && fr == tot;
+      uint32_t info[4];
+      std::lock_guard<std::mutex> lk(_reg_mu);
+      const uint16_t regs[4] = {0x0230, 0x0234, 0x0238, 0x0240};
+      for (int i = 0; i < 4; ++i)
+        info[i] = _device.rtw_read<uint32_t>(regs[i]);
+      return jaguar3::cross_path_queues_drained(info);
     };
     io.reg_mu = &_reg_mu;
     _xp = std::make_unique<jaguar3::CrossPathSession>(std::move(io), *_xp_listener);

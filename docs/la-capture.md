@@ -128,8 +128,10 @@ is a false return.
   the capture window), sets up the chain-B listener, then starts the probe
   train: HT MCS1 frames (150-byte body at 20 MHz, 320 at 40) sent back to
   back through `send_packet` until `CrossPathEnd`. Refused while a session
-  is open, and when the TX queue does not drain within 500 ms (nothing
-  written). A failed step undoes the steps before it.
+  is open, and when the TX queues do not drain within 500 ms (nothing
+  written). The probe rides LQ, whose 64 dedicated pages can hold frames
+  while the public pool already reads all free, so both waits check every
+  queue. A failed step undoes the steps before it.
 - `CrossPathPark(parked)`: parks or unparks the listener's front end
   (`0x4c[22]`, `0x3c[26]`); false if the bits do not take.
 - `CrossPathCapture(tx_index, gain, out)`: sets the flat index override
@@ -139,8 +141,8 @@ is a false return.
   the session can still be closed. A capture holds the device register lock
   throughout; on a trigger that never fires that is the full poll,
   2000 × 2 ms, about 4.5 s with the readback.
-- `CrossPathEnd()`: stops the train, waits (up to 500 ms) until the chip's
-  queue reports every page free, undoes the listener, re-lays the TX buffer
+- `CrossPathEnd()`: stops the train, waits (up to 500 ms) until every TX
+  queue (HQ, LQ, NQ and the public pool) reports all its pages free, undoes the listener, re-lays the TX buffer
   to full and restores the flat index override saved at `CrossPathBegin`.
   The listener undo puts `0x4130` back on the AFE table bring-up last wrote
   there (the TXGAPK restore, or the IQK restore when TXGAPK did not run) and

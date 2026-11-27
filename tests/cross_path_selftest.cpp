@@ -89,6 +89,16 @@ int main() {
     CHECK(std::equal(hdr, hdr + 24, f.begin() + o));
     CHECK(std::equal(body, body + 8, f.begin() + o + 24));
   }
+  // TX queues drained: every FIFOPAGE_INFO word free == configured, not PUB alone
+  {
+    auto info = [](uint32_t fr, uint32_t tot) { return (fr << 16) | tot; };
+    const uint32_t idle[4] = {info(64, 64), info(64, 64), info(64, 64), info(1745, 1745)};
+    const uint32_t lq_busy[4] = {info(64, 64), info(54, 64), info(64, 64), info(721, 721)};
+    const uint32_t pub_busy[4] = {info(64, 64), info(64, 64), info(64, 64), info(283, 721)};
+    CHECK(jaguar3::cross_path_queues_drained(idle));
+    CHECK(!jaguar3::cross_path_queues_drained(lq_busy));
+    CHECK(!jaguar3::cross_path_queues_drained(pub_busy));
+  }
   CHECK(cross_path_samples(CHANNEL_WIDTH_20) == 8192);
   CHECK(cross_path_samples(CHANNEL_WIDTH_40) == 16384);
 

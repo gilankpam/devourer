@@ -51,6 +51,19 @@ private:
   uint32_t _s820 = 0, _s410c = 0, _s4c = 0, _s3c = 0, _sRfB0 = 0;
 };
 
+/* True when every TX queue is empty: each REG_FIFOPAGE_INFO word (HQ, LQ,
+ * NQ, PUB: 0x0230/0x0234/0x0238/0x0240) reads free pages [27:16] equal to its
+ * configured pages [11:0]. PUB alone is not enough: the probe train rides
+ * LQ, and on the bench the first poll after the train stopped read PUB
+ * 721/721 with LQ at 20, 54 and 62 of 64 free. An idle queue always reads
+ * free == configured, so this never refuses an idle chip. */
+inline bool cross_path_queues_drained(const uint32_t (&info)[4]) {
+  for (uint32_t v : info)
+    if (((v >> 16) & 0xfff) != (v & 0xfff))
+      return false;
+  return true;
+}
+
 /* One cross-path session: TX buffer re-laid to half, listener set up and a
  * probe train running from begin() to end(), captures in between. The device
  * supplies the register work through Io; the session owns the order. Not
@@ -64,8 +77,8 @@ public:
     std::function<void(int)> set_index;
     std::function<devourer::LaResult(const devourer::LaParams &)> capture;
     std::function<bool(const uint8_t *, size_t)> send;
-    // True once the chip's TX queue is empty (free pages == configured
-    // pages). Unset counts as drained.
+    // True once the chip's TX queues are empty (cross_path_queues_drained).
+    // Unset counts as drained.
     std::function<bool()> drained;
     // Held around the listener's register work when set; the other callables
     // serialize themselves.
