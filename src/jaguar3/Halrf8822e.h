@@ -232,8 +232,12 @@ public:
   /* One-shot path-A meter read for GetThermalStatus (see Jaguar3Calibration):
    * shares the tracker's one-time RF 0x42[19] trigger; baseline = efuse 0xd0. */
   bool read_thermal(uint8_t &raw, uint8_t &baseline) override;
+  bool afe_b_txgapk_last() const override { return _afe_b_txgapk; }
 
 private:
+  /* Set by txgapk_afe_iqk_restore(path B), cleared by iqk_afe_restore: which
+   * of the two tables 0x4130 (write-only) last received. */
+  bool _afe_b_txgapk = false;
   uint8_t _therm_base[2] = {0xFF, 0xFF}; /* efuse 0xd0/0xd1 baseline per path */
   uint8_t _track_channel = 0;
   bool _tm_triggered = false;

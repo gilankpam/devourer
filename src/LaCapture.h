@@ -157,12 +157,14 @@ class LaCapture {
 
   /* Full one-shot sequence: arm → (trigger) → poll → readback → restore.
    * Safe to call repeatedly; after a wedge every call returns immediately
-   * with wedged=true. */
+   * with wedged=true. Never throws: a failed register transfer restores what
+   * was snapshotted (best effort) and returns ok=false. */
   LaResult run(const LaParams &p);
 
   bool is_wedged() const { return _wedged; }
 
  private:
+  LaResult run_once(const LaParams &p);
   void set_reg(uint16_t addr, uint32_t mask, uint32_t val);
   void setup_trigger_time(const LaParams &p);
   void setup_bb(const LaParams &p);

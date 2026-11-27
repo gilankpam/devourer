@@ -6,8 +6,10 @@
  * scripted to finish mid-window with the ring wrapped, so the newest-2048
  * readback starts at a non-page-aligned address, crosses several pages and
  * wraps from the window end back to its start. */
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <ios>
 #include <map>
 #include <memory>
 #include <vector>
@@ -24,6 +26,7 @@ struct Fake : devourer::ITransport {
   std::vector<uint8_t> txbuf = std::vector<uint8_t>(0x40000);
   uint32_t max_block_end = 0; /* max of (window offset & 0xfff) + len */
   bool short_reads = false;
+  bool throw_reads = false; /* a failed control transfer, as UsbTransport throws */
 
   Fake() {
     for (uint32_t a = 0; a < txbuf.size(); a += 8) {
@@ -47,6 +50,8 @@ struct Fake : devourer::ITransport {
   uint8_t read8(uint16_t a) override { return read32(a) & 0xff; }
   uint16_t read16(uint16_t a) override { return read32(a) & 0xffff; }
   int read_block(uint16_t a, uint8_t *buf, int len) override {
+    if (throw_reads)
+      throw std::ios_base::failure("control transfer failed");
     max_block_end = std::max(max_block_end, uint32_t((a & 0xfff) + len));
     std::memcpy(buf, &txbuf[base() + (a - 0x8000)], len);
     return short_reads ? len - 8 : len;
@@ -96,6 +101,25 @@ int main() {
   fake->short_reads = true;
   auto c = la.run(p);
   CHECK(!c.ok && c.samples.empty());
+
+  /* A throw mid-readback, after arming: run() returns ok=false and the LA
+   * registers are back, so the next run starts from the pre-capture state. */
+  fake->short_reads = false;
+  fake->regs[0x1CF4] = 0x00123456; /* [23] (LA mode) clear */
+  fake->regs[0x0106] = 0;
+  fake->throw_reads = true;
+  devourer::LaResult d;
+  bool threw = false;
+  try {
+    d = la.run(p);
+  } catch (...) {
+    threw = true;
+  }
+  CHECK(!threw && !d.ok && d.samples.empty());
+  CHECK(fake->regs[0x1CF4] == 0x00123456 && fake->regs[0x0106] == 0);
+  fake->throw_reads = false;
+  auto e = la.run(p);
+  CHECK(e.ok && e.samples == b.samples);
 
   return fails ? 1 : 0;
 }

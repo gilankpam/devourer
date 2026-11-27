@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <string>
 #include <thread>
+#include <ios>
 #include <map>
 #include <memory>
 #include <utility>
@@ -14,6 +15,7 @@
 #include "CrossPathCapture.h"
 #include "RadiotapBuilder.h"
 #include "Transport.h"
+#include "jaguar3/Afe8822e.h"
 #include "jaguar3/CrossPath8822e.h"
 
 namespace {
@@ -92,7 +94,7 @@ int main() {
 
   auto fake = std::make_shared<Fake>();
   fake->regs[0x820] = 0x12345632;
-  fake->regs[0x410c] = 0xabcd0003;
+  fake->regs[0x410c] = 0xabcd0001; // [1:0] = 1: undo restores this, not 3
   fake->regs[0x4c] = 0x00a00000;
   fake->regs[0x3c] = 0x04000011;
   fake->regs[0x4c00] = 0x30123;
@@ -109,7 +111,7 @@ int main() {
   CHECK(fake->to(0x4130) == want);
   CHECK(want[1] == 0x701F0001u && want[15] == 0x70FF0001u);
   CHECK((fake->to(0x1c38) == std::vector<uint32_t>{0, 0xffffffff}));
-  CHECK((fake->regs[0x410c] & 3) == 0 && fake->regs[0x410c] >> 2 == 0xabcd0003u >> 2);
+  CHECK((fake->regs[0x410c] & 3) == 0 && fake->regs[0x410c] >> 2 == 0xabcd0001u >> 2);
   CHECK((fake->regs[0x820] & 0xff) == 0x31 && (fake->regs[0x820] >> 8) == 0x123456);
   CHECK(l.active());
 
@@ -118,18 +120,45 @@ int main() {
   l.set_gain(2);
   CHECK(fake->to(0x4108).back() == 0x300c0);
   fake->writes.clear();
-  l.undo();
+  CHECK(l.undo());
   auto w = fake->to(0x4130);
   CHECK(w.size() == 18 && w.back() == 0x70fb0001);
-  CHECK(fake->regs[0x1c38] == 0xffa1005e && (fake->regs[0x410c] & 3) == 3);
-  CHECK(fake->regs[0x410c] >> 2 == 0xabcd0003u >> 2);
+  CHECK(std::equal(w.begin(), w.end(), jaguar3::kAfeRestoreSeqB)); // no TXGAPK record: IQK table
+  CHECK(fake->regs[0x1c38] == 0xffa1005e && fake->regs[0x410c] == 0xabcd0001u);
   CHECK(fake->regs[0x820] == 0x12345632);
   CHECK(fake->regs[0x4c] == s4c && fake->regs[0x3c] == s3c);
   CHECK(fake->regs[0x4c00] == 0x30123); // path-B RF 0x00 back after set_gain(2)
   CHECK(!l.active());
   fake->writes.clear();
-  l.undo();
+  CHECK(l.undo());
   CHECK(fake->writes.empty());
+
+  // bring-up's last 0x4130 writer was TXGAPK: undo replays that table
+  {
+    bool txgapk = true;
+    jaguar3::CrossPathListener8822e lt(RtlAdapter(fake, std::make_shared<Logger>()),
+                                       [&] { return txgapk; });
+    lt.setup();
+    fake->writes.clear();
+    CHECK(lt.undo());
+    auto t = fake->to(0x4130);
+    CHECK(t.size() == 16 && std::equal(t.begin(), t.end(), jaguar3::kAfeTxgapkRestoreSeq));
+    CHECK(t[0] == 0x700b8041 && t[15] == 0x70fb8041);
+    txgapk = false; // the record is read at setup: IQK ran last this time
+    lt.setup();
+    fake->writes.clear();
+    CHECK(lt.undo());
+    t = fake->to(0x4130);
+    CHECK(t.size() == 18 && std::equal(t.begin(), t.end(), jaguar3::kAfeRestoreSeqB));
+  }
+
+  // a restored bit that does not read back: undo reports it and still closes
+  fake->regs[0x410c] = 0xabcd0003;
+  l.setup();
+  fake->stuck[0x410c] = 3; // [1:0] stay 0
+  CHECK(!l.undo() && !l.active());
+  fake->stuck.clear();
+  fake->regs[0x410c] = 0xabcd0001;
 
   // a park that does not take
   fake->stuck[0x3c] = 1u << 26;
@@ -156,6 +185,9 @@ int main() {
     int cur_index = 77, get_index_count = 0;
     uint32_t gain_at_capture = 0;
     bool relayout_fails = false, capture_times_out = false;
+    bool relayout_throws_half = false, relayout_throws_full = false;
+    bool capture_throws = false, drained_throws = false, set_index_throws = false;
+    std::atomic<bool> send_throws{false};
     std::atomic<int> undrained_polls{0}; // drained() reads false this many more times
     LaParams last;
     jaguar3::CrossPathListener8822e listener(RtlAdapter(fake, std::make_shared<Logger>()));
@@ -165,6 +197,8 @@ int main() {
       io.relayout = [&, l = &lis](bool half) {
         log.push_back(std::string("relayout ") + (half ? "half" : "full") +
                       " listener=" + (l->active() ? "1" : "0"));
+        if (half ? relayout_throws_half : relayout_throws_full)
+          throw std::ios_base::failure("control transfer failed");
         return !relayout_fails;
       };
       io.get_index = [&] {
@@ -172,11 +206,15 @@ int main() {
         return cur_index;
       };
       io.set_index = [&](int i) {
+        if (set_index_throws)
+          throw std::ios_base::failure("control transfer failed");
         cur_index = i;
         log.push_back("set_index " + std::to_string(i));
       };
       io.capture = [&](const LaParams &p) {
         log.push_back("capture");
+        if (capture_throws)
+          throw std::ios_base::failure("control transfer failed");
         last = p;
         gain_at_capture = fake->regs[0x4c00];
         LaResult r;
@@ -191,9 +229,13 @@ int main() {
       io.send = [&, l = &lis](const uint8_t *, size_t) {
         if (!l->active()) ++sends_seen_while_listener_inactive;
         ++send_count;
+        if (send_throws)
+          throw std::ios_base::failure("bulk transfer failed");
         return true;
       };
       io.drained = [&] {
+        if (drained_throws)
+          throw std::ios_base::failure("control transfer failed");
         if (undrained_polls > 0) {
           --undrained_polls;
           log.push_back("undrained");
@@ -225,7 +267,7 @@ int main() {
     CHECK(sends_seen_while_listener_inactive == 0);
     CHECK(s.park(true) && s.park(false));
     undrained_polls = 3; // frames still queued when the train stops
-    s.end();
+    CHECK(s.end());
     CHECK(log[log.size() - 2] == "relayout full listener=0");
     CHECK(undrained_polls == 0);
     {
@@ -238,7 +280,7 @@ int main() {
     sleep_ms(20);
     CHECK(send_count == sends);
     log.clear();
-    s.end();
+    CHECK(s.end()); // no session open: true, nothing done
     CHECK(log.empty());
 
     CHECK(s.begin(CHANNEL_WIDTH_20));
@@ -282,7 +324,59 @@ int main() {
     CHECK(!s.capture(128, 0, out) && !s.capture(-1, 0, out) && !s.capture(60, 4, out) &&
           !s.capture(60, -1, out) && log.empty());
     CHECK(s.capture(60, 0, out) && last.smp_rate == 1 && last.max_samples == 16384);
-    s.end();
+    CHECK(s.end());
+
+    // throwing Io callables: every call returns, none throws
+    log.clear();
+    drained_throws = true; // begin: the drain check throws, nothing written
+    fake->writes.clear();
+    CHECK(!s.begin(CHANNEL_WIDTH_20) && !s.active() && log.empty() && fake->writes.empty());
+    drained_throws = false;
+
+    relayout_throws_half = true; // begin: the half re-layout throws
+    CHECK(!s.begin(CHANNEL_WIDTH_20) && !s.active() && !listener.active());
+    CHECK(log.back() == "relayout full listener=0"); // a half-applied layout goes back
+    relayout_throws_half = false;
+
+    CHECK(s.begin(CHANNEL_WIDTH_20));
+    capture_throws = true;
+    out.assign(5, IqSample{});
+    CHECK(!s.capture(64, 1, out) && out.empty() && s.active());
+    capture_throws = false;
+    set_index_throws = true;
+    CHECK(!s.capture(68, 1, out) && out.empty() && s.active());
+    set_index_throws = false;
+    CHECK(s.park(true));
+
+    send_throws = true; // the train survives a throwing send
+    const size_t sc = send_count;
+    while (send_count < sc + 3) sleep_ms(1);
+    send_throws = false;
+
+    relayout_throws_full = true; // end: the full re-layout throws
+    log.clear();
+    CHECK(!s.end() && s.active() && !listener.active());
+    CHECK(log.back() == "set_index 77"); // later steps still ran
+    relayout_throws_full = false;
+    log.clear();
+    CHECK(s.end() && !s.active()); // the retry closes it
+    CHECK((log == std::vector<std::string>{"relayout full listener=0", "set_index 77"}));
+    CHECK((fake->regs[0x4c] & (1u << 22)) == (s4c & (1u << 22)));
+
+    CHECK(s.begin(CHANNEL_WIDTH_20));
+    drained_throws = true; // end: a throwing drain check counts as not drained
+    log.clear();
+    CHECK(!s.end() && !s.active());
+    CHECK((log == std::vector<std::string>{"relayout full listener=0", "set_index 77"}));
+    drained_throws = false;
+
+    CHECK(s.begin(CHANNEL_WIDTH_20));
+    undrained_polls = 1 << 30; // end: the queue never drains
+    log.clear();
+    CHECK(!s.end() && !s.active() && !listener.active());
+    CHECK(log.back() == "set_index 77");
+    CHECK(std::count(log.begin(), log.end(), "relayout full listener=0") == 1);
+    undrained_polls = 0;
   }
 
   if (fails) return 1;

@@ -139,7 +139,7 @@ int main() {
           "CrossPath defaults refuse");
     check(!rtl->CrossPathCapture(60, 0, v) && v.empty(),
           "CrossPathCapture default refuses and clears out");
-    rtl->CrossPathEnd();
+    check(rtl->CrossPathEnd(), "CrossPathEnd default (no session) returns true");
   }
 
   check(!rtl->SetCcaGates(true, true), "SetCcaGates default refuses");

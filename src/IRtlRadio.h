@@ -194,13 +194,20 @@ public:
 
   /* Cross-path capture: one chain transmits a probe train while the other
    * listens through the LA capture, for self-calibration of the TX power
-   * ladder (docs/la-capture.md "Cross-path capture (8822E)"). Ported on the
-   * 8822E with rfe_type 21..24 only, after bring-up; everywhere else every
-   * call refuses and writes nothing. Control-thread only. */
+   * ladder (docs/la-capture.md "Cross-path capture (8822E)" has the caller's
+   * full contract). Ported on the 8822E with rfe_type 21..24 only, after
+   * bring-up, validated at 5 GHz only; everywhere else every call refuses and
+   * writes nothing. None of the five throws: a failed register transfer is a
+   * false return. One control thread: Stop() calls CrossPathEnd(), so Stop
+   * and these calls run on one thread or the caller serializes them. A
+   * capture can hold the register lock for up to ~4.5 s on a timeout. */
   virtual bool CrossPathSupported() { return false; }
-  /* Opens the session at bw (20 or 40 MHz, the tuned width). Caller
-   * guarantees: the TX queue is drained and nothing else sends until
-   * CrossPathEnd. */
+  /* Opens the session at bw (20 or 40 MHz, not wider than the tuned width).
+   * At 40 MHz the result belongs to the tuned primary channel and offset
+   * (ChannelOffset 0 is HT40+ here), so tune the pair the link flies. Caller
+   * guarantees: nothing else sends until CrossPathEnd. The probe inherits the
+   * session's TX state: turn A-MPDU off (SetAmpduMode) and zero
+   * SetTxPowerOffsetQdb first. */
   virtual bool CrossPathBegin(ChannelWidth_t bw) {
     (void)bw;
     return false;
@@ -219,10 +226,14 @@ public:
     out.clear();
     return false;
   }
-  /* Closes the session and restores the TX buffer, the chain-B front end and
-   * the flat index override; never touches channel, width or the rate-diff
-   * table. No-op with no session. */
-  virtual void CrossPathEnd() {}
+  /* Closes the session: restores the TX buffer layout, the chain-B front
+   * end, the flat index override and the wide-TX IGI floor state. Channel,
+   * width and the rate-diff table are not written by the session. True when
+   * every restore step succeeded and the TX queue drained before the buffer
+   * re-layout; false (logged at error level) otherwise, which includes a
+   * drain timeout after which the re-layout still ran and TX may be wedged.
+   * True with no session open. */
+  virtual bool CrossPathEnd() { return true; }
 
   /* Dump the chip's canary register set (BB / MAC / per-path RF) to the
    * diagnostic plane. Reads only — no writes, no calibration, no bring-up.

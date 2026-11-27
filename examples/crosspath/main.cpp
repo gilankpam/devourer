@@ -5,9 +5,10 @@
  *
  * Per cycle: free TX pages, CrossPathBegin, one unparked capture at index 28
  * gain 0, CrossPathPark(true), one capture per index 28..124 step 4 at --gain
- * (default 0), CrossPathEnd, free TX pages, then 2000 MCS7 frames and the
- * send-failure count. Each capture prints its mean power in dB; the unparked
- * and parked index-28 lines are labelled so the park rise reads directly.
+ * (default 0), CrossPathEnd (a false return marks the cycle bad), free TX
+ * pages, then 2000 MCS7 frames and the send-failure count. Each capture
+ * prints its mean power in dB; the unparked and parked index-28 lines are
+ * labelled so the park rise reads directly.
  *
  * With --out, captures are written as DVLA files (32-byte header, sample
  * count at byte 12 LE, then one 8-byte word per sample, low dword zero):
@@ -213,7 +214,10 @@ int main(int argc, char **argv) {
       for (int idx = 28; idx <= 124; idx += 4)
         cap(idx, gain, true);
     }
-    dev->CrossPathEnd();
+    if (!dev->CrossPathEnd()) {
+      std::printf("end FAILED\n");
+      ok = false;
+    }
     ok &= pages(dev, "after", after);
     if (before != after) {
       std::printf("pages MISMATCH before=%u after=%u\n", before, after);

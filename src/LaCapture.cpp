@@ -294,12 +294,32 @@ void LaCapture::readback(const LaParams &p, LaResult &r) {
 }
 
 LaResult LaCapture::run(const LaParams &p) {
-  LaResult r;
   if (_wedged) {
+    LaResult r;
     r.wedged = true;
     return r;
   }
+  try {
+    return run_once(p);
+  } catch (...) {
+    /* A failed control transfer throws. Put back whatever the snapshot holds
+     * so the next run does not snapshot a half-armed LA block; snapshot()
+     * empties it first, so nothing is written when the throw came before
+     * any register was read. */
+    _logger->error("LaCapture: register I/O failed mid-capture; restoring");
+    if (!_saved.empty()) {
+      try {
+        restore();
+      } catch (...) {
+        _logger->error("LaCapture: restore after a failed capture failed too");
+      }
+    }
+    return LaResult{};
+  }
+}
 
+LaResult LaCapture::run_once(const LaParams &p) {
+  LaResult r;
   snapshot();
   if (p.buff_all && _regs.full_buff_capable)
     set_reg(kRegLaConf, 1u << 30, 1);

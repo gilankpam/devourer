@@ -559,6 +559,7 @@ void Halrf8822e::iqk_afe_restore() {
     bb_write(0x1830, v);
   for (uint32_t v : kAfeRestoreSeqB)
     bb_write(0x4130, v);
+  _afe_b_txgapk = false;
   bb_write(0x1c38, 0xffa1005e);
   iqk_ex_dac_fifo_rst();
 }
@@ -1397,13 +1398,11 @@ void Halrf8822e::txgapk_afe_iqk(uint8_t path) {
 
 void Halrf8822e::txgapk_afe_iqk_restore(uint8_t path) {
   const uint16_t reg = (path == 0) ? 0x1830 : 0x4130;
-  static const uint32_t vals[16] = {
-      0x700b8041, 0x70144041, 0x70244041, 0x70344041, 0x70444041, 0x705b8041,
-      0x70644041, 0x707b8041, 0x708b8041, 0x709b8041, 0x70ab8041, 0x70bb8041,
-      0x70cb8041, 0x70db8041, 0x70eb8041, 0x70fb8041};
   bb_write(0x1c38, 0xffa1005e);
-  for (uint32_t v : vals)
+  for (uint32_t v : kAfeTxgapkRestoreSeq)
     bb_write(reg, v);
+  if (path == 1)
+    _afe_b_txgapk = true;
   iqk_ex_dac_fifo_rst();
 }
 

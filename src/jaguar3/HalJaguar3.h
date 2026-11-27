@@ -180,6 +180,7 @@ public:
   void coex_keepalive() { _cal->coex_keepalive(); }
   void coex_run_5g() { _cal->coex_run_5g(); }
   void pwr_track() { _cal->pwr_track(); }
+  bool afe_b_txgapk_last() const { return _cal && _cal->afe_b_txgapk_last(); }
   /* One-shot thermal-meter read for GetThermalStatus (see Jaguar3Calibration).
    * Caller serializes against pwr_track (same RF 0x42 trigger RMW). */
   bool read_thermal(uint8_t &raw, uint8_t &baseline) {

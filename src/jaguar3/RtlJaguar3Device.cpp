@@ -89,6 +89,10 @@ struct WriteBatchScope {
 
 void RtlJaguar3Device::Init(Action_ParsedRadioPacket packetProcessor,
                             SelectedChannel channel) {
+#if defined(DEVOURER_HAVE_JAGUAR3_8822E)
+  /* A re-bring-up ends an open cross-path session first, as Stop() does. */
+  CrossPathEnd();
+#endif
   {
     std::lock_guard<std::mutex> ccx(busy_window_mutex());
     nhm_busy_forget();
@@ -547,12 +551,9 @@ void RtlJaguar3Device::start_rx_loop(Action_ParsedRadioPacket packetProcessor, b
 RtlJaguar3Device::~RtlJaguar3Device() {
 #if defined(DEVOURER_HAVE_JAGUAR3_8822E)
   /* The probe train sends through this object: stop it first. */
-  try {
-    CrossPathEnd();
-  } catch (...) {
-  }
+  CrossPathEnd();
   /* Destroy the session now, while _reg_mu (declared after it) is alive: an
-   * end() that threw leaves it open, and its destructor retries end(). */
+   * end() that failed leaves it open, and its destructor retries end(). */
   _xp.reset();
 #endif
   /* Inert on this generation (its send path is synchronous), but the invariant
@@ -922,12 +923,8 @@ void RtlJaguar3Device::apply_replay_wseq() {
 void RtlJaguar3Device::Stop() {
 #if defined(DEVOURER_HAVE_JAGUAR3_8822E)
   /* A cross-path session ends before the chip does (best effort, like the
-   * de-init below). */
-  try {
-    CrossPathEnd();
-  } catch (...) {
-    _logger->info("Jaguar3: Stop() cross-path end failed (chip already gone?)");
-  }
+   * de-init below; CrossPathEnd logs its own failures). */
+  CrossPathEnd();
 #endif
   /* The armed window dies with the session. Nothing else forgets it:
    * with_ccx gates on _brought_up, which Stop() does not clear, so a window
@@ -979,6 +976,10 @@ void RtlJaguar3Device::Stop() {
 }
 
 void RtlJaguar3Device::InitWrite(SelectedChannel channel) {
+#if defined(DEVOURER_HAVE_JAGUAR3_8822E)
+  /* A re-bring-up ends an open cross-path session first, as Stop() does. */
+  CrossPathEnd();
+#endif
   {
     std::lock_guard<std::mutex> ccx(busy_window_mutex());
     nhm_busy_forget();
@@ -2380,10 +2381,15 @@ bool RtlJaguar3Device::CrossPathSupported() {
 }
 
 bool RtlJaguar3Device::CrossPathBegin(ChannelWidth_t bw) {
-  if (!CrossPathSupported() || (_xp && _xp->active()))
+  /* The probe can be narrower than the tuned channel, never wider. */
+  const ChannelWidth_t tuned = _channel.ChannelWidth;
+  const bool fits = tuned == CHANNEL_WIDTH_40 || tuned == CHANNEL_WIDTH_80 ||
+                    (tuned == CHANNEL_WIDTH_20 && bw == CHANNEL_WIDTH_20);
+  if (!CrossPathSupported() || !fits || (_xp && _xp->active()))
     return false;
   if (!_xp) {
-    _xp_listener = std::make_unique<jaguar3::CrossPathListener8822e>(_device);
+    _xp_listener = std::make_unique<jaguar3::CrossPathListener8822e>(
+        _device, [this] { return _hal.afe_b_txgapk_last(); });
     jaguar3::CrossPathSession::Io io;
     io.relayout = [this](bool half) {
       std::lock_guard<std::mutex> lk(_reg_mu);
@@ -2402,6 +2408,9 @@ bool RtlJaguar3Device::CrossPathBegin(ChannelWidth_t bw) {
     io.reg_mu = &_reg_mu;
     _xp = std::make_unique<jaguar3::CrossPathSession>(std::move(io), *_xp_listener);
   }
+  /* A 40 MHz probe arms the wide-TX IGI floor (send_packet); End puts the
+   * flag back the way the session found it. */
+  _xp_wide_tx_seen = _wide_tx_seen.load(std::memory_order_acquire);
   return _xp->begin(bw);
 }
 
@@ -2418,9 +2427,21 @@ bool RtlJaguar3Device::CrossPathCapture(int tx_index, int gain,
   return _xp->capture(tx_index, gain, out);
 }
 
-void RtlJaguar3Device::CrossPathEnd() {
-  if (_xp)
-    _xp->end();
+bool RtlJaguar3Device::CrossPathEnd() {
+  if (!_xp || !_xp->active())
+    return true;
+  bool ok = _xp->end();
+  if (!_xp_wide_tx_seen) {
+    try {
+      std::lock_guard<std::mutex> lk(_reg_mu);
+      _wide_tx_seen.store(false, std::memory_order_release);
+      apply_igi_floor_locked(_channel.Channel, _channel.ChannelWidth);
+    } catch (...) {
+      _logger->error("Jaguar3: cross-path end: IGI floor restore failed");
+      ok = false;
+    }
+  }
+  return ok;
 }
 #endif
 
