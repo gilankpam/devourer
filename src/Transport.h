@@ -62,6 +62,10 @@ public:
   virtual uint8_t read8(uint16_t reg) = 0;
   virtual uint16_t read16(uint16_t reg) = 0;
   virtual uint32_t read32(uint16_t reg) = 0;
+  /* One multi-byte vendor read; returns bytes read or <0. Default: unsupported. */
+  virtual int read_block(uint16_t /*reg*/, uint8_t * /*buf*/, int /*len*/) {
+    return -1;
+  }
   virtual bool write8(uint16_t reg, uint8_t v) = 0;
   virtual bool write16(uint16_t reg, uint16_t v) = 0;
   virtual bool write32(uint16_t reg, uint32_t v) = 0;

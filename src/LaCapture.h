@@ -33,10 +33,13 @@
  *
  * THREADING / TX CONTRACT: single-control-thread like every control-plane
  * entry point. run() blocks for up to poll_ms*poll_tries + the readback
- * (two vendor-control reads per 8-byte sample: 16 K samples ~ tens of
- * seconds on USB2). The capture lands in the TOP of the TX packet buffer
- * (above the pages the TX path uses), but do not run a capture concurrent
- * with heavy TX — arm first, keep TX quiesced until readback completes.
+ * (two vendor-control reads per 8-byte sample, or one per block_len bytes
+ * with block_len set: 16 K samples ~ tens of seconds per-word on USB2). The
+ * capture lands in the TOP of the TX packet buffer. With the full-size TX
+ * buffer layout the TX path uses those pages too, so TX must stay quiesced
+ * from arm through the end of readback. A caller that has confined TX to
+ * the lower half of the buffer may keep sending through capture and
+ * readback.
  */
 
 #ifndef DEVOURER_LA_CAPTURE_H
@@ -125,6 +128,10 @@ struct LaParams {
   uint32_t poll_tries = 20;
   /* Cap readback (8-byte samples read, oldest-first); 0 = whole window. */
   uint32_t max_samples = 0;
+  /* 0 = two 32-bit reads per word. > 0 = vendor reads of this many bytes
+   * (rounded down to a multiple of 8, never crossing a 4 KB window page);
+   * far fewer USB transfers for the same samples. */
+  int block_len = 0;
 };
 
 struct LaResult {

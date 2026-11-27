@@ -99,6 +99,10 @@ public:
   /* Batched EP0 register transfers — see ITransport::ctrl_batch for the
    * ordering / in-place-read / failure contract and the USB event-pump
    * hazard. The caller owns serialization (its device register lock). */
+  /* One multi-byte vendor read (ITransport::read_block). */
+  int read_block(uint16_t reg, uint8_t *buf, int len) {
+    return _transport->read_block(reg, buf, len);
+  }
   bool ctrl_batch(std::vector<devourer::CtrlOp> &ops) {
     /* debug.log_writes parity with rtw_write: a batched write is still a
      * write: keeps tests/decode_wseq.py's golden sequence identical whether

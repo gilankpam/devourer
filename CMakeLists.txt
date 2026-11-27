@@ -1601,6 +1601,12 @@ target_include_directories(CtrlBatchSelftest PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src)
 add_test(NAME ctrl_batch_semantics COMMAND CtrlBatchSelftest)
 
+# Headless guard for LaCapture's block readback: sample order across 4 KB
+# pages and the ring wrap, and failure on a short read.
+add_executable(LaBlockReadbackSelftest tests/la_block_readback_selftest.cpp)
+target_link_libraries(LaBlockReadbackSelftest PRIVATE devourer)
+add_test(NAME la_block_readback COMMAND LaBlockReadbackSelftest)
+
 # Headless guard for the ONE silent-corruption path on the batched scout read:
 # GetRxEnergyScout must not compose its 0x1d2c/0x1eb4 BB reset out of a FAILED
 # read. Unlike ctrl_batch_semantics this drives the real RtlJaguar3Device over

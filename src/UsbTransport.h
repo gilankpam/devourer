@@ -47,6 +47,10 @@ public:
   uint8_t read8(uint16_t reg) override { return ctrl_read<uint8_t>(reg); }
   uint16_t read16(uint16_t reg) override { return ctrl_read<uint16_t>(reg); }
   uint32_t read32(uint16_t reg) override { return ctrl_read<uint32_t>(reg); }
+  int read_block(uint16_t reg, uint8_t *buf, int len) override {
+    return libusb_control_transfer(_dev_handle, REALTEK_USB_VENQT_READ, 5, reg,
+                                   0, buf, static_cast<uint16_t>(len), 500);
+  }
   bool write8(uint16_t reg, uint8_t v) override { return ctrl_write(reg, v); }
   bool write16(uint16_t reg, uint16_t v) override { return ctrl_write(reg, v); }
   bool write32(uint16_t reg, uint32_t v) override { return ctrl_write(reg, v); }
